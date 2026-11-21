@@ -18,7 +18,9 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def resource_stats(rows: list[dict[str, str]], start: float, end: float) -> dict[str, Any]:
+def resource_stats(
+    rows: list[dict[str, str]], start: float, end: float
+) -> dict[str, Any]:
     """Weight CPU by interval overlap; RSS peaks remain sampled point measurements."""
     rss: list[float] = []
     cpu: list[float] = []
@@ -84,6 +86,56 @@ def resource_stats(rows: list[dict[str, str]], start: float, end: float) -> dict
     }
 
 
+DROP_PHASES = ("before_load", "load", "tail", "unattributed")
+
+
+def counter_phase_deltas(
+    rows: list[dict[str, str]],
+    key: str,
+    start: float | None,
+    end: float | None,
+    final: float | None,
+    baseline: float | None,
+) -> dict[str, float]:
+    """Split cumulative counters by sample phase; resets stay gated as unattributed."""
+    phases = {phase: 0.0 for phase in DROP_PHASES}
+    previous = baseline if baseline is not None and baseline >= 0 else 0.0
+    phases["before_load"] = previous
+    for row in rows:
+        value = numeric(row.get(key))
+        if value is None or value < 0:
+            continue
+        timestamp = numeric(row.get("monotonic_timestamp"))
+        if timestamp is None or start is None or end is None:
+            phase = "unattributed"
+        elif timestamp < start:
+            phase = "before_load"
+        elif timestamp < end:
+            phase = "load"
+        else:
+            phase = "tail"
+        if value < previous:
+            phases["unattributed"] = max(1.0, phases["unattributed"] + value)
+        else:
+            phases[phase] += value - previous
+        previous = value
+    if final is not None and final >= 0:
+        if final < previous:
+            phases["unattributed"] = max(1.0, phases["unattributed"] + final)
+        else:
+            phases["tail"] += final - previous
+    return phases
+
+
+def drops_require_failure(probe_drop_phases: dict[str, dict[str, float]]) -> bool:
+    """Only pre-load drops are informational; every other attribution remains fatal."""
+    return any(
+        phases[phase] > 0
+        for phases in probe_drop_phases.values()
+        for phase in ("load", "tail", "unattributed")
+    )
+
+
 def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
     """Gate load-window resources on both capture correctness and usable CPU samples."""
     worker = read_json(directory / "worker-result.json")
@@ -100,12 +152,18 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         "channel_dropped": [],
     }
     final_metrics = read_internal_metrics(directory / "internal-metrics.prom")
+    baseline_metrics = read_json(directory / "metrics-baseline.json")
     invalid_counters: set[str] = set()
     for key in drop_samples:
         value = numeric(final_metrics.get(key))
         if value is not None and value >= 0:
             drop_samples[key].append(value)
         elif key in final_metrics:
+            invalid_counters.add(key)
+        baseline = numeric(baseline_metrics.get(key))
+        if baseline is not None and baseline >= 0:
+            drop_samples[key].append(baseline)
+        elif baseline_metrics.get(key) not in (None, ""):
             invalid_counters.add(key)
     counter_samples = {"eviction_count": evictions, **drop_samples}
     metrics = directory / "metrics.csv"
@@ -124,22 +182,41 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
     window = read_json(directory / "agents/start.json")
     start, end = numeric(window.get("start")), numeric(window.get("end"))
     window_valid = start is not None and end is not None and end > start
-    resources = resource_stats(rows, start, end) if window_valid else resource_stats([], 0, 0)
+    probe_drop_phases = {
+        key: counter_phase_deltas(
+            rows,
+            key,
+            start,
+            end,
+            numeric(final_metrics.get(key)),
+            numeric(baseline_metrics.get(key)),
+        )
+        for key in drop_samples
+    }
+    resources = (
+        resource_stats(rows, start, end) if window_valid else resource_stats([], 0, 0)
+    )
     tail = resource_stats(rows, end, math.inf) if window_valid else None
     average, peak = resources["rss_average_mib"], resources["rss_peak_mib"]
     resource_error = None
     if not window_valid:
         resource_error = "missing or invalid load measurement window"
     elif invalid_counters:
-        resource_error = "invalid internal counter samples: " + ", ".join(sorted(invalid_counters))
+        resource_error = "invalid internal counter samples: " + ", ".join(
+            sorted(invalid_counters)
+        )
     elif not resources["rss_samples_valid"] or not resources["cpu_samples_valid"]:
         resource_error = "missing or invalid RSS/CPU samples in the load window"
     elif resources["cpu_measurement_seconds"] < (end - start) * 0.95:
         resource_error = "CPU samples cover less than 95% of the load window"
     total = worker.get("host_memory_mib")
-    load_status = "PASS" if load.get("passed") is True else "FAIL" if load else "UNVERIFIED"
-    probe_drops = {key: max(values) if values else None for key, values in drop_samples.items()}
-    events_dropped = any(value is not None and value > 0 for value in probe_drops.values())
+    load_status = (
+        "PASS" if load.get("passed") is True else "FAIL" if load else "UNVERIFIED"
+    )
+    probe_drops = {
+        key: max(values) if values else None for key, values in drop_samples.items()
+    }
+    events_dropped = drops_require_failure(probe_drop_phases)
     sent = capture.get("sent")
     conflicts = capture.get("conflicts")
     quality = {}
@@ -158,9 +235,17 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
     capture_status = (
         "FAIL"
         if worker.get("capture_ready") is False
-        else "PASS" if capture_ok else "FAIL" if capture or events_dropped else "UNVERIFIED"
+        else (
+            "PASS"
+            if capture_ok
+            else "FAIL" if capture or events_dropped else "UNVERIFIED"
+        )
     )
-    ffi = read_json(directory / "ffi-consumer.json") if source.get("mode") == "ffi" else None
+    ffi = (
+        read_json(directory / "ffi-consumer.json")
+        if source.get("mode") == "ffi"
+        else None
+    )
     ffi_error = None
     if ffi is not None:
         expected = (sent if type(sent) is int and sent > 0 else 0) + len(
@@ -205,7 +290,9 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         else:
             field_valid = type(value) is int and value >= 0
         capture_counts[key] = value if field_valid else None
-    if capture_counts["missing_count"] is None and isinstance(capture.get("missing_ids"), list):
+    if capture_counts["missing_count"] is None and isinstance(
+        capture.get("missing_ids"), list
+    ):
         capture_counts["missing_count"] = len(capture["missing_ids"])
     return {
         "source": source,
@@ -218,7 +305,9 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         "resource_error": resource_error,
         "logical_cpus": worker.get("logical_cpus"),
         "host_memory_mib": total,
-        "rss_average_host_pct": average / total * 100 if average is not None and total else None,
+        "rss_average_host_pct": (
+            average / total * 100 if average is not None and total else None
+        ),
         "rss_peak_host_pct": peak / total * 100 if peak is not None and total else None,
         "load": load_status,
         "capture": capture_status,
@@ -228,9 +317,12 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         "capture_counts": capture_counts,
         "connection_evictions": max(evictions) if evictions else None,
         "probe_drops": probe_drops,
+        "probe_drop_phases": probe_drop_phases,
         "ffi_consumer": ffi,
         "ffi_error": ffi_error,
-        "ffi_dropped": numeric(final_metrics.get("ffi_dropped", "0")) if ffi is not None else None,
+        "ffi_dropped": (
+            numeric(final_metrics.get("ffi_dropped", "0")) if ffi is not None else None
+        ),
         "safety_stop": safety_stop or None,
     }
 
@@ -255,20 +347,31 @@ def safety_message(record: dict[str, Any]) -> str:
 
 def reduction(before: float, after: float) -> dict[str, float | None]:
     """Positive reductions indicate less memory; zero baselines have no percentage."""
-    return {"mib": before - after, "percent": (before - after) / before * 100 if before else None}
+    return {
+        "mib": before - after,
+        "percent": (before - after) / before * 100 if before else None,
+    }
 
 
 def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
     """Print and persist a plain text report with a machine-readable companion."""
-    runs = {label: summarize(output / label, source) for label, source in sources.items()}
+    runs = {
+        label: summarize(output / label, source) for label, source in sources.items()
+    }
     error_file = output / "run-error.txt"
-    valid = bool(runs) and all(run["valid"] for run in runs.values()) and not error_file.exists()
+    valid = (
+        bool(runs)
+        and all(run["valid"] for run in runs.values())
+        and not error_file.exists()
+    )
     comparison: dict[str, Any] = {}
     if valid and len(runs) == 2:
         for key in ("rss_average_mib", "rss_peak_mib"):
             comparison[key] = reduction(runs["before"][key], runs["after"][key])
         for key in ("rss_average_host_pct", "rss_peak_host_pct"):
-            comparison[key] = {"percentage_points": runs["before"][key] - runs["after"][key]}
+            comparison[key] = {
+                "percentage_points": runs["before"][key] - runs["after"][key]
+            }
         for key in ("cpu_average_pct", "cpu_p95_pct", "cpu_peak_pct"):
             before, after = runs["before"][key], runs["after"][key]
             comparison[key] = {
@@ -310,7 +413,9 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
             f"{settings['payload_kb']} KiB request padding"
         )
         if "connection_capacity" in settings:
-            lines.append(f"Configured connection capacity: {settings['connection_capacity']}")
+            lines.append(
+                f"Configured connection capacity: {settings['connection_capacity']}"
+            )
         if settings.get("cpu_budget_percent"):
             lines.append(
                 f"Configured CPU pacing target: {settings['cpu_budget_percent']}% of one logical CPU (cooperative)"
@@ -342,7 +447,9 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
         delta = "N/A (invalid)"
         if change is not None:
             if key.endswith("_mib"):
-                delta = f"{display(change['mib'])} MiB ({display(change['percent'], '%')})"
+                delta = (
+                    f"{display(change['mib'])} MiB ({display(change['percent'], '%')})"
+                )
             else:
                 delta = f"{display(change['percentage_points'])} pp"
                 if "percent" in change:
@@ -352,7 +459,11 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
             + "".join(f"{display(run[key], suffix):>16}" for run in runs.values())
             + (f"{delta:>28}" if ab else "")
         )
-    for title, key in (("Load", "load"), ("Capture", "capture"), ("Run status", "status")):
+    for title, key in (
+        ("Load", "load"),
+        ("Capture", "capture"),
+        ("Run status", "status"),
+    ):
         lines.append(
             f"{title:<24}"
             + "".join(f"{run[key]:>16}" for run in runs.values())
@@ -381,15 +492,29 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
                 f"{display(tail['cpu_p95_pct'])}/{display(tail['cpu_peak_pct'])}%"
             )
         if run["safety_stop"]:
-            lines.append(f"{label} stopped by resource guard: {safety_message(run['safety_stop'])}")
+            lines.append(
+                f"{label} stopped by resource guard: {safety_message(run['safety_stop'])}"
+            )
         drops = run["probe_drops"]
         lines.append(
             f"{label} probe drops (all probe types): "
             f"ring={drop_count(drops['ring_buffer_dropped'])}; "
             f"channel={drop_count(drops['channel_dropped'])}"
         )
-        if any(value is not None and value > 0 for value in drops.values()):
-            lines.append(f"{label} capture failed: probe events were dropped")
+        for counter, phases in run["probe_drop_phases"].items():
+            lines.append(
+                f"{label} {counter} phases: before_load={drop_count(phases['before_load'])}; "
+                f"load={drop_count(phases['load'])}; drain={drop_count(phases['tail'])}; "
+                f"unattributed={drop_count(phases['unattributed'])}"
+            )
+        if drops_require_failure(run["probe_drop_phases"]):
+            lines.append(
+                f"{label} capture failed: probe events were dropped during load/drain or were unattributed"
+            )
+        elif any(value is not None and value > 0 for value in drops.values()):
+            lines.append(
+                f"{label} probe drops were confined to pre-load and did not fail the load/drain capture gate"
+            )
         if run["capture"] == "FAIL":
             counts = {
                 key: str(value) if value is not None else "N/A"
@@ -401,8 +526,12 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
                 f"{counts['token_correct']}/{counts['sent']} token-correct"
             )
             if run["connection_evictions"] is not None:
-                lines.append(f"{label} connection evictions: {run['connection_evictions']:.0f}")
-    lines.append(f"Result: {'VALID' if valid else 'INVALID; do not infer a resource improvement'}")
+                lines.append(
+                    f"{label} connection evictions: {run['connection_evictions']:.0f}"
+                )
+    lines.append(
+        f"Result: {'VALID' if valid else 'INVALID; do not infer a resource improvement'}"
+    )
     if error_file.exists():
         lines.append(f"Error: {error_file.read_text().strip()}")
     for label, run in runs.items():

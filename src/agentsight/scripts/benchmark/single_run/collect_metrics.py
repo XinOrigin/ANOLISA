@@ -395,6 +395,23 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     if args.start_file is not None:
+        baseline_time = time.monotonic()
+        baseline_row, _, _ = sample(
+            args.pid,
+            read_cpu_ticks(args.pid),
+            baseline_time,
+            args.input_qps,
+            args.metrics_file,
+            identity,
+        )
+        write_json(
+            Path(args.output).with_name("metrics-baseline.json"),
+            {
+                "monotonic_timestamp": baseline_row.get("monotonic_timestamp"),
+                "ring_buffer_dropped": baseline_row.get("ring_buffer_dropped", ""),
+                "channel_dropped": baseline_row.get("channel_dropped", ""),
+            },
+        )
         deadline = time.monotonic() + 65
         while not args.start_file.exists() and not STOP:
             if time.monotonic() > deadline:

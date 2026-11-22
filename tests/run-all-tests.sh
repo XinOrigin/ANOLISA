@@ -4,10 +4,44 @@ set -e
 # Ensure we're running from the root of the repo
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FILTER=""
+HAS_FILTER=0
 
-if [ "$1" == "--filter" ]; then
-    FILTER="$2"
-fi
+usage() {
+    echo "Usage: $0 [--filter <shell|sec|sight|tokenless|memory|mem>] [-h|--help]"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            if [ "$HAS_FILTER" -ne 0 ] || [ "$#" -gt 1 ]; then
+                usage >&2
+                exit 2
+            fi
+            usage
+            exit 0
+            ;;
+        --filter)
+            if [ "$HAS_FILTER" -ne 0 ]; then
+                echo "Duplicate --filter option." >&2
+                usage >&2
+                exit 2
+            fi
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--filter requires a non-empty component name." >&2
+                usage >&2
+                exit 2
+            fi
+            FILTER="$2"
+            HAS_FILTER=1
+            shift 2
+            ;;
+        *)
+            echo "Unknown or unexpected argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
 
 run_shell() {
     echo "==> Running copilot-shell tests"

@@ -59,8 +59,10 @@ enum SidecarState {
     Parseable,
     /// Readable but unparseable — repairable.
     Corrupt,
-    /// Resolvable but unreadable, or not there at all — not repairable.
+    /// Truly absent on disk (or a directory named like a sidecar) — not repairable.
     Absent,
+    /// Unreadable due to transient I/O, permissions, or system error — retain both files.
+    Unreadable(MemoryError),
     /// A symlink on the resolution path (or a mount crossing) — the name
     /// was not put there by `create_tarball`. Not repairable; the archive
     /// is discarded and the pair is reported as `tampered_pairs` so
@@ -92,7 +94,8 @@ pub struct ReclaimReport {
     pub archives_removed: usize,
     /// Invalid archives discarded, included in `archives_removed`.
     pub invalid_archives_removed: usize,
-    /// Archives retained because opening or reading them failed.
+    /// Archives or sidecars retained because opening, probing, or reading
+    /// their content or metadata failed.
     pub validation_failures: usize,
     /// `*.json` sidecars removed for having no regular archive file.
     pub sidecars_removed: usize,
@@ -414,10 +417,27 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
                 // and surface it as a failure rather than repair through
                 // the link.
                 Err(crate::error::MemoryError::PathOutsideMount(_)) => SidecarState::Tampered,
-                // Unreadable or unresolvable (dangling symlink, permissions,
-                // vanished inode): not repairable — treated like an absent
-                // sidecar. The link itself is never followed.
-                Err(_) => SidecarState::Absent,
+                // Sidecar is truly missing on disk — treat as absent (not repairable).
+                Err(crate::error::MemoryError::NotFound(_)) => SidecarState::Absent,
+                // A directory named like a sidecar fails read with EISDIR — not a valid sidecar.
+                Err(crate::error::MemoryError::Io(ref e))
+                    if e.raw_os_error() == Some(nix::libc::EISDIR) =>
+                {
+                    SidecarState::Absent
+                }
+                // Invalid UTF-8 (e.g. a mid-write crash inside a multibyte
+                // character or corrupt bytes) fails `read_to_string` with
+                // `InvalidData` and no OS errno — classify as corrupt so the
+                // sidecar remains repairable from its intact archive.
+                Err(crate::error::MemoryError::Io(ref e))
+                    if e.kind() == io::ErrorKind::InvalidData && e.raw_os_error().is_none() =>
+                {
+                    SidecarState::Corrupt
+                }
+                // Unreadable due to transient I/O or permissions error (EACCES,
+                // EIO, EBUSY, etc.): do not assume absent; retain both archive
+                // and sidecar to prevent data loss.
+                Err(error) => SidecarState::Unreadable(error),
             };
         match sidecar_state {
             SidecarState::Parseable | SidecarState::Corrupt => {
@@ -525,10 +545,8 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
                 }
             }
             SidecarState::Absent => {
-                // No readable sidecar (absent, dangling, or unreadable):
-                // the archive is invisible to list/restore; past the age
-                // guard it is dead weight. The link itself is never
-                // followed and never repaired through.
+                // Sidecar is truly absent: the archive is invisible to
+                // list/restore; past the age guard it is dead weight.
                 if !older_than_anchored(mount.root_fd.as_fd(), &archive_rel, min_age, now) {
                     report.kept_young += 1;
                     continue;
@@ -543,6 +561,22 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
                         report.removal_failures += 1;
                     }
                 }
+            }
+            SidecarState::Unreadable(error) => {
+                // A sidecar that exists but cannot be read (permissions,
+                // transient I/O errors) must not cause its archive to be
+                // deleted. Retain both files so transient issues don't destroy
+                // valid backups.
+                if !older_than_anchored(mount.root_fd.as_fd(), &archive_rel, min_age, now) {
+                    report.kept_young += 1;
+                    continue;
+                }
+                report.validation_failures += 1;
+                tracing::warn!(
+                    "snapshot reclaim: cannot read metadata {}; retaining archive and sidecar: {error}",
+                    sidecar.display()
+                );
+                continue;
             }
             SidecarState::Tampered => {
                 // A symlinked (or mount-crossing) sidecar: the same
@@ -581,23 +615,6 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
     }
 
     for sidecar in &sidecars {
-        // Anchored type probe, same reasoning as the archive loop: the
-        // sidecar's name comes from a directory listing, so the archive
-        // path must never be probed through the absolute path.
-        let archive_rel = snapshots_rel.join(format!(
-            "{}.tar.gz",
-            sidecar
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|n| n.strip_suffix(".json").unwrap_or(n))
-                .unwrap_or_default()
-        ));
-        if crate::safe_fs::metadata(mount.root_fd.as_fd(), &archive_rel)
-            .is_ok_and(|metadata| metadata.is_file())
-        {
-            // A regular archive is present; directories cannot back snapshots.
-            continue;
-        }
         // The sidecar's own age check is anchored too: its name is just as
         // attacker-chosen as the archive's, so the mtime must not be probed
         // through a planted link. An unresolvable sidecar reads as young
@@ -613,6 +630,45 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
                 continue;
             }
         };
+        // Anchored type probe, same reasoning as the archive loop: the
+        // sidecar's name comes from a directory listing, so the archive
+        // path must never be probed through the absolute path.
+        let archive_rel = snapshots_rel.join(format!(
+            "{}.tar.gz",
+            sidecar
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|n| n.strip_suffix(".json").unwrap_or(n))
+                .unwrap_or_default()
+        ));
+        match crate::safe_fs::metadata(mount.root_fd.as_fd(), &archive_rel) {
+            Ok(metadata) if metadata.is_file() => continue,
+            // Not a regular file (e.g. directory named like an archive),
+            // missing, or a symlink (`PathOutsideMount` via openat2
+            // `RESOLVE_NO_SYMLINKS`): the archive is absent or non-regular,
+            // so the sidecar is orphaned and falls through to age-guarded
+            // cleanup.
+            Ok(_)
+            | Err(
+                crate::error::MemoryError::NotFound(_)
+                | crate::error::MemoryError::PathOutsideMount(_),
+            ) => {}
+            Err(error) => {
+                // Unresolvable due to transient I/O or permissions error;
+                // do not assume archive is absent. Retain sidecar, respecting
+                // the age guard before counting or warning on a failure.
+                if !older_than_anchored(mount.root_fd.as_fd(), &sidecar_rel, min_age, now) {
+                    report.kept_young += 1;
+                    continue;
+                }
+                report.validation_failures += 1;
+                tracing::warn!(
+                    "snapshot reclaim: cannot probe archive {}; retaining sidecar: {error}",
+                    archive_rel.display()
+                );
+                continue;
+            }
+        }
         if !older_than_anchored(mount.root_fd.as_fd(), &sidecar_rel, min_age, now) {
             report.kept_young += 1;
             continue;

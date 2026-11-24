@@ -986,6 +986,121 @@ fn reclaim_preserves_unreadable_archives_at_mount_open() {
 }
 
 #[test]
+fn reclaim_preserves_old_snapshot_when_sidecar_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+
+    let (_tmp, svc) = setup();
+    svc.write("notes.md", "precious backup content", false)
+        .unwrap();
+    let snapshot = svc.mem_snapshot(Some("essential_backup")).unwrap();
+
+    let dir = svc.mount.meta_dir.join("snapshots");
+    let archive = dir.join(format!("{}.tar.gz", snapshot.id));
+    let sidecar = dir.join(format!("{}.json", snapshot.id));
+
+    let archive_bytes = std::fs::read(&archive).unwrap();
+    let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+    let permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+
+    // Age both files past the 24h floor (48 hours ago).
+    age_file(&archive, 2 * 24 * 3600);
+    age_file(&sidecar, 2 * 24 * 3600);
+
+    // Make sidecar unreadable (mode 000).
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+
+    // Mount-open sweep must preserve both archive and unreadable sidecar.
+    let config = svc.config.clone();
+    drop(svc);
+    let svc = MemoryService::new(config.clone()).unwrap();
+    assert!(
+        archive.exists(),
+        "healthy archive must survive mount-open sweep when sidecar is unreadable"
+    );
+    assert!(
+        sidecar.exists(),
+        "unreadable sidecar must survive mount-open sweep"
+    );
+
+    // Execute sweeper directly to verify ReclaimReport counters.
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+
+    // Issue #10545 assertions:
+    assert!(
+        archive.exists(),
+        "healthy archive must NOT be deleted when sidecar is temporarily unreadable"
+    );
+    assert!(
+        sidecar.exists(),
+        "unreadable sidecar must NOT be deleted as an orphan"
+    );
+    assert_eq!(report.validation_failures, 1);
+    assert_eq!(report.total_removed(), 0);
+    assert_eq!(report.archives_removed, 0);
+    assert_eq!(report.sidecars_removed, 0);
+    assert_eq!(report.invalid_archives_removed, 0);
+    assert_eq!(report.sidecars_repaired, 0);
+    assert_eq!(report.removal_failures, 0);
+
+    // Restore permissions and verify roundtrip data integrity.
+    std::fs::set_permissions(&sidecar, permissions).unwrap();
+    assert_eq!(std::fs::read(&archive).unwrap(), archive_bytes);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+    drop(svc);
+
+    // Reopen service, mutate live file, and restore snapshot to verify full operational recovery.
+    let svc = MemoryService::new(config).unwrap();
+    assert_eq!(svc.mem_snapshot_list().unwrap().len(), 1);
+    svc.write("notes.md", "corrupted live state", true).unwrap();
+    svc.mem_snapshot_restore(&snapshot.id).unwrap();
+    assert_eq!(svc.read("notes.md").unwrap(), "precious backup content");
+}
+
+#[test]
+fn reclaim_keeps_young_snapshot_when_sidecar_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+
+    let (_tmp, svc) = setup();
+    svc.write("notes.md", "fresh content", false).unwrap();
+    let snapshot = svc.mem_snapshot(Some("fresh_backup")).unwrap();
+
+    let dir = svc.mount.meta_dir.join("snapshots");
+    let archive = dir.join(format!("{}.tar.gz", snapshot.id));
+    let sidecar = dir.join(format!("{}.json", snapshot.id));
+    let permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+
+    // Files are brand new (< 24h). Set sidecar to unreadable.
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+
+    assert!(archive.exists());
+    assert!(sidecar.exists());
+    assert_eq!(report.kept_young, 1);
+    assert_eq!(report.total_removed(), 0);
+
+    std::fs::set_permissions(&sidecar, permissions).unwrap();
+}
+
+#[test]
 fn reclaim_keeps_young_sidecar_after_discarding_invalid_archive() {
     let (_tmp, svc) = setup();
     let dir = svc.mount.meta_dir.join("snapshots");
@@ -1055,6 +1170,84 @@ fn reclaim_removes_stale_sidecar_when_archive_is_a_directory() {
         std::fs::read(archive.join("unrelated.txt")).unwrap(),
         b"preserve"
     );
+}
+
+#[test]
+fn reclaim_removes_stale_sidecar_when_archive_is_a_symlink() {
+    let (tmp, svc) = setup();
+    let dir = svc.mount.meta_dir.join("snapshots");
+    std::fs::create_dir_all(&dir).unwrap();
+    let outside = tmp.path().join("outside.tar.gz");
+    std::fs::write(&outside, b"preserve").unwrap();
+    let archive = dir.join("snap_LINK.tar.gz");
+    std::os::unix::fs::symlink(&outside, &archive).unwrap();
+    let sidecar = dir.join("snap_LINK.json");
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&sidecar_info("snap_LINK")).unwrap(),
+    )
+    .unwrap();
+
+    // Young sidecar is kept below the age guard without logging validation_failures.
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.kept_young, 1);
+    assert_eq!(report.validation_failures, 0);
+    assert_eq!(report.total_removed(), 0);
+    assert!(sidecar.exists());
+
+    // Once aged, the orphaned sidecar is reclaimed cleanly while the symlink
+    // and its target remain untouched.
+    age_file(&sidecar, 2 * 24 * 3600);
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.sidecars_removed, 1);
+    assert_eq!(report.archives_removed, 0);
+    assert_eq!(report.validation_failures, 0);
+    assert_eq!(report.tampered_pairs, 0);
+    assert_eq!(report.removal_failures, 0);
+    assert!(!sidecar.exists());
+    assert!(archive.is_symlink());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+}
+
+#[test]
+fn reclaim_respects_age_guard_when_archive_probe_fails() {
+    let (_tmp, svc) = setup();
+    let dir = svc.mount.meta_dir.join("snapshots");
+    std::fs::create_dir_all(&dir).unwrap();
+    // 249-byte stem: `<stem>.json` is 254 bytes (<= NAME_MAX 255) while
+    // `<stem>.tar.gz` is 256 bytes (> NAME_MAX), so `safe_fs::metadata` fails
+    // with ENAMETOOLONG on the archive probe while `older_than_anchored` on
+    // the sidecar itself succeeds.
+    let stem = "a".repeat(249);
+    let sidecar = dir.join(format!("{stem}.json"));
+    std::fs::write(&sidecar, serde_json::to_vec(&sidecar_info(&stem)).unwrap()).unwrap();
+
+    // Young sidecar: age guard runs before reporting validation_failures.
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.kept_young, 1);
+    assert_eq!(report.validation_failures, 0);
+    assert_eq!(report.total_removed(), 0);
+    assert!(sidecar.exists());
+
+    // Aged sidecar: probe error now surfaces as a validation failure and retains the sidecar.
+    age_file(&sidecar, 2 * 24 * 3600);
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.validation_failures, 1);
+    assert_eq!(report.kept_young, 0);
+    assert_eq!(report.total_removed(), 0);
+    assert!(sidecar.exists());
 }
 
 #[test]
@@ -1200,6 +1393,41 @@ fn reclaim_repairs_truncated_sidecar_from_intact_archive() {
     assert_eq!(list[0].name, "snap_FIX");
     assert_eq!(list[0].backend, "tar.gz");
     assert!(list[0].size > 0);
+}
+
+#[test]
+fn reclaim_repairs_non_utf8_corrupt_sidecar_from_intact_archive() {
+    let (_tmp, svc) = setup();
+    let dir = svc.mount.meta_dir.join("snapshots");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Intact archive + sidecar truncated inside a multibyte UTF-8 sequence
+    // (or containing invalid UTF-8 bytes): `read_to_string` fails with
+    // `InvalidData` and no OS errno, which must classify as `Corrupt` so
+    // the sidecar is repaired rather than stuck as `Unreadable`.
+    write_valid_archive(&dir, "snap_UTF8", b"archive contents");
+    std::fs::write(
+        dir.join("snap_UTF8.json"),
+        b"{\"id\":\"snap_UTF8\",\"name\":\"\xff\xfe",
+    )
+    .unwrap();
+    age_file(&dir.join("snap_UTF8.tar.gz"), 2 * 24 * 3600);
+    age_file(&dir.join("snap_UTF8.json"), 2 * 24 * 3600);
+
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.sidecars_repaired, 1);
+    assert_eq!(report.validation_failures, 0);
+    assert_eq!(report.archives_removed, 0);
+
+    let list = svc.mem_snapshot_list().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, "snap_UTF8");
+    assert_eq!(list[0].name, "snap_UTF8");
+    svc.mem_snapshot_restore("snap_UTF8").unwrap();
+    assert_eq!(svc.read("notes.md").unwrap(), "archive contents");
 }
 
 #[test]

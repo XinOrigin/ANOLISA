@@ -1284,3 +1284,59 @@ async fn nothing_to_compact_without_a_complete_run() {
         .expect_err("incomplete run");
     assert_eq!(error.code(), "nothing_to_compact");
 }
+
+#[tokio::test]
+async fn manual_compaction_commits_past_an_interrupted_earlier_run() {
+    use crate::provider::{ToolCallFunction, ToolCallInfo};
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let call = ToolCallInfo {
+        id: "call-0".to_string(),
+        call_type: "function".to_string(),
+        function: ToolCallFunction {
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let mut messages = vec![
+        Message::user("interrupted"),
+        Message::assistant_with_tool_calls("", vec![call]),
+        Message::tool_result("call-0", "partial", false),
+    ];
+    let interrupted_end = messages.len();
+    messages.extend(bulky_messages(4));
+
+    let mut session = PersistedSession::new(
+        ProviderSessionId::new(),
+        store.workspace_scope().to_string(),
+        "mock-model".to_string(),
+        messages,
+    );
+    store.persist(&mut session).unwrap();
+
+    let (report, updated) = compact(
+        &store,
+        &session,
+        &summary_provider(),
+        &CoreConfig::default(),
+    )
+    .await
+    .expect("manual compaction must summarize past interrupted earlier run");
+    assert!(
+        report.compacted_through >= interrupted_end,
+        "expected cut at or past interrupted prefix ({interrupted_end}), got {}",
+        report.compacted_through
+    );
+    assert_eq!(updated.messages.len(), session.messages.len());
+
+    let reloaded = store.load(&session.session_id).expect("reload");
+    let projection = reloaded.compaction.as_ref().expect("persisted projection");
+    assert_eq!(projection.compacted_through, report.compacted_through);
+    assert!(super::super::boundary::is_safe_split_point(
+        &reloaded.messages,
+        projection.compacted_through
+    ));
+    let effective = effective_messages(&reloaded.messages, reloaded.compaction.as_ref());
+    assert!(effective[0].content.as_text().contains("compacted-history"));
+}

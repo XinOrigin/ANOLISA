@@ -293,8 +293,12 @@ fn select_preserving_recent_runs(
 ///
 /// No recent run is reserved unconditionally. As much verbatim history as the
 /// target permits is still preserved, and the latest completed run is only
-/// summarized when no earlier cut satisfies the target. An incomplete trailing
-/// run stops candidate generation, so the active run is never cut.
+/// summarized when no earlier cut satisfies the target. Every Agent-run
+/// boundary is a candidate, so this policy is never stricter than
+/// `RecentRuns(1)`. The one exception is the end of an incomplete *trailing*
+/// run: that run is the active run and is never cut. An earlier run that ended
+/// without a final reply (interrupt, `max_turns`, or provider error) was closed
+/// by the next user prompt, so its end is a safe boundary.
 fn select_through_latest_completed_run(
     messages: &[Message],
     target_tokens: u64,
@@ -304,12 +308,11 @@ fn select_through_latest_completed_run(
     if runs.is_empty() {
         return Ok(None);
     }
+    let last = runs.len() - 1;
     let mut candidates = Vec::with_capacity(runs.len());
-    let mut prefix_is_complete = true;
     for (index, run) in runs.iter().copied().enumerate() {
-        prefix_is_complete &= transcript_ends_with_complete_agent_run(messages, run);
-        if !prefix_is_complete {
-            continue;
+        if index == last && !transcript_ends_with_complete_agent_run(messages, run) {
+            break;
         }
         let cut = runs
             .get(index + 1)
@@ -450,6 +453,95 @@ mod tests {
         assert_eq!(
             select_latest_completed(&older_complete, u64::MAX, 0).unwrap(),
             Some(first_run_end)
+        );
+    }
+
+    fn interrupted_run(prompt: &str, call_id: &str) -> Vec<Message> {
+        vec![
+            Message::user(prompt),
+            Message::assistant_with_tool_calls("", vec![tool_call(call_id)]),
+            Message::tool_result(call_id, "partial", false),
+        ]
+    }
+
+    #[test]
+    fn manual_selection_advances_past_an_interrupted_earlier_run() {
+        let mut messages = interrupted_run("interrupted", "call-0");
+        messages.extend(run_with_tools("second", "call-1"));
+        assert!(group_agent_runs(&messages).is_ok());
+
+        // Generous target preserves the completed second run by cutting after
+        // the closed interrupted prefix; zero target summarizes both runs.
+        assert_eq!(
+            select_latest_completed(&messages, u64::MAX, 0).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            select_latest_completed(&messages, 0, 0).unwrap(),
+            Some(messages.len())
+        );
+    }
+
+    #[test]
+    fn manual_selection_is_never_stricter_than_one_preserved_run() {
+        let mut messages = interrupted_run("first", "call-0");
+        messages.extend(interrupted_run("second", "call-1"));
+        let runs = group_agent_runs(&messages).expect("valid transcript");
+        assert!(has_active_run(&messages));
+
+        let recent = select_preserving(&messages, 1, u64::MAX).unwrap();
+        assert_eq!(recent, Some(runs[1].start));
+        assert_eq!(
+            select_latest_completed(&messages, u64::MAX, 0).unwrap(),
+            recent
+        );
+        // Even a zero target must never reach into the trailing active run.
+        assert_eq!(
+            select_latest_completed(&messages, 0, 0).unwrap(),
+            Some(runs[1].start)
+        );
+        assert_eq!(
+            select_latest_completed(&messages, 0, runs[1].start).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_selection_advances_past_aborted_user_only_and_system_closed_runs() {
+        let mut aborted_then_complete = vec![Message::user("aborted"), Message::system("hook")];
+        aborted_then_complete.extend(run_with_tools("second", "call-1"));
+        assert_eq!(
+            select_latest_completed(&aborted_then_complete, u64::MAX, 0).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            select_latest_completed(&aborted_then_complete, 0, 0).unwrap(),
+            Some(aborted_then_complete.len())
+        );
+
+        let mut incremental = interrupted_run("first", "call-0");
+        incremental.push(Message::system("loop warning"));
+        let second_start = incremental.len();
+        incremental.extend(run_with_tools("second", "call-1"));
+        let third_start = incremental.len();
+        incremental.extend(run_with_tools("third", "call-2"));
+        assert_eq!(
+            select_latest_completed(&incremental, u64::MAX, second_start).unwrap(),
+            Some(third_start)
+        );
+        assert_eq!(
+            select_latest_completed(&incremental, 0, second_start).unwrap(),
+            Some(incremental.len())
+        );
+
+        let mut trailing_system = interrupted_run("first", "call-0");
+        let trailing_start = trailing_system.len();
+        trailing_system.extend(interrupted_run("second", "call-1"));
+        trailing_system.push(Message::system("loop warning"));
+        assert!(has_active_run(&trailing_system));
+        assert_eq!(
+            select_latest_completed(&trailing_system, 0, 0).unwrap(),
+            Some(trailing_start)
         );
     }
 

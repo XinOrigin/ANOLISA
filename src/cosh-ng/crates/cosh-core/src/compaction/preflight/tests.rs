@@ -8,7 +8,7 @@ use super::*;
 use crate::compaction::projection::source_digest;
 use crate::config::CoreConfig;
 use crate::provider::mock::MockProvider;
-use crate::provider::Message;
+use crate::provider::{Message, ToolCallFunction, ToolCallInfo};
 
 /// Runtime prefix used by every scenario; small enough to leave the window to
 /// the transcript.
@@ -736,4 +736,43 @@ async fn disabled_compaction_skips_the_guard_entirely() {
         .as_ref()
         .expect("a disabled policy must not block the request");
     assert!(preflight.statuses.is_empty());
+}
+
+#[tokio::test]
+async fn interrupted_earlier_run_does_not_block_the_last_rung() {
+    let call = ToolCallInfo {
+        id: "call-0".to_string(),
+        call_type: "function".to_string(),
+        function: ToolCallFunction {
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let mut messages = vec![
+        Message::user("interrupted"),
+        Message::assistant_with_tool_calls("", vec![call]),
+        Message::tool_result("call-0", "partial", false),
+    ];
+    messages.extend(complete_run("only", 33_000));
+    let config = config(2);
+    let budget = budget_for(&config);
+    assert!(
+        budget.over_emergency(crate::compaction::budget::estimate_messages_tokens(
+            &messages
+        ))
+    );
+
+    let preflight = preflight(&messages, &config, &summarizer()).await;
+    preflight
+        .result
+        .as_ref()
+        .expect("last rung must summarize past an interrupted earlier run");
+    let state = preflight.runtime.state().expect("projection");
+    assert_eq!(state.compacted_through, messages.len());
+    assert!(
+        state.revision >= 1 && state.revision <= 2,
+        "unexpected revision {}",
+        state.revision
+    );
+    assert_projection_is_consistent(&preflight.runtime, &messages, state.revision);
 }

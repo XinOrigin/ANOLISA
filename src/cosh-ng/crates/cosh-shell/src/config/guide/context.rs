@@ -54,13 +54,27 @@ impl GuideStore {
                 entries: Vec::new(),
             });
         };
-        let records: Contexts = serde_json::from_slice(&bytes).map_err(|_| Error::Corrupt)?;
-        if records.version != 1
-            || records.entries.len() > MAX_RECORDS
-            || records.entries.iter().any(|record| {
-                !valid_context_id(&record.id) || guidance::failure_kind(&record.event).is_none()
-            })
-        {
+        let mut records: Contexts = serde_json::from_slice(&bytes).map_err(|_| Error::Corrupt)?;
+        if records.version != 1 {
+            return Err(Error::Corrupt);
+        }
+        records.entries.retain(|record| {
+            let valid_id = valid_context_id(&record.id);
+            let keep = valid_id && guidance::failure_kind(&record.event).is_some();
+            if !keep {
+                tracing::debug!(
+                    id = if valid_id {
+                        record.id.as_str()
+                    } else {
+                        "<invalid>"
+                    },
+                    valid_id,
+                    "Dropping unredacted or malformed failure context entry"
+                );
+            }
+            keep
+        });
+        if records.entries.len() > MAX_RECORDS {
             return Err(Error::Corrupt);
         }
         Ok(records)

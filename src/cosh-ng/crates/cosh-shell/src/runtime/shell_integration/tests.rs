@@ -603,3 +603,44 @@ fn failed_context_persistence_does_not_consume_an_invitation() {
         Status::Show
     );
 }
+
+#[test]
+fn advice_claim_heals_expired_unsafe_failure_context_store_on_disk() {
+    let (dir, store, runtime) = fixture();
+    let snapshot = store.snapshot(Some(&runtime)).unwrap();
+    let unsafe_id = uuid::Uuid::new_v4().simple().to_string();
+    let path = dir.path().join("guide/failure-contexts.json");
+    let poisoned = json!({
+        "version": 1,
+        "entries": [{
+            "id": unsafe_id,
+            "event": {
+                "expression": "cargo test --token ghp_333333333333333333333333333333333333",
+                "status": 101,
+                "cwd": "/project",
+                "observed_at_ms": 1000,
+                "scope": "observed_command_fragment",
+                "identity": "external_unshadowed"
+            }
+        }]
+    });
+    std::fs::write(&path, serde_json::to_vec(&poisoned).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let now_ms = 1000 + 3_600_000 + 5_000;
+    let mut value = advice(&snapshot.generation);
+    value["event"]["observed_at_ms"] = json!(now_ms);
+    let result = evaluate(request(&value), now_ms, Some((&store, &runtime)), render);
+    assert_eq!(result.decision, Status::Show);
+    assert!(!result.decision_id.is_empty());
+
+    let loaded = store
+        .load_failure_context(&result.decision_id, now_ms)
+        .unwrap();
+    assert_eq!(loaded.expression, "cargo test");
+
+    let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let entries = on_disk["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], json!(result.decision_id));
+}

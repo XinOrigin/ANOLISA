@@ -1093,6 +1093,281 @@ fn failure_context_capacity_is_bounded_and_busy_or_unsafe_state_fails_quietly() 
 }
 
 #[test]
+fn failure_context_unsafe_entry_does_not_poison_clean_sibling() {
+    use crate::insight::guidance::{BashEvent, CommandIdentity, ExecutionScope};
+    let (_temp, store, _runtime) = fixture();
+
+    // 1. Prepare clean event and unsafe event (with redacted token)
+    let clean_event = BashEvent {
+        expression: "cargo test --test clean_suite".into(),
+        status: 101,
+        cwd: "/clean/project".into(),
+        observed_at_ms: 1000,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    let clean_id = uuid::Uuid::new_v4().simple().to_string();
+
+    let unsafe_event = BashEvent {
+        expression: "cargo test --token ghp_111111111111111111111111111111111111".into(),
+        status: 101,
+        cwd: "/project".into(),
+        observed_at_ms: 1000,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    assert!(crate::insight::guidance::failure_kind(&unsafe_event).is_none());
+    let unsafe_id = uuid::Uuid::new_v4().simple().to_string();
+
+    // 2. Persist both entries to failure-contexts.json
+    let contexts_json = serde_json::json!({
+        "version": 1,
+        "entries": [
+            { "id": clean_id, "event": clean_event },
+            { "id": unsafe_id, "event": unsafe_event }
+        ]
+    });
+    private_state::atomic_write(
+        &store.root.join("failure-contexts.json"),
+        &serde_json::to_vec(&contexts_json).unwrap(),
+        MAX_BYTES,
+    )
+    .unwrap();
+
+    // 3. Sibling isolation: Clean sibling query must succeed
+    assert_eq!(
+        store.load_failure_context(&clean_id, 1002).unwrap(),
+        clean_event
+    );
+
+    // 4. Unsafe entry is filtered and cannot be loaded
+    assert!(store.load_failure_context(&unsafe_id, 1002).is_err());
+}
+
+#[test]
+fn failure_context_expired_unsafe_entry_heals_and_allows_new_contexts() {
+    use crate::insight::guidance::{BashEvent, CommandIdentity, ExecutionScope};
+    let (_temp, store, _runtime) = fixture();
+
+    // 1. Poison store with an unsafe entry at t=1000
+    let unsafe_event = BashEvent {
+        expression: "cargo test --token ghp_222222222222222222222222222222222222".into(),
+        status: 101,
+        cwd: "/project".into(),
+        observed_at_ms: 1000,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    let unsafe_id = uuid::Uuid::new_v4().simple().to_string();
+
+    let contexts_json = serde_json::json!({
+        "version": 1,
+        "entries": [{ "id": unsafe_id, "event": unsafe_event }]
+    });
+    private_state::atomic_write(
+        &store.root.join("failure-contexts.json"),
+        &serde_json::to_vec(&contexts_json).unwrap(),
+        MAX_BYTES,
+    )
+    .unwrap();
+
+    // 2. Advance time past TTL (TTL_MS = 3_600_000)
+    let new_now_ms = 1000 + 3_600_000 + 10_000;
+    let new_event = BashEvent {
+        expression: "pytest test_module.py".into(),
+        status: 1,
+        cwd: "/project".into(),
+        observed_at_ms: new_now_ms,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    let new_id = uuid::Uuid::new_v4().simple().to_string();
+
+    // 3. Self-healing: Recording new failure context must not be blocked
+    store
+        .save_failure_context(&new_id, &new_event, new_now_ms)
+        .unwrap();
+
+    // 4. Verify new context is loadable and old unsafe entry is gone
+    assert_eq!(
+        store.load_failure_context(&new_id, new_now_ms).unwrap(),
+        new_event
+    );
+    assert!(store.load_failure_context(&unsafe_id, new_now_ms).is_err());
+}
+
+#[test]
+fn failure_context_structural_corruption_still_fails_with_corrupt_error() {
+    use crate::insight::guidance::{BashEvent, CommandIdentity, ExecutionScope};
+    let (_temp, store, _runtime) = fixture();
+    let valid_event = BashEvent {
+        expression: "cargo build".into(),
+        status: 101,
+        cwd: "/project".into(),
+        observed_at_ms: 1000,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    let valid_id = uuid::Uuid::new_v4().simple().to_string();
+    let path = store.root.join("failure-contexts.json");
+
+    // Case 1: Broken JSON syntax
+    private_state::atomic_write(&path, b"{ broken json syntax", MAX_BYTES).unwrap();
+    assert_eq!(
+        store.load_failure_context(&valid_id, 1000).unwrap_err(),
+        Error::Corrupt
+    );
+    assert_eq!(
+        store
+            .save_failure_context(&valid_id, &valid_event, 1000)
+            .unwrap_err(),
+        Error::Corrupt
+    );
+
+    // Case 2: Version mismatch
+    let bad_version = serde_json::json!({ "version": 2, "entries": [] });
+    private_state::atomic_write(&path, &serde_json::to_vec(&bad_version).unwrap(), MAX_BYTES)
+        .unwrap();
+    assert_eq!(
+        store.load_failure_context(&valid_id, 1000).unwrap_err(),
+        Error::Corrupt
+    );
+
+    // Case 3: Entries exceed MAX_RECORDS (17 > 16 valid entries)
+    let excess: Vec<_> = (0..17)
+        .map(|_| serde_json::json!({ "id": uuid::Uuid::new_v4().simple().to_string(), "event": valid_event }))
+        .collect();
+    let excess_json = serde_json::json!({ "version": 1, "entries": excess });
+    private_state::atomic_write(&path, &serde_json::to_vec(&excess_json).unwrap(), MAX_BYTES)
+        .unwrap();
+    assert_eq!(
+        store.load_failure_context(&valid_id, 1000).unwrap_err(),
+        Error::Corrupt
+    );
+}
+
+#[test]
+fn failure_context_mixed_excess_with_invalid_entries_heals_cleanly() {
+    use crate::insight::guidance::{BashEvent, CommandIdentity, ExecutionScope};
+    let (_temp, store, _runtime) = fixture();
+    let valid_event = BashEvent {
+        expression: "cargo test".into(),
+        status: 101,
+        cwd: "/project".into(),
+        observed_at_ms: 1000,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    let valid_id = uuid::Uuid::new_v4().simple().to_string();
+
+    let unsafe_event = BashEvent {
+        expression: "cargo test --token ghp_111111111111111111111111111111111111".into(),
+        status: 101,
+        cwd: "/project".into(),
+        observed_at_ms: 1000,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+
+    // 1 valid + 16 unsafe = 17 entries on disk (exceeds MAX_RECORDS before filtering)
+    let mut entries = vec![serde_json::json!({ "id": valid_id, "event": valid_event })];
+    for _ in 0..16 {
+        entries.push(serde_json::json!({
+            "id": uuid::Uuid::new_v4().simple().to_string(),
+            "event": unsafe_event,
+        }));
+    }
+    let mixed_json = serde_json::json!({ "version": 1, "entries": entries });
+    private_state::atomic_write(
+        &store.root.join("failure-contexts.json"),
+        &serde_json::to_vec(&mixed_json).unwrap(),
+        MAX_BYTES,
+    )
+    .unwrap();
+
+    // Sibling loading succeeds because retain prunes unsafe records before container limit check
+    assert_eq!(
+        store.load_failure_context(&valid_id, 1000).unwrap(),
+        valid_event
+    );
+}
+
+#[test]
+fn failure_context_malformed_id_and_invalid_cwd_isolate_without_evicting_clean_siblings() {
+    use crate::insight::guidance::{BashEvent, CommandIdentity, ExecutionScope};
+    let (_temp, store, _runtime) = fixture();
+
+    let mut clean_ids = Vec::new();
+    let mut entries = Vec::new();
+    for i in 0..15 {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let event = BashEvent {
+            expression: format!("cargo test case_{i}"),
+            status: 101,
+            cwd: "/clean/project".into(),
+            observed_at_ms: 1000 + i as u64,
+            scope: ExecutionScope::ObservedCommandFragment,
+            identity: CommandIdentity::ExternalUnshadowed,
+        };
+        entries.push(serde_json::json!({ "id": id, "event": event }));
+        clean_ids.push((id, event));
+    }
+
+    // Add an entry with a malformed/log-injecting ID (fresh timestamp) and verify
+    // it does not poison clean entries or consume one of the 16 clean slots on heal.
+    let bad_id = "../escape\ntoken=ghp_111111111111111111111111111111111111".to_string();
+    let bad_cwd_event = BashEvent {
+        expression: "cargo build".into(),
+        status: 101,
+        cwd: "relative/path\n".into(),
+        observed_at_ms: 1500,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    assert!(crate::insight::guidance::failure_kind(&bad_cwd_event).is_none());
+    entries.push(serde_json::json!({ "id": bad_id, "event": bad_cwd_event }));
+
+    let path = store.root.join("failure-contexts.json");
+    let raw = serde_json::json!({ "version": 1, "entries": entries });
+    private_state::atomic_write(&path, &serde_json::to_vec(&raw).unwrap(), MAX_BYTES).unwrap();
+
+    assert_eq!(
+        store.load_failure_context(&clean_ids[0].0, 2000).unwrap(),
+        clean_ids[0].1
+    );
+    assert!(store.load_failure_context(&bad_id, 2000).is_err());
+
+    // Save a 16th clean entry: invalid entry must be pruned without evicting oldest clean entry.
+    let sixteenth_id = uuid::Uuid::new_v4().simple().to_string();
+    let sixteenth_event = BashEvent {
+        expression: "pytest tests/test_ok.py".into(),
+        status: 1,
+        cwd: "/clean/project".into(),
+        observed_at_ms: 2000,
+        scope: ExecutionScope::ObservedCommandFragment,
+        identity: CommandIdentity::ExternalUnshadowed,
+    };
+    store
+        .save_failure_context(&sixteenth_id, &sixteenth_event, 2000)
+        .unwrap();
+
+    assert_eq!(
+        store.load_failure_context(&clean_ids[0].0, 2000).unwrap(),
+        clean_ids[0].1
+    );
+    assert_eq!(
+        store.load_failure_context(&sixteenth_id, 2000).unwrap(),
+        sixteenth_event
+    );
+    let persisted: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let persisted_entries = persisted["entries"].as_array().unwrap();
+    assert_eq!(persisted_entries.len(), 16);
+    assert!(!persisted_entries
+        .iter()
+        .any(|entry| entry["id"].as_str() == Some(bad_id.as_str())));
+}
+
+#[test]
 fn login_health_same_evidence_is_suppressed_within_window() {
     let (_temp, store, runtime) = fixture();
     let snapshot = store.snapshot(Some(&runtime)).unwrap();

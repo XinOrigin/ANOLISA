@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useId } from 'react';
 
 export interface DateTimePickerProps {
   value: number; // ms timestamp
@@ -18,10 +18,12 @@ function fromDatetimeLocal(val: string): number {
 }
 
 export const DateTimePicker: React.FC<DateTimePickerProps> = ({ value, onChange, label, className }) => {
+  const id = useId();
   return (
     <div className={`flex items-center gap-2 ${className || ''}`}>
-      {label && <label className="text-sm text-gray-600 whitespace-nowrap">{label}</label>}
+      {label && <label htmlFor={id} className="text-sm text-gray-600 whitespace-nowrap">{label}</label>}
       <input
+        id={id}
         type="datetime-local"
         className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
         value={toDatetimeLocal(value)}

@@ -1002,3 +1002,34 @@ for (const [tab, api, row] of [
     assert.ok(rows(rendered).length, 'successful retry restores the row');
   });
 }
+
+test('datetime picker: associates visible labels with unique input ids', () => {
+  const React = require('react');
+  const { renderToStaticMarkup } = require('react-dom/server');
+  const code = transpile('src/components/DateTimePicker.tsx');
+  const module = { exports: {} };
+  new Function('require', 'module', 'exports', code)((name) => {
+    if (name === 'react') return React;
+    throw new Error(`Unexpected DateTimePicker dependency: ${name}`);
+  }, module, module.exports);
+  const { DateTimePicker } = module.exports;
+  const html = renderToStaticMarkup(
+    React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(DateTimePicker, { label: 'Start time', value: 1_700_000_000_000, onChange: () => {} }),
+      React.createElement(DateTimePicker, { label: 'End time', value: 1_700_003_600_000, onChange: () => {} }),
+      React.createElement(DateTimePicker, { value: 1_700_007_200_000, onChange: () => {} }),
+    ),
+  );
+  const labels = [...html.matchAll(/<label[^>]*for="([^"]+)"[^>]*>([^<]+)<\/label>/g)];
+  const inputs = [...html.matchAll(/<input[^>]*id="([^"]+)"[^>]*>/g)];
+  assert.equal(labels.length, 2, 'only labelled pickers render a <label>');
+  assert.equal(inputs.length, 3, 'all three pickers render an <input> with an id');
+  assert.equal(labels[0][2], 'Start time');
+  assert.equal(labels[1][2], 'End time');
+  assert.equal(labels[0][1], inputs[0][1], 'Start time label for must match its input id');
+  assert.equal(labels[1][1], inputs[1][1], 'End time label for must match its input id');
+  assert.notEqual(inputs[0][1], inputs[1][1], 'each picker instance must receive a unique id');
+  assert.notEqual(inputs[1][1], inputs[2][1], 'labelled and unlabelled pickers receive distinct ids');
+});

@@ -697,6 +697,158 @@ test('security events query: the Query button re-issues the request with unchang
   );
 });
 
+test('security observability: clearing selectedSessionId clears stale runs, runId, timeline, and errors', async () => {
+  const { calls, driver, page } = renderSecurityPage();
+
+  driver.slots[2].setter('timeline');
+  driver.slots[26].setter('session-a');
+  let rendered = driver.render(page);
+  rendered.effects[5]();
+  rendered.effects[6]();
+  calls.fetchSecurityEvents[0].resolve({ state: 'ok', data: { items: [] } });
+  calls.fetchSecurityRuns[0].resolve({
+    state: 'ok',
+    data: { items: [{ run_id: 'run-a1' }] },
+  });
+  await settle();
+
+  rendered = driver.render(page);
+  rendered.effects[7]();
+  calls.fetchSecurityTimeline[0].reject(new Error('timeline failed'));
+  await settle();
+  assert.equal(driver.slots[33].value, 'timeline failed');
+
+  // Resolve a second timeline load so both timeline data and a prior error case are covered.
+  rendered = driver.render(page);
+  rendered.effects[7]();
+  calls.fetchSecurityTimeline[1].resolve({
+    state: 'ok',
+    data: { items: [{ kind: 'event', id: 'tl-a1' }] },
+  });
+  await settle();
+  assert.equal(driver.slots[30].value, 'run-a1');
+  assert.equal(driver.slots[31].value?.data?.items?.length, 1);
+
+  // Now simulate a time-range change leaving 0 sessions (selectedSessionId -> null).
+  driver.slots[26].setter(null);
+  rendered = driver.render(page);
+  rendered.effects[5]();
+  rendered.effects[6]();
+  rendered.effects[7]();
+  await settle();
+
+  assert.equal(driver.slots[27].value, null, 'securityRuns must clear when selectedSessionId is null');
+  assert.equal(driver.slots[28].value, false, 'runsLoading must clear on early return');
+  assert.equal(driver.slots[29].value, null, 'runsError must clear on early return');
+  assert.equal(driver.slots[30].value, null, 'selectedRunId must clear when selectedSessionId is null');
+  assert.equal(driver.slots[31].value, null, 'timeline must clear when selectedSessionId is null');
+  assert.equal(driver.slots[32].value, false, 'timelineLoading must clear on early return');
+  assert.equal(driver.slots[33].value, null, 'timelineError must clear on early return');
+  assert.equal(driver.slots[35].value, null, 'sessionEvents must clear on early return');
+  assert.equal(driver.slots[36].value, false, 'sessionEventsLoading must clear on early return');
+  assert.equal(driver.slots[37].value, null, 'sessionEventsError must clear on early return');
+  assert.equal(calls.fetchSecurityTimeline.length, 2, 'must not fetch timeline without a session');
+});
+
+test('security observability: switching sessions does not fetch timeline with old runId and clears on empty runs', async () => {
+  const { calls, driver, page } = renderSecurityPage();
+
+  driver.slots[2].setter('timeline');
+  driver.slots[26].setter('session-a');
+  let rendered = driver.render(page);
+  rendered.effects[6]();
+  calls.fetchSecurityRuns[0].resolve({
+    state: 'ok',
+    data: { items: [{ run_id: 'run-a1' }] },
+  });
+  await settle();
+
+  rendered = driver.render(page);
+  rendered.effects[7]();
+  assert.equal(calls.fetchSecurityTimeline.length, 1);
+  calls.fetchSecurityTimeline[0].resolve({
+    state: 'ok',
+    data: { items: [{ kind: 'event', id: 'tl-a1' }] },
+  });
+  await settle();
+
+  // Switch from session-a to session-b without manually clearing selectedRunId.
+  driver.slots[26].setter('session-b');
+  rendered = driver.render(page);
+  const runsDepsOnSwitch = rendered.effects[6].__deps;
+  rendered.effects[6]();
+  rendered.effects[7]();
+
+  assert.equal(calls.fetchSecurityRuns.length, 2, 'switching sessions must issue fetchSecurityRuns once for session-b');
+  const postSwitchDeps = driver.render(page).effects[6].__deps;
+  assert.equal(postSwitchDeps.length, runsDepsOnSwitch.length);
+  assert.ok(
+    postSwitchDeps.slice(0, -1).every((dep, i) => Object.is(dep, runsDepsOnSwitch[i])),
+    'securityRuns effect deps must remain stable across the post-switch re-render',
+  );
+  assert.equal(
+    calls.fetchSecurityTimeline.length,
+    1,
+    'must not fire fetchSecurityTimeline({ session_id: session-b, run_id: run-a1 })',
+  );
+  assert.equal(driver.slots[31].value, null, 'stale timeline must clear on session switch');
+  assert.equal(driver.slots[33].value, null, 'stale timelineError must clear on session switch');
+
+  // Session B has 0 runs.
+  calls.fetchSecurityRuns[1].resolve({ state: 'ok', data: { items: [] } });
+  await settle();
+  rendered = driver.render(page);
+  rendered.effects[7]();
+
+  assert.equal(driver.slots[30].value, null, 'selectedRunId must be null when session B has 0 runs');
+  assert.equal(driver.slots[31].value, null, 'timeline must remain null when session B has 0 runs');
+  assert.equal(driver.slots[33].value, null, 'timelineError must remain null when session B has 0 runs');
+  assert.equal(calls.fetchSecurityTimeline.length, 1, 'no timeline request when session B has 0 runs');
+});
+
+test('security observability: viewing timeline from events tab preserves the explicit session and run', async () => {
+  const { calls, driver, page } = renderSecurityPage();
+
+  driver.slots[2].setter('timeline');
+  driver.slots[26].setter('session-a');
+  let rendered = driver.render(page);
+  rendered.effects[6]();
+  calls.fetchSecurityRuns[0].resolve({
+    state: 'ok',
+    data: { items: [{ run_id: 'run-a1' }] },
+  });
+  await settle();
+
+  // Switch to events tab and click View Timeline for (session-b, run-b2).
+  driver.slots[2].setter('events');
+  rendered = driver.render(page);
+  rendered.effects[6]();
+  rendered.effects[7]();
+  const eventsTab = findElement(rendered.element, (node) => (
+    node.props && typeof node.props.onViewTimeline === 'function'
+  ));
+  assert.ok(eventsTab, 'EventsTab must be rendered');
+  eventsTab.props.onViewTimeline('session-b', 'run-b2');
+
+  rendered = driver.render(page);
+  assert.equal(driver.slots[2].value, 'timeline');
+  assert.equal(driver.slots[26].value, 'session-b');
+  assert.equal(driver.slots[30].value, 'run-b2');
+
+  rendered.effects[6]();
+  rendered.effects[7]();
+  assert.equal(calls.fetchSecurityTimeline.length, 1, 'must fetch timeline for explicit (session-b, run-b2)');
+  assert.equal(calls.fetchSecurityTimeline[0].args[0].session_id, 'session-b');
+  assert.equal(calls.fetchSecurityTimeline[0].args[0].run_id, 'run-b2');
+
+  calls.fetchSecurityRuns[1].resolve({
+    state: 'ok',
+    data: { items: [{ run_id: 'run-b1' }, { run_id: 'run-b2' }] },
+  });
+  await settle();
+  assert.equal(driver.slots[30].value, 'run-b2', 'explicit run-b2 must not be overwritten by run-b1');
+});
+
 // ─── SkillMetricsPage ─────────────────────────────────────────────────────────
 //
 // Hook-slot map: 0 startMs · 1 endMs · 2 agentName · 3 agents · 4 granularity

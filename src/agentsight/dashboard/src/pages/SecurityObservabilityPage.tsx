@@ -118,8 +118,18 @@ export const SecurityObservabilityPage: React.FC = () => {
   // touches the spinner, so a superseded loadSessions must still clear its own
   // flag or the timeline session <select> stays disabled forever.
   const sessionsLoadingRequestIdRef = useRef(0);
+  const prevSessionIdRef = useRef<string | null>(null);
+  const explicitRunForSessionRef = useRef<{ sessionId: string; runId: string } | null>(null);
 
   const isAvailable = isSecurityAvailableState(status?.state);
+  const explicitRunTarget = explicitRunForSessionRef.current;
+  const matchesExplicitRun = explicitRunTarget !== null
+    && explicitRunTarget.sessionId === selectedSessionId
+    && explicitRunTarget.runId === selectedRunId;
+  const hasStaleRunFromSessionSwitch = prevSessionIdRef.current !== null
+    && selectedSessionId !== prevSessionIdRef.current
+    && !matchesExplicitRun;
+  const effectiveSelectedRunId = hasStaleRunFromSessionSwitch ? null : selectedRunId;
   const rangeParams: SecurityTimeRangeParams = useMemo(() => ({
     start_ns: msToNs(startMs),
     end_ns: msToNs(endMs),
@@ -341,6 +351,8 @@ export const SecurityObservabilityPage: React.FC = () => {
   useEffect(() => {
     if (!isAvailable || activeTab !== 'timeline' || !selectedSessionId) {
       setSessionEvents(null);
+      setSessionEventsError(null);
+      setSessionEventsLoading(false);
       return;
     }
 
@@ -371,8 +383,27 @@ export const SecurityObservabilityPage: React.FC = () => {
   }, [activeTab, isAvailable, rangeParams, selectedSessionId, timelineRefreshNonce, t]);
 
   useEffect(() => {
+    const prevSessionId = prevSessionIdRef.current;
+    const explicitTarget = explicitRunForSessionRef.current;
+    prevSessionIdRef.current = selectedSessionId;
+    explicitRunForSessionRef.current = null;
     if (!isAvailable || activeTab !== 'timeline' || !selectedSessionId) {
+      setSecurityRuns(null);
+      setRunsError(null);
+      setRunsLoading(false);
+      setSelectedRunId(null);
       return;
+    }
+
+    const matchesExplicitTarget = explicitTarget !== null
+      && explicitTarget.sessionId === selectedSessionId
+      && explicitTarget.runId === selectedRunId;
+    const switchedSession = prevSessionId !== null
+      && selectedSessionId !== prevSessionId
+      && !matchesExplicitTarget;
+    const preserveCurrentRun = !switchedSession;
+    if (switchedSession) {
+      setSelectedRunId(null);
     }
 
     let cancelled = false;
@@ -380,12 +411,13 @@ export const SecurityObservabilityPage: React.FC = () => {
     setRunsError(null);
     setSecurityRuns(null);
     setTimeline(null);
+    setTimelineError(null);
     fetchSecurityRuns(selectedSessionId, { ...rangeParams, limit: 100, offset: 0 })
       .then((response) => {
         if (!cancelled) {
           setSecurityRuns(response);
           const ids = new Set(response.data.items.map((run) => run.run_id));
-          setSelectedRunId((current) => current && ids.has(current)
+          setSelectedRunId((current) => preserveCurrentRun && current && ids.has(current)
             ? current
             : response.data.items[0]?.run_id ?? null);
         }
@@ -406,17 +438,21 @@ export const SecurityObservabilityPage: React.FC = () => {
   }, [activeTab, isAvailable, rangeParams, selectedSessionId, timelineRefreshNonce, t]);
 
   useEffect(() => {
-    if (!isAvailable || activeTab !== 'timeline' || !selectedSessionId || !selectedRunId) {
+    if (!isAvailable || activeTab !== 'timeline' || !selectedSessionId || !effectiveSelectedRunId) {
+      setTimeline(null);
+      setTimelineError(null);
+      setTimelineLoading(false);
       return;
     }
 
     let cancelled = false;
     setTimelineLoading(true);
     setTimelineError(null);
+    setTimeline(null);
     fetchSecurityTimeline({
       ...rangeParams,
       session_id: selectedSessionId,
-      run_id: selectedRunId,
+      run_id: effectiveSelectedRunId,
       limit: 500,
       include_security: true,
     })
@@ -433,7 +469,7 @@ export const SecurityObservabilityPage: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, isAvailable, rangeParams, selectedRunId, selectedSessionId, timelineRefreshNonce, t]);
+  }, [activeTab, effectiveSelectedRunId, isAvailable, rangeParams, selectedSessionId, timelineRefreshNonce, t]);
 
   const handleRefresh = useCallback(async () => {
     const nextStatus = await loadStatus();
@@ -457,7 +493,7 @@ export const SecurityObservabilityPage: React.FC = () => {
   const verdictItems = verdictCounts?.data.items ?? [];
   const verdictFilterOptions = Array.from(new Set(verdictItems.map((item) => String(item.value)).filter(Boolean)));
   const selectedSession = (securitySessions?.data.items ?? []).find((session) => session.session_id === selectedSessionId) ?? null;
-  const selectedRun = (securityRuns?.data.items ?? []).find((run) => run.run_id === selectedRunId) ?? null;
+  const selectedRun = (securityRuns?.data.items ?? []).find((run) => run.run_id === effectiveSelectedRunId) ?? null;
 
   return (
     <main className="mx-auto max-w-screen-xl space-y-6 px-6 py-6">
@@ -571,6 +607,7 @@ export const SecurityObservabilityPage: React.FC = () => {
               loadEvents={loadEvents}
               onSelectEvent={setSelectedEventId}
               onViewTimeline={(sessionId, runId) => {
+                explicitRunForSessionRef.current = { sessionId, runId };
                 setSelectedSessionId(sessionId);
                 setSelectedRunId(runId);
                 setActiveTab('timeline');
@@ -582,7 +619,7 @@ export const SecurityObservabilityPage: React.FC = () => {
             <TimelineTab
               selectedSessionId={selectedSessionId}
               setSelectedSessionId={setSelectedSessionId}
-              selectedRunId={selectedRunId}
+              selectedRunId={effectiveSelectedRunId}
               setSelectedRunId={setSelectedRunId}
               securitySessions={securitySessions}
               sessionsLoading={sessionsLoading}

@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use seccompiler::{
-    apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-    SeccompFilter, SeccompRule, TargetArch,
+    apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+    SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
 };
 
 /// Match the build target_arch to seccompiler's TargetArch so the BPF
@@ -107,10 +107,11 @@ fn unconditional_rule() -> Result<SeccompRule, seccompiler::Error> {
     )?])?)
 }
 
-/// Apply the seccomp deny-list filter to the current thread (and future children).
+/// Apply the seccomp deny-list filter to all threads in the process (and future children).
 ///
-/// Must be called **after** bootstrap (image creation, loop mount) completes,
-/// but **before** the listener loop starts.
+/// Uses `SECCOMP_FILTER_FLAG_TSYNC` so pre-existing Tokio worker and blocking
+/// threads receive the filter as well. Must be called **after** bootstrap
+/// (image creation, loop mount) completes, but **before** the listener loop starts.
 pub fn apply_seccomp_filter() -> anyhow::Result<()> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
@@ -126,10 +127,10 @@ pub fn apply_seccomp_filter() -> anyhow::Result<()> {
     )?;
 
     let bpf: BpfProgram = filter.try_into()?;
-    apply_filter(&bpf)?;
+    apply_filter_all_threads(&bpf)?;
 
     tracing::info!(
-        "Seccomp filter applied: {} dangerous syscalls blocked",
+        "Seccomp filter applied to all threads: {} dangerous syscalls blocked",
         blocked_syscalls().len()
     );
     Ok(())
@@ -167,5 +168,135 @@ mod tests {
             arch,
         );
         assert!(filter.is_ok(), "seccomp filter should build without errors");
+    }
+
+    const TSYNC_TEST_HELPER_ENV: &str = "WS_CKPT_TEST_SECCOMP_TSYNC_HELPER";
+    const TSYNC_TEST_NAME: &str = "seccomp::tests::apply_seccomp_filter_applies_to_all_threads";
+
+    fn current_tid() -> libc::pid_t {
+        // SAFETY: `gettid(2)` takes no arguments and always succeeds on Linux.
+        unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
+    }
+
+    fn read_thread_status(tid: libc::pid_t) -> String {
+        let path = format!("/proc/self/task/{tid}/status");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"))
+    }
+
+    fn parse_status_field<'a>(status: &'a str, key: &str) -> Option<&'a str> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key).map(str::trim))
+    }
+
+    #[test]
+    fn apply_seccomp_filter_applies_to_all_threads() {
+        if std::env::var_os(TSYNC_TEST_HELPER_ENV).is_none() {
+            let exe = std::env::current_exe().expect("resolve current test executable");
+            let output = std::process::Command::new(exe)
+                .arg("--exact")
+                .arg(TSYNC_TEST_NAME)
+                .arg("--test-threads=1")
+                .arg("--nocapture")
+                .env(TSYNC_TEST_HELPER_ENV, "1")
+                .output()
+                .expect("spawn seccomp subprocess helper");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "seccomp subprocess helper failed (status: {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "seccomp subprocess helper did not execute target test\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let applied = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready_sibling = std::sync::Arc::clone(&ready);
+        let applied_sibling = std::sync::Arc::clone(&applied);
+
+        let sibling = std::thread::spawn(move || {
+            let tid = current_tid();
+            let before = read_thread_status(tid);
+            let before_filters = parse_status_field(&before, "Seccomp_filters:\t")
+                .and_then(|v| v.parse::<u64>().ok());
+
+            // Ensure the sibling thread is live before apply_seccomp_filter()
+            // runs, then inspect /proc status after installation completes.
+            ready_sibling.wait();
+            applied_sibling.wait();
+
+            let after = read_thread_status(tid);
+            (tid, before_filters, after)
+        });
+
+        let caller_tid = current_tid();
+        let caller_before = read_thread_status(caller_tid);
+        let caller_before_filters = parse_status_field(&caller_before, "Seccomp_filters:\t")
+            .and_then(|v| v.parse::<u64>().ok());
+
+        ready.wait();
+        let apply_res = apply_seccomp_filter();
+        applied.wait();
+        apply_res.expect("apply_seccomp_filter should succeed");
+
+        let caller_after = read_thread_status(caller_tid);
+        let (sibling_tid, sibling_before_filters, sibling_after) =
+            sibling.join().expect("sibling thread panicked");
+
+        assert_ne!(
+            caller_tid, sibling_tid,
+            "sibling must be a distinct OS thread"
+        );
+
+        let caller_seccomp = parse_status_field(&caller_after, "Seccomp:\t");
+        let sibling_seccomp = parse_status_field(&sibling_after, "Seccomp:\t");
+        assert_eq!(
+            caller_seccomp,
+            Some("2"),
+            "calling thread (tid {caller_tid}) should have Seccomp:\\t2, got {caller_seccomp:?}"
+        );
+        assert_eq!(
+            sibling_seccomp,
+            Some("2"),
+            "pre-existing sibling thread (tid {sibling_tid}) should have Seccomp:\\t2, got {sibling_seccomp:?}"
+        );
+
+        let caller_nnp = parse_status_field(&caller_after, "NoNewPrivs:\t");
+        let sibling_nnp = parse_status_field(&sibling_after, "NoNewPrivs:\t");
+        assert_eq!(
+            caller_nnp,
+            Some("1"),
+            "calling thread (tid {caller_tid}) should have NoNewPrivs:\\t1, got {caller_nnp:?}"
+        );
+        assert_eq!(
+            sibling_nnp,
+            Some("1"),
+            "pre-existing sibling thread (tid {sibling_tid}) should have NoNewPrivs:\\t1, got {sibling_nnp:?}"
+        );
+
+        if let Some(before) = caller_before_filters {
+            let after = parse_status_field(&caller_after, "Seccomp_filters:\t")
+                .and_then(|v| v.parse::<u64>().ok());
+            assert_eq!(
+                after,
+                Some(before + 1),
+                "calling thread (tid {caller_tid}) should gain one seccomp filter"
+            );
+        }
+        if let Some(before) = sibling_before_filters {
+            let after = parse_status_field(&sibling_after, "Seccomp_filters:\t")
+                .and_then(|v| v.parse::<u64>().ok());
+            assert_eq!(
+                after,
+                Some(before + 1),
+                "pre-existing sibling thread (tid {sibling_tid}) should gain one seccomp filter"
+            );
+        }
     }
 }

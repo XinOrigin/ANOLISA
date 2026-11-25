@@ -675,9 +675,11 @@ fn load_category_meta(dir: &Path, cat_name: &str, max_size: usize) -> CategoryMe
 /// Read `path` as UTF-8 if it is a regular file of at most `max_size` bytes.
 ///
 /// The open is non-blocking so a FIFO under this name cannot stall the load
-/// before the handle's own type is checked. A stat length is only a snapshot
-/// (the file can grow after it, and a FIFO reports 0), so the read itself is
-/// capped at `max_size + 1` bytes and an extra byte means over the limit.
+/// before the handle's own type is checked, and `O_NOFOLLOW` on Unix ensures
+/// a symlinked `_category.yaml` is rejected rather than reading outside the
+/// skill store. A stat length is only a snapshot (the file can grow after it,
+/// and a FIFO reports 0), so the read itself is capped at `max_size + 1` bytes
+/// and an extra byte means over the limit.
 fn read_category_yaml(path: &Path, max_size: usize) -> Option<String> {
     use std::io::Read;
 
@@ -686,7 +688,7 @@ fn read_category_yaml(path: &Path, max_size: usize) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
     let file = options.open(path).ok()?;
     if !file.metadata().ok()?.is_file() {
@@ -1074,6 +1076,66 @@ mod tests {
         assert!(no_errors);
         assert_eq!(meta.name, "team");
         assert_eq!(meta.description, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_category_meta_is_treated_as_absent() {
+        // A symlinked `_category.yaml` could point outside the skill store and
+        // exfiltrate or spoof metadata from an arbitrary file; O_NOFOLLOW must
+        // refuse it so the loader falls back to the default category meta.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let outside_dir = tempfile::TempDir::new().unwrap();
+        let outside_target = outside_dir.path().join("secret.yaml");
+        std::fs::write(
+            &outside_target,
+            "name: leaked-category\ndescription: outside target content\n",
+        )
+        .unwrap();
+
+        let cat_dir = temp_dir.path().join("team");
+        let skill_dir = cat_dir.join("team-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_target, cat_dir.join("_category.yaml")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: team-skill\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let mut store = SkillStore::new();
+        let errors = store.load_from_directory(temp_dir.path(), &ParseConfig::default());
+
+        assert!(errors.is_empty());
+        let meta = &store.categories["team"];
+        assert_eq!(meta.name, "team");
+        assert_eq!(meta.description, "");
+    }
+
+    #[test]
+    fn regular_category_meta_is_loaded() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cat_dir = temp_dir.path().join("team");
+        let skill_dir = cat_dir.join("team-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            cat_dir.join("_category.yaml"),
+            "name: Team Skills\ndescription: Curated team workflows\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: team-skill\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let mut store = SkillStore::new();
+        let errors = store.load_from_directory(temp_dir.path(), &ParseConfig::default());
+
+        assert!(errors.is_empty());
+        let meta = &store.categories["team"];
+        assert_eq!(meta.name, "Team Skills");
+        assert_eq!(meta.description, "Curated team workflows");
     }
 
     #[test]

@@ -277,9 +277,7 @@ impl WatcherInner {
                 );
                 self.protocol_event_writer.emit(&reload_event);
 
-                self.baselines
-                    .lock()
-                    .insert(name.clone(), ActivationFreshness::snapshot(&skill_dir));
+                self.baselines.lock().insert(name.clone(), current);
                 outcomes.push((name.clone(), outcome));
             }
         }
@@ -820,5 +818,161 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (watcher, _, _) = make_watcher(dir.path(), Duration::from_millis(42));
         assert_eq!(watcher.interval(), Duration::from_millis(42));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Concurrent update during reload window
+    // ─────────────────────────────────────────────────────────────────
+
+    struct ConcurrentUpdateWriter {
+        inner: InMemoryProtocolEventWriter,
+        dir: PathBuf,
+        skill: String,
+        next_activation_json: String,
+        injected: std::sync::atomic::AtomicBool,
+    }
+
+    impl ConcurrentUpdateWriter {
+        fn new(dir: &Path, skill: &str, next_activation_json: &str) -> Self {
+            Self {
+                inner: InMemoryProtocolEventWriter::new(),
+                dir: dir.to_path_buf(),
+                skill: skill.to_string(),
+                next_activation_json: next_activation_json.to_string(),
+                injected: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
+    impl ProtocolEventWriter for ConcurrentUpdateWriter {
+        fn emit(&self, event: &ProtocolEvent) {
+            self.inner.emit(event);
+            if !self
+                .injected
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                update_activation_fresh(&self.dir, &self.skill, &self.next_activation_json);
+            }
+        }
+    }
+
+    #[test]
+    fn watcher_converges_when_activation_updates_during_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_skill_with_snapshot(dir.path(), "alpha", "v000001");
+        setup_skill_with_snapshot(dir.path(), "alpha", "v000002");
+        setup_skill_with_activation(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+        );
+
+        let resolver = Arc::new(ActiveSkillResolver::new(dir.path()));
+        let reload_ctrl = Arc::new(ActivationReloadController::new(
+            dir.path(),
+            resolver.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+        ));
+        let writer = Arc::new(ConcurrentUpdateWriter::new(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000002.snapshot"}"#,
+        ));
+        let watcher = ActivationWatcher::new(reload_ctrl, writer.clone(), Duration::from_secs(60));
+        watcher.register_skill("alpha");
+
+        // Tick 1: reload_skill_once loads v1, then emit() writes v2 before baseline save.
+        let outcomes1 = watcher.tick_for_testing();
+        assert_eq!(outcomes1.len(), 1);
+        assert!(matches!(
+            resolver.get("alpha"),
+            Some(ActiveTarget::Snapshot { ref version, .. }) if version == "v000001.snapshot"
+        ));
+
+        // Tick 2: must observe v2 written after reload_skill_once and converge to v2.
+        let outcomes2 = watcher.tick_for_testing();
+        assert_eq!(
+            outcomes2.len(),
+            1,
+            "concurrent activation update during reload must be picked up on next tick"
+        );
+        match &outcomes2[0].1 {
+            ReloadOutcome::Updated(ActiveTarget::Snapshot { version, .. }) => {
+                assert_eq!(version, "v000002.snapshot");
+            }
+            other => panic!("expected Updated(Snapshot v2), got {other:?}"),
+        }
+        assert!(matches!(
+            resolver.get("alpha"),
+            Some(ActiveTarget::Snapshot { ref version, .. }) if version == "v000002.snapshot"
+        ));
+
+        // Tick 3: baseline has converged to v2 — no further reloads.
+        let outcomes3 = watcher.tick_for_testing();
+        assert!(
+            outcomes3.is_empty(),
+            "tick after convergence must not loop, got {outcomes3:?}"
+        );
+        assert_eq!(writer.len(), 2);
+    }
+
+    #[test]
+    fn watcher_converges_when_quarantine_written_during_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_skill_with_snapshot(dir.path(), "alpha", "v000001");
+        setup_skill_with_activation(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+        );
+
+        let resolver = Arc::new(ActiveSkillResolver::new(dir.path()));
+        let reload_ctrl = Arc::new(ActivationReloadController::new(
+            dir.path(),
+            resolver.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+        ));
+        let writer = Arc::new(ConcurrentUpdateWriter::new(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": null}"#,
+        ));
+        let watcher = ActivationWatcher::new(reload_ctrl, writer.clone(), Duration::from_secs(60));
+        watcher.register_skill("alpha");
+
+        // Tick 1 loads v1, then daemon writes target=null during emit().
+        let outcomes1 = watcher.tick_for_testing();
+        assert_eq!(outcomes1.len(), 1);
+        assert!(matches!(
+            resolver.get("alpha"),
+            Some(ActiveTarget::Snapshot { ref version, .. }) if version == "v000001.snapshot"
+        ));
+
+        // Tick 2 must pick up the quarantine decision and hide the skill.
+        let outcomes2 = watcher.tick_for_testing();
+        assert_eq!(
+            outcomes2.len(),
+            1,
+            "concurrent quarantine decision during reload must be picked up on next tick"
+        );
+        assert!(matches!(
+            outcomes2[0].1,
+            ReloadOutcome::Updated(ActiveTarget::Hidden { .. })
+        ));
+        assert!(matches!(
+            resolver.get("alpha"),
+            Some(ActiveTarget::Hidden { .. })
+        ));
+
+        // Tick 3: no extra reloads.
+        let outcomes3 = watcher.tick_for_testing();
+        assert!(outcomes3.is_empty());
+        assert_eq!(writer.len(), 2);
     }
 }

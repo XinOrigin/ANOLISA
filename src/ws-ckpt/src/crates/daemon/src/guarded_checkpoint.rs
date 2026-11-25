@@ -464,12 +464,6 @@ pub(crate) async fn rollback(
         return rollback_evidence_response(evidence.clone());
     }
 
-    if workspace.index.guarded_rollbacks.len() >= GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 {
-        return rollback_rejected(
-            GuardedRollbackRejectionCodeV2::EvidenceCapacityReached,
-            "guarded rollback evidence capacity is exhausted",
-        );
-    }
     if let Err(response) = validate_rollback_workspace(
         state,
         &workspace_arc,
@@ -497,6 +491,15 @@ pub(crate) async fn rollback(
             "workspace generation no longer matches the guarded rollback",
         );
     }
+    let mut started_index = match index_with_rollback_evidence_slot(&workspace.index, generation) {
+        Some(index) => index,
+        None => {
+            return rollback_rejected(
+                GuardedRollbackRejectionCodeV2::EvidenceCapacityReached,
+                "guarded rollback evidence capacity is exhausted",
+            )
+        }
+    };
     // Same as the checkpoint pre-flight: this flow holds the workspace
     // write lock, so the registration path is handed to the check directly.
     match state
@@ -533,7 +536,6 @@ pub(crate) async fn rollback(
         caller_uid,
         outcome: GuardedRollbackOutcomeV2::Started,
     };
-    let mut started_index = workspace.index.clone();
     started_index
         .guarded_rollbacks
         .insert(operation_id.to_string(), evidence.clone());
@@ -1013,6 +1015,32 @@ fn index_with_evidence_slot(
             })
             .map(|(checkpoint_id, _)| checkpoint_id.clone())?;
         next.governed_evidence.remove(&evict);
+    }
+    Some(next)
+}
+
+fn index_with_rollback_evidence_slot(
+    index: &ws_ckpt_common::SnapshotIndex,
+    current_generation: WorkspaceGenerationTokenV2,
+) -> Option<ws_ckpt_common::SnapshotIndex> {
+    let mut next = index.clone();
+    while next.guarded_rollbacks.len() >= GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 {
+        let pick = |superseded_only: bool| {
+            next.guarded_rollbacks
+                .iter()
+                .filter(|(_, evidence)| match evidence.outcome {
+                    GuardedRollbackOutcomeV2::Succeeded {
+                        resulting_generation,
+                    } => !superseded_only || resulting_generation != current_generation,
+                    GuardedRollbackOutcomeV2::Started
+                    | GuardedRollbackOutcomeV2::Unknown { .. } => false,
+                })
+                .map(|(operation_id, _)| operation_id)
+                .min()
+                .cloned()
+        };
+        let evict = pick(true).or_else(|| pick(false))?;
+        next.guarded_rollbacks.remove(&evict);
     }
     Some(next)
 }

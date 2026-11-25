@@ -18,8 +18,8 @@ use ws_ckpt_common::{
 };
 
 use super::{
-    checkpoint, checkpoint_evidence, index_with_evidence_slot, rollback, rollback_diff_digest,
-    rollback_evidence, rollback_preview, workspace_identity,
+    checkpoint, checkpoint_evidence, index_with_evidence_slot, index_with_rollback_evidence_slot,
+    rollback, rollback_diff_digest, rollback_evidence, rollback_preview, workspace_identity,
 };
 use crate::dispatcher;
 use crate::state::DaemonState;
@@ -1421,4 +1421,233 @@ fn guarded_rollback_diff_digest_is_order_independent_and_content_sensitive() {
         rollback_diff_digest(&[first, second.clone()]),
         rollback_diff_digest(&[second])
     );
+}
+
+fn synthetic_rollback_evidence(
+    registered_path: &str,
+    operation_id: &str,
+    outcome: GuardedRollbackOutcomeV2,
+) -> ws_ckpt_common::GuardedRollbackEvidenceV2 {
+    ws_ckpt_common::GuardedRollbackEvidenceV2 {
+        ws_id: WS_ID.to_string(),
+        registered_path: registered_path.to_string(),
+        expected_generation: WorkspaceGenerationTokenV2::from_bytes([1; 32]),
+        target_snapshot_id: TARGET_ID.to_string(),
+        expected_diff_digest: [2; 32],
+        operation_id: operation_id.to_string(),
+        operation_digest: [3; 32],
+        caller_uid: 1000,
+        outcome,
+    }
+}
+
+#[tokio::test]
+async fn guarded_rollback_evicts_superseded_succeeded_receipts_at_capacity() {
+    let fixture = Fixture::new(true);
+    fixture.add_target_snapshot().await;
+    let registered_path = fixture
+        .workspace_path
+        .to_str()
+        .expect("utf8 path")
+        .to_string();
+    let prior_generation = WorkspaceGenerationTokenV2::from_bytes([1; 32]);
+    {
+        let workspace = fixture.state.get_by_wsid(WS_ID).expect("registered");
+        let mut workspace = workspace.write().await;
+        for index in 0..GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 {
+            let op_id = format!("prior-rb-{index:03}");
+            workspace.index.guarded_rollbacks.insert(
+                op_id.clone(),
+                synthetic_rollback_evidence(
+                    &registered_path,
+                    &op_id,
+                    GuardedRollbackOutcomeV2::Succeeded {
+                        resulting_generation: prior_generation,
+                    },
+                ),
+            );
+        }
+    }
+
+    let digest = preview_digest(&fixture, 1000).await;
+    let response = switch(&fixture, 1000, digest).await;
+    assert!(
+        matches!(response, Response::GuardedRollbackV2Ok { .. }),
+        "expected superseded succeeded receipts to be evicted, got {response:?}"
+    );
+    assert_eq!(fixture.backend.rollback_calls.load(Ordering::SeqCst), 1);
+
+    let workspace = fixture.state.get_by_wsid(WS_ID).expect("registered");
+    let rollbacks = &workspace.read().await.index.guarded_rollbacks;
+    assert!(rollbacks.len() <= GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2);
+    assert_eq!(rollbacks.len(), GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2);
+    assert!(rollbacks.contains_key(OPERATION_ID));
+    assert!(!rollbacks.contains_key("prior-rb-000"));
+
+    let persisted = crate::index_store::load(&fixture.state.index_dir(WS_ID))
+        .await
+        .expect("load durable index");
+    assert_eq!(
+        persisted.guarded_rollbacks.len(),
+        GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2
+    );
+    assert!(persisted.guarded_rollbacks.contains_key(OPERATION_ID));
+    assert!(!persisted.guarded_rollbacks.contains_key("prior-rb-000"));
+}
+
+#[tokio::test]
+async fn guarded_rollback_rejects_capacity_when_occupied_by_started_or_unknown() {
+    let fixture = Fixture::new(true);
+    fixture.add_target_snapshot().await;
+    let registered_path = fixture
+        .workspace_path
+        .to_str()
+        .expect("utf8 path")
+        .to_string();
+    {
+        let workspace = fixture.state.get_by_wsid(WS_ID).expect("registered");
+        let mut workspace = workspace.write().await;
+        for index in 0..GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 {
+            let op_id = format!("active-rb-{index:03}");
+            let outcome = if index % 2 == 0 {
+                GuardedRollbackOutcomeV2::Started
+            } else {
+                GuardedRollbackOutcomeV2::Unknown {
+                    reason: "uncertain".to_string(),
+                }
+            };
+            workspace.index.guarded_rollbacks.insert(
+                op_id.clone(),
+                synthetic_rollback_evidence(&registered_path, &op_id, outcome),
+            );
+        }
+    }
+
+    let digest = preview_digest(&fixture, 1000).await;
+    // Workspace and generation validation must still run before capacity rejection.
+    assert_rollback_rejected(
+        rollback(
+            &fixture.state,
+            Some(1000),
+            &registered_path,
+            WS_ID,
+            WorkspaceGenerationTokenV2::from_bytes([8; 32]),
+            TARGET_ID,
+            digest,
+            OPERATION_ID,
+            OPERATION_DIGEST,
+        )
+        .await,
+        GuardedRollbackRejectionCodeV2::GenerationMismatch,
+    );
+
+    assert_rollback_rejected(
+        switch(&fixture, 1000, digest).await,
+        GuardedRollbackRejectionCodeV2::EvidenceCapacityReached,
+    );
+    assert_eq!(fixture.backend.rollback_calls.load(Ordering::SeqCst), 0);
+
+    let workspace = fixture.state.get_by_wsid(WS_ID).expect("registered");
+    let rollbacks = &workspace.read().await.index.guarded_rollbacks;
+    assert_eq!(rollbacks.len(), GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2);
+    assert!(!rollbacks.contains_key(OPERATION_ID));
+}
+
+#[test]
+fn rollback_evidence_slot_prefers_superseded_and_never_evicts_active_or_unknown() {
+    let current_gen = WorkspaceGenerationTokenV2::from_bytes([7; 32]);
+    let prior_gen = WorkspaceGenerationTokenV2::from_bytes([1; 32]);
+
+    // Mix: 128 Started/Unknown + 127 current-gen Succeeded + 1 prior-gen Succeeded.
+    let mut mixed = SnapshotIndex::new(PathBuf::from("/workspace"));
+    for index in 0..128 {
+        let op_id = format!("active-{index:03}");
+        let outcome = if index % 2 == 0 {
+            GuardedRollbackOutcomeV2::Started
+        } else {
+            GuardedRollbackOutcomeV2::Unknown {
+                reason: "uncertain".to_string(),
+            }
+        };
+        mixed.guarded_rollbacks.insert(
+            op_id.clone(),
+            synthetic_rollback_evidence("/workspace", &op_id, outcome),
+        );
+    }
+    for index in 0..127 {
+        let op_id = format!("current-{index:03}");
+        mixed.guarded_rollbacks.insert(
+            op_id.clone(),
+            synthetic_rollback_evidence(
+                "/workspace",
+                &op_id,
+                GuardedRollbackOutcomeV2::Succeeded {
+                    resulting_generation: current_gen,
+                },
+            ),
+        );
+    }
+    mixed.guarded_rollbacks.insert(
+        "superseded-000".to_string(),
+        synthetic_rollback_evidence(
+            "/workspace",
+            "superseded-000",
+            GuardedRollbackOutcomeV2::Succeeded {
+                resulting_generation: prior_gen,
+            },
+        ),
+    );
+    let after_superseded =
+        index_with_rollback_evidence_slot(&mixed, current_gen).expect("evict superseded");
+    assert_eq!(
+        after_superseded.guarded_rollbacks.len(),
+        GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 - 1
+    );
+    assert!(!after_superseded
+        .guarded_rollbacks
+        .contains_key("superseded-000"));
+    assert!(after_superseded
+        .guarded_rollbacks
+        .contains_key("current-000"));
+
+    // Fallback: all 256 are Succeeded with current_gen.
+    let mut all_current = SnapshotIndex::new(PathBuf::from("/workspace"));
+    for index in 0..GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 {
+        let op_id = format!("cur-{index:03}");
+        all_current.guarded_rollbacks.insert(
+            op_id.clone(),
+            synthetic_rollback_evidence(
+                "/workspace",
+                &op_id,
+                GuardedRollbackOutcomeV2::Succeeded {
+                    resulting_generation: current_gen,
+                },
+            ),
+        );
+    }
+    let after_fallback =
+        index_with_rollback_evidence_slot(&all_current, current_gen).expect("fallback Succeeded");
+    assert_eq!(
+        after_fallback.guarded_rollbacks.len(),
+        GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 - 1
+    );
+    assert!(!after_fallback.guarded_rollbacks.contains_key("cur-000"));
+
+    // All Started/Unknown -> None.
+    let mut unremovable = SnapshotIndex::new(PathBuf::from("/workspace"));
+    for index in 0..GUARDED_CHECKPOINT_EVIDENCE_LIMIT_V2 {
+        let op_id = format!("stuck-{index:03}");
+        let outcome = if index % 2 == 0 {
+            GuardedRollbackOutcomeV2::Started
+        } else {
+            GuardedRollbackOutcomeV2::Unknown {
+                reason: "uncertain".to_string(),
+            }
+        };
+        unremovable.guarded_rollbacks.insert(
+            op_id.clone(),
+            synthetic_rollback_evidence("/workspace", &op_id, outcome),
+        );
+    }
+    assert!(index_with_rollback_evidence_slot(&unremovable, current_gen).is_none());
 }

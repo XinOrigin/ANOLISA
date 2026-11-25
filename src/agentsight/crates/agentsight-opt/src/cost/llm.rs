@@ -250,10 +250,12 @@ pub async fn identify_waste(
     // waste" verdict downstream (it is persisted and rendered as such), so an
     // all-failed run must surface its error instead.
     if judged > 0 && failed == judged {
-        let err = last_err.expect("failed count implies an error");
-        return Err(anyhow::anyhow!(
-            "all {failed} cost-waste LLM judgments failed: {err:#}"
-        ));
+        return Err(match last_err {
+            Some(err) => {
+                anyhow::anyhow!("all {failed} cost-waste LLM judgments failed: {err:#}")
+            }
+            None => anyhow::anyhow!("all {failed} cost-waste LLM judgments failed"),
+        });
     }
 
     Ok(WasteReport {
@@ -528,6 +530,93 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    async fn spawn_mock_llm_server<F>(
+        handler: F,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let url = format!("http://{}/v1", listener.local_addr().expect("local addr"));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&requests);
+        let handler = Arc::new(handler);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let received = Arc::clone(&received);
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let body_start = loop {
+                        let mut buf = [0u8; 4096];
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&req[..pos]).to_lowercase();
+                            let len: usize = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if req.len() >= pos + 4 + len {
+                                break pos + 4;
+                            }
+                        }
+                    };
+                    received.fetch_add(1, Ordering::SeqCst);
+                    let body_str = String::from_utf8_lossy(&req[body_start..]);
+                    let (status, resp_body) = handler(&body_str);
+                    let reason = if status == 200 {
+                        "OK"
+                    } else {
+                        "Internal Server Error"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        (url, requests, handle)
+    }
+
+    fn large_prompt_trajectory() -> AtifTrajectory {
+        let big = "x ".repeat(4000); // ~2k tokens: fires the user_prompt candidate
+        AtifTrajectory::from_json(&format!(
+            r#"{{"schema_version":"ATIF-v1.6","session_id":"s1",
+                "agent":{{"name":"a","version":"1","model_name":"m"}},"steps":[
+                {{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"{big}"}},
+                {{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z","message":"ok"}}
+            ]}}"#
+        ))
+        .unwrap()
+    }
+
     /// When every per-candidate judgment call fails (endpoint down, bad key),
     /// the run must surface an error instead of returning a report: an empty
     /// report is persisted and rendered as "evaluated N candidates, no waste
@@ -535,20 +624,76 @@ mod tests {
     #[tokio::test]
     async fn all_failed_judgments_error_instead_of_a_clean_report() {
         let client = LlmClient::with_config("http://127.0.0.1:1/v1", "key", "test-model");
-        let big = "x ".repeat(4000); // ~2k tokens: fires the user_prompt candidate
-        let t = AtifTrajectory::from_json(&format!(
-            r#"{{"schema_version":"ATIF-v1.6","session_id":"s1",
-                "agent":{{"name":"a","version":"1","model_name":"m"}},"steps":[
-                {{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"{big}"}},
-                {{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z","message":"ok"}}
-            ]}}"#
-        ))
-        .unwrap();
+        let t = large_prompt_trajectory();
         let report = identify_waste(&client, &t).await;
         assert!(
             report.is_err(),
             "all judgments failed against a dead endpoint; expected Err, got {report:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn all_failed_http_responses_return_err_cleanly() {
+        use std::sync::atomic::Ordering;
+
+        let t = large_prompt_trajectory();
+        let (url, requests, server) = spawn_mock_llm_server(|_| {
+            (
+                500,
+                serde_json::json!({"error": {"message": "upstream outage"}}).to_string(),
+            )
+        })
+        .await;
+        let client = LlmClient::with_config(url, "key", "test-model");
+        let err = identify_waste(&client, &t)
+            .await
+            .expect_err("all 500 responses must surface Err without panicking");
+        server.abort();
+        assert!(requests.load(Ordering::SeqCst) > 0);
+        assert!(
+            err.to_string().contains("cost-waste LLM judgments failed"),
+            "unexpected error message: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluated_not_worth_candidates_count_toward_dismissed() {
+        use std::sync::atomic::Ordering;
+
+        let t = large_prompt_trajectory();
+        let (url, requests, server) = spawn_mock_llm_server(|_| {
+            let content = serde_json::json!({
+                "worth_optimizing": false,
+                "save_ratio": 0.0,
+                "symptom": "",
+                "evidence": "",
+                "confidence": "低"
+            })
+            .to_string();
+            let body = serde_json::json!({
+                "id": "fixture",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": content}
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+            })
+            .to_string();
+            (200, body)
+        })
+        .await;
+        let client = LlmClient::with_config(url, "key", "test-model");
+        let report = identify_waste(&client, &t).await.unwrap();
+        server.abort();
+        assert_eq!(requests.load(Ordering::SeqCst), report.considered);
+        assert!(report.considered >= 1);
+        assert!(report.items.is_empty());
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.dismissed, report.considered);
     }
 
     #[test]

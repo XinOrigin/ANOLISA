@@ -611,3 +611,119 @@ test('atif viewer: late snapshot batches cannot replace a newer load or attach a
   assert.equal(loadedSnapshotBatch(ctx.driver), undefined,
     'a late matching batch from a network load must not attach to an imported document');
 });
+
+const sampleRiskHealth = {
+  ready: true,
+  backend: 'actplane',
+  capabilities: {
+    max_active_bindings: 1, credential_observe: true, credential_audit: true,
+    credential_enforce: true, file_read_protection: true, policy_handoff: true,
+    alternate_pid_retarget: false, test_development: false,
+  },
+  message: null,
+};
+const sampleRiskBinding = {
+  request: {
+    binding_id: 'binding-1', agent_id: 'agent-1', session_id: 'sess-1',
+    policy_id: 'policy-1', policy_revision: '1', root_pid: 4242,
+    policy_dsl: 'block open file "/tmp/secret" if AGENT', policy_mode: 'enforce',
+  },
+  state: 'enforced',
+  message: null,
+};
+const sampleRiskViolation = {
+  event_id: 'event-1', binding_id: 'binding-1', agent_id: 'agent-1',
+  session_id: 'sess-1', policy_id: 'policy-1', policy_revision: '1',
+  pid: 4242, ppid: null, process_start_time: 0, operation: 'open',
+  target: '/tmp/secret', effect: 'block', blocked: true, killed: false,
+  rule_id: null, reason: 'blocked secret access', actplane_revision: '1',
+  occurred_at_ns: 1_700_000_000_000_000_000, observed_at_ns: 1_700_000_000_000_000_000,
+  case_id: 'case-1',
+};
+
+function collectNodes(node, predicate, out = []) {
+  if (node == null || typeof node !== 'object') return out;
+  if (Array.isArray(node)) {
+    for (const child of node) collectNodes(child, predicate, out);
+    return out;
+  }
+  if (predicate(node)) out.push(node);
+  return collectNodes(node.children, predicate, out);
+}
+
+function renderRiskPage() {
+  const driver = createHooksDriver();
+  const { calls, stubs } = deferredFetchStubs([
+    'fetchEnforcementHealth',
+    'fetchEnforcementBindings',
+    'fetchEnforcementViolations',
+  ]);
+  const { RiskEnforcementPage } = loadPageModule('src/pages/RiskEnforcementPage.tsx', {
+    'react-router-dom': { useSearchParams: () => [new URLSearchParams(), () => {}] },
+    '../i18n': { useI18n: () => ({ t: (key) => key }), useLocaleTag: () => 'en-US' },
+    '../utils/apiClient': {
+      ...stubs,
+      createCredentialBinding: async () => {},
+      createFileReadBinding: async () => {},
+      detachEnforcementBinding: async () => {},
+      enforcementSupportsMode: () => true,
+      enforcementViolationTotal: (violations) => violations.length,
+    },
+    '../utils/enforcementMode': {
+      effectiveBindingMode: (req) => req.policy_mode ?? 'observe',
+      firstCorrelatedCaseId: (violations) => violations.find((v) => v.case_id)?.case_id,
+    },
+    '../components/Pagination': componentStub('Pagination'),
+  }, driver);
+  const rows = (el, prefix) => collectNodes(
+    el,
+    (n) => n.type === 'tr' && typeof n.props?.key === 'string' && n.props.key.startsWith(prefix),
+  );
+  const submit = (el) => collectNodes(el, (n) => n.type === 'button' && n.props?.type === 'submit')[0];
+  return { driver, calls, render: () => driver.render(RiskEnforcementPage), rows, submit };
+}
+
+test('risk-enforcement: rejected bindings or violations reload clears stale rows and unmount drops late settlements', async () => {
+  const ctx = renderRiskPage();
+  let rendered = ctx.render();
+  rendered.effects[0]();
+  ctx.calls.fetchEnforcementHealth[0].resolve(sampleRiskHealth);
+  ctx.calls.fetchEnforcementBindings[0].resolve({ bindings: [sampleRiskBinding] });
+  ctx.calls.fetchEnforcementViolations[0].resolve({ violations: [sampleRiskViolation] });
+  await settle();
+  rendered = ctx.render();
+  assert.equal(ctx.rows(rendered.element, 'binding-').length, 1);
+  assert.equal(ctx.rows(rendered.element, 'event-').length, 1);
+  assert.equal(ctx.submit(rendered.element).props.disabled, true);
+  rendered.callbacks[0]();
+  ctx.calls.fetchEnforcementHealth[1].resolve(sampleRiskHealth);
+  ctx.calls.fetchEnforcementBindings[1].reject(new Error('bindings unavailable'));
+  ctx.calls.fetchEnforcementViolations[1].resolve({ violations: [sampleRiskViolation] });
+  await settle();
+  rendered = ctx.render();
+  assert.equal(ctx.rows(rendered.element, 'binding-').length, 0);
+  assert.equal(ctx.rows(rendered.element, 'event-').length, 1);
+  assert.equal(ctx.submit(rendered.element).props.disabled, false);
+  assert.equal(ctx.driver.slots[4].value, 'bindings unavailable');
+  rendered.callbacks[0]();
+  ctx.calls.fetchEnforcementHealth[2].resolve(sampleRiskHealth);
+  ctx.calls.fetchEnforcementBindings[2].resolve({ bindings: [sampleRiskBinding] });
+  ctx.calls.fetchEnforcementViolations[2].reject(new Error('violations unavailable'));
+  await settle();
+  rendered = ctx.render();
+  assert.equal(ctx.rows(rendered.element, 'binding-').length, 1);
+  assert.equal(ctx.rows(rendered.element, 'event-').length, 0);
+  assert.equal(ctx.submit(rendered.element).props.disabled, true);
+  assert.equal(ctx.driver.slots[5].value, 'violations unavailable');
+  const unmounted = renderRiskPage();
+  const cleanup = unmounted.render().effects[0]();
+  assert.equal(typeof cleanup, 'function', 'initial loadAll effect must return unmount cleanup');
+  cleanup();
+  unmounted.calls.fetchEnforcementHealth[0].resolve(sampleRiskHealth);
+  unmounted.calls.fetchEnforcementBindings[0].resolve({ bindings: [sampleRiskBinding] });
+  unmounted.calls.fetchEnforcementViolations[0].reject(new Error('late error'));
+  await settle();
+  assert.equal(unmounted.driver.slots[0].value, null);
+  assert.deepEqual(unmounted.driver.slots[1].value, []);
+  assert.equal(unmounted.driver.slots[5].value, '');
+});

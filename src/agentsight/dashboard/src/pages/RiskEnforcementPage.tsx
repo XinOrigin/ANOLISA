@@ -143,12 +143,14 @@ export const RiskEnforcementPage: React.FC = () => {
       setBindings(bindingsResult.value.bindings);
       setBindingsError('');
     } else {
+      setBindings([]);
       setBindingsError(errorMessage(bindingsResult.reason));
     }
     if (violationsResult.status === 'fulfilled') {
       setViolations(violationsResult.value.violations);
       setViolationsError('');
     } else {
+      setViolations([]);
       setViolationsError(errorMessage(violationsResult.reason));
     }
     setLoading(false);
@@ -156,6 +158,9 @@ export const RiskEnforcementPage: React.FC = () => {
 
   useEffect(() => {
     void loadAll();
+    return () => {
+      loadEpoch.current += 1;
+    };
   }, [loadAll]);
 
   // Highlight binding from URL param

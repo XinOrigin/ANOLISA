@@ -600,8 +600,8 @@ pub fn is_loadable_categorized_skill(source: &Path, dest: &Path) -> bool {
 }
 
 /// Returns `true` when `dir` looks like a category container:
-/// it has no `SKILL.md` of its own but contains at least one **real
-/// sub-directory** (not a symlink) that does have a `SKILL.md`.
+/// it has no `SKILL.md` of its own but contains at least one **non-hidden
+/// real sub-directory** (not a symlink) that does have a `SKILL.md`.
 fn is_category_dir(dir: &Path) -> bool {
     if has_regular_skill_md(dir) {
         return false;
@@ -609,9 +609,10 @@ fn is_category_dir(dir: &Path) -> bool {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             // No-follow entry type: a symlinked child is never a Skill
-            // directory, so it never makes `dir` a category.
+            // directory, and a hidden child (`.` prefix) is never loaded.
             let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_real_dir && has_regular_skill_md(&entry.path()) {
+            let path = entry.path();
+            if is_real_dir && !is_hidden(&path) && has_regular_skill_md(&path) {
                 return true;
             }
         }
@@ -1113,6 +1114,64 @@ mod tests {
     }
 
     #[test]
+    fn test_directory_with_only_hidden_skill_is_not_a_category() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let hidden_nested = temp_dir.path().join("notes").join(".draft");
+        std::fs::create_dir_all(&hidden_nested).unwrap();
+        std::fs::write(
+            hidden_nested.join("SKILL.md"),
+            "---\nname: draft\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(store.is_empty());
+        assert!(
+            store.categories.is_empty(),
+            "directory containing only hidden skills must not become a category"
+        );
+    }
+
+    #[test]
+    fn test_category_with_hidden_and_visible_skill_still_loads_visible() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let category_dir = temp_dir.path().join("notes");
+        let hidden_dir = category_dir.join(".draft");
+        let visible_dir = category_dir.join("visible");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        std::fs::create_dir_all(&visible_dir).unwrap();
+        std::fs::write(hidden_dir.join("SKILL.md"), "---\nname: draft\n---\nbody\n").unwrap();
+        std::fs::write(
+            visible_dir.join("SKILL.md"),
+            "---\nname: visible\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(store.categories.contains_key("notes"));
+        assert_eq!(store.list(), vec!["visible"]);
+        assert!(store.get("draft").is_none());
+    }
+
+    #[test]
     fn test_load_from_directory_ignores_files() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join("not-a-dir.txt"), "not a skill").unwrap();
@@ -1290,6 +1349,35 @@ mod tests {
 
         assert!(errors.is_empty(), "nothing to report, got {errors:?}");
         assert_eq!(store.list(), vec!["alpha", "good"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_non_utf8_dir_with_only_hidden_skill_is_ignored() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = |bytes: &[u8]| std::ffi::OsString::from_vec(bytes.to_vec());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let hidden_nested = temp_dir.path().join(raw(b"dir-\xff")).join(".draft");
+        std::fs::create_dir_all(&hidden_nested).unwrap();
+        std::fs::write(
+            hidden_nested.join("SKILL.md"),
+            "---\nname: draft\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(store.is_empty());
+        assert!(store.categories.is_empty());
     }
 
     #[test]

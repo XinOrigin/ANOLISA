@@ -228,24 +228,46 @@ impl SkillFs {
     }
 
     /// Return the lifecycle namespace name reserved by Package S3 when the
-    /// parsed path's top-level skill-name segment matches one of
-    /// `.staging`, `.certified`, `.quarantine`, or `.archive`. Otherwise
-    /// returns `None`.
+    /// parsed path's top-level skill-name or Hermes category segment matches
+    /// one of `.staging`, `.certified`, `.quarantine`, or `.archive`.
+    /// Otherwise returns `None`.
     ///
-    /// The check is purely lexical and applies to `SkillDir`, `SkillMd`,
-    /// and `Passthrough` paths — i.e. any FUSE path that lives below the
-    /// reserved top-level segment. Root, SkillsDir, and Invalid never have
-    /// a skill-name component and always return `None`.
+    /// The check is purely lexical and covers both flat/inbox paths
+    /// (`SkillDir`, `SkillMd`, `Passthrough`, `InboxSkillDir`,
+    /// `InboxPassthrough`) and Hermes category/descendant paths
+    /// (`CategoryDir`, `CategoryPassthrough`, `NestedSkillDir`,
+    /// `NestedSkillMd`, `NestedPassthrough`). Deeper non-root segments
+    /// (such as `apple/docs/.staging`) remain ordinary because only the
+    /// top-level segment is classified. Root, SkillsDir, InboxDir,
+    /// HermesMeta*, and Invalid always return `None`.
     pub(super) fn lifecycle_reservation(path_type: &PathType) -> Option<&'static str> {
-        let skill_name = match path_type {
+        let top_level = match path_type {
             PathType::SkillDir { skill_name }
             | PathType::SkillMd { skill_name }
             | PathType::Passthrough { skill_name, .. }
             | PathType::InboxSkillDir { skill_name }
-            | PathType::InboxPassthrough { skill_name, .. } => skill_name.as_str(),
+            | PathType::InboxPassthrough { skill_name, .. }
+            | PathType::CategoryDir {
+                category: skill_name,
+            }
+            | PathType::CategoryPassthrough {
+                name: skill_name, ..
+            }
+            | PathType::NestedSkillDir {
+                category: skill_name,
+                ..
+            }
+            | PathType::NestedSkillMd {
+                category: skill_name,
+                ..
+            }
+            | PathType::NestedPassthrough {
+                category: skill_name,
+                ..
+            } => skill_name.as_str(),
             _ => return None,
         };
-        match classify_lifecycle_name(skill_name) {
+        match classify_lifecycle_name(top_level) {
             LifecycleNameClass::Reserved(canonical) => Some(canonical),
             LifecycleNameClass::Ordinary => None,
         }
@@ -271,6 +293,24 @@ impl SkillFs {
         req: &Request,
         detail: Option<String>,
     ) -> Option<i32> {
+        self.enforce_lifecycle_reservation_for_caller(
+            path_type,
+            operation,
+            req.uid(),
+            req.gid(),
+            detail,
+        )
+    }
+
+    /// Caller-uid/gid implementation of [`Self::enforce_lifecycle_reservation`].
+    pub(super) fn enforce_lifecycle_reservation_for_caller(
+        &self,
+        path_type: &PathType,
+        operation: SkillEventKind,
+        uid: u32,
+        gid: u32,
+        detail: Option<String>,
+    ) -> Option<i32> {
         let canonical = Self::lifecycle_reservation(path_type)?;
         let errno = libc::EACCES;
         let reason = "lifecycle namespace is reserved";
@@ -282,20 +322,45 @@ impl SkillFs {
             | PathType::InboxPassthrough {
                 skill_name,
                 relative_path,
+            }
+            | PathType::CategoryPassthrough {
+                name: skill_name,
+                relative_path,
             } => (skill_name.clone(), Some(relative_path.clone())),
             PathType::SkillMd { skill_name } => {
                 (skill_name.clone(), Some(PathBuf::from("SKILL.md")))
             }
-            PathType::SkillDir { skill_name } | PathType::InboxSkillDir { skill_name } => {
-                (skill_name.clone(), None)
-            }
+            PathType::SkillDir { skill_name }
+            | PathType::InboxSkillDir { skill_name }
+            | PathType::CategoryDir {
+                category: skill_name,
+            } => (skill_name.clone(), None),
+            PathType::NestedSkillDir {
+                category,
+                skill_name,
+            } => (Self::hermes_skill_id(category, skill_name), None),
+            PathType::NestedSkillMd {
+                category,
+                skill_name,
+            } => (
+                Self::hermes_skill_id(category, skill_name),
+                Some(PathBuf::from("SKILL.md")),
+            ),
+            PathType::NestedPassthrough {
+                category,
+                skill_name,
+                relative_path,
+            } => (
+                Self::hermes_skill_id(category, skill_name),
+                Some(relative_path.clone()),
+            ),
             _ => return None,
         };
         let mut event = SkillEvent::new(SkillEventKind::PolicyDenied)
             .with_skill_name(skill_name)
             .with_action(SkillEventAction::Rejected)
             .with_errno(errno)
-            .with_caller(req.uid(), req.gid());
+            .with_caller(uid, gid);
         if let Some(rel) = relative_path {
             event = event.with_relative_path(rel);
         }
@@ -420,5 +485,247 @@ impl SkillFs {
             relative_path: std::path::PathBuf::from(crate::security::SKILL_META_DIR),
         };
         self.is_trusted_skill_meta_access(&probe, req) == Some(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use parking_lot::RwLock;
+    use skillfs_core::store::SkillStore;
+
+    use super::*;
+    use crate::path::{SkillLayout, parse_path_with_layout};
+    use crate::security::event::InMemoryEventSink;
+    use crate::security::lifecycle::LIFECYCLE_RESERVED_NAMES;
+
+    fn test_hermes_fs(source: &Path, in_place: bool) -> (SkillFs, Arc<InMemoryEventSink>) {
+        let sink = Arc::new(InMemoryEventSink::new());
+        let store = Arc::new(RwLock::new(SkillStore::new()));
+        let fs = SkillFs::new(source.join("mount"), source.to_path_buf(), store, in_place)
+            .with_skill_layout(SkillLayout::Hermes)
+            .with_event_sink(sink.clone());
+        (fs, sink)
+    }
+
+    #[test]
+    fn lifecycle_reservation_enforces_all_hermes_descendants_and_attributes_audit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        for in_place in [true, false] {
+            let prefix = if in_place { "" } else { "/skills" };
+
+            for &reserved in LIFECYCLE_RESERVED_NAMES {
+                // Prepare a physical plain file under `{reserved}/README.md` so
+                // `SkillFs::parse_fuse_path` produces `CategoryPassthrough`.
+                let reserved_dir = dir.path().join(reserved);
+                std::fs::create_dir_all(&reserved_dir).expect("create reserved dir");
+                std::fs::write(reserved_dir.join("README.md"), "readme\n").expect("write README");
+
+                let (fs, sink) = test_hermes_fs(dir.path(), in_place);
+
+                let cases = [
+                    (
+                        parse_path_with_layout(
+                            Path::new(&format!("{prefix}/{reserved}")),
+                            in_place,
+                            SkillLayout::Hermes,
+                        ),
+                        reserved.to_string(),
+                        None,
+                        "CategoryDir",
+                    ),
+                    (
+                        fs.parse_fuse_path(Path::new(&format!("{prefix}/{reserved}/README.md"))),
+                        reserved.to_string(),
+                        Some(PathBuf::from("README.md")),
+                        "CategoryPassthrough",
+                    ),
+                    (
+                        parse_path_with_layout(
+                            Path::new(&format!("{prefix}/{reserved}/demo")),
+                            in_place,
+                            SkillLayout::Hermes,
+                        ),
+                        format!("{reserved}/demo"),
+                        None,
+                        "NestedSkillDir",
+                    ),
+                    (
+                        parse_path_with_layout(
+                            Path::new(&format!("{prefix}/{reserved}/demo/SKILL.md")),
+                            in_place,
+                            SkillLayout::Hermes,
+                        ),
+                        format!("{reserved}/demo"),
+                        Some(PathBuf::from("SKILL.md")),
+                        "NestedSkillMd",
+                    ),
+                    (
+                        parse_path_with_layout(
+                            Path::new(&format!("{prefix}/{reserved}/demo/scripts/run.sh")),
+                            in_place,
+                            SkillLayout::Hermes,
+                        ),
+                        format!("{reserved}/demo"),
+                        Some(PathBuf::from("scripts/run.sh")),
+                        "NestedPassthrough",
+                    ),
+                ];
+
+                for (path_type, expected_skill, expected_rel, label) in cases {
+                    assert_eq!(
+                        SkillFs::lifecycle_reservation(&path_type),
+                        Some(reserved),
+                        "lifecycle_reservation failed for {label} ({reserved}, in_place={in_place}): {path_type:?}"
+                    );
+
+                    let before_len = sink.len();
+                    let errno = fs.enforce_lifecycle_reservation_for_caller(
+                        &path_type,
+                        SkillEventKind::Write,
+                        1000,
+                        1001,
+                        Some("extra=1".to_string()),
+                    );
+                    assert_eq!(
+                        errno,
+                        Some(libc::EACCES),
+                        "enforce_lifecycle_reservation failed for {label} ({reserved}, in_place={in_place}): {path_type:?}"
+                    );
+
+                    let events = sink.events();
+                    assert_eq!(events.len(), before_len + 1);
+                    let ev = events.last().expect("PolicyDenied event");
+                    assert_eq!(ev.kind, SkillEventKind::PolicyDenied);
+                    assert_eq!(ev.action, Some(SkillEventAction::Rejected));
+                    assert_eq!(ev.errno, Some(libc::EACCES));
+                    assert_eq!(ev.uid, Some(1000));
+                    assert_eq!(ev.gid, Some(1001));
+                    assert_eq!(
+                        ev.skill_name.as_deref(),
+                        Some(expected_skill.as_str()),
+                        "wrong skill_name attribution for {label} ({reserved})"
+                    );
+                    assert_eq!(
+                        ev.relative_path.as_ref(),
+                        expected_rel.as_ref(),
+                        "wrong relative_path attribution for {label} ({reserved})"
+                    );
+                    let detail = ev.detail.as_deref().unwrap_or_default();
+                    assert!(
+                        detail.contains(&format!("lifecycle={reserved}")),
+                        "detail must include lifecycle={reserved}, got {detail:?}"
+                    );
+                    assert!(
+                        detail.contains("extra=1"),
+                        "detail must preserve caller context, got {detail:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_reservation_allows_ordinary_and_deeper_non_root_hermes_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("apple/apple-notes")).expect("apple-notes");
+        std::fs::write(
+            dir.path().join("apple/apple-notes/SKILL.md"),
+            "---\nname: apple-notes\n---\n",
+        )
+        .expect("SKILL.md");
+        std::fs::write(dir.path().join("apple/README.md"), "apple readme\n").expect("README");
+        std::fs::write(dir.path().join("apple/.staging"), "nested file\n").expect("apple/.staging");
+
+        for in_place in [true, false] {
+            let prefix = if in_place { "" } else { "/skills" };
+            let (fs, sink) = test_hermes_fs(dir.path(), in_place);
+
+            let allowed_paths = [
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                fs.parse_fuse_path(Path::new(&format!("{prefix}/apple/README.md"))),
+                fs.parse_fuse_path(Path::new(&format!("{prefix}/apple/.staging"))),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple/apple-notes")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple/apple-notes/SKILL.md")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple/apple-notes/scripts/run.sh")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple/.staging")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple/.staging/SKILL.md")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple/docs/.staging")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/apple/docs/.certified/file.txt")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/.STAGING/demo")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/.Staging/demo/SKILL.md")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+                parse_path_with_layout(
+                    Path::new(&format!("{prefix}/.staging2/demo/run.sh")),
+                    in_place,
+                    SkillLayout::Hermes,
+                ),
+            ];
+
+            for path_type in allowed_paths {
+                assert_eq!(
+                    SkillFs::lifecycle_reservation(&path_type),
+                    None,
+                    "non-root or ordinary Hermes path must not be reserved (in_place={in_place}): {path_type:?}"
+                );
+                assert_eq!(
+                    fs.enforce_lifecycle_reservation_for_caller(
+                        &path_type,
+                        SkillEventKind::Write,
+                        1000,
+                        1001,
+                        None,
+                    ),
+                    None,
+                    "non-root or ordinary Hermes path must be allowed (in_place={in_place}): {path_type:?}"
+                );
+            }
+            assert!(
+                sink.is_empty(),
+                "allowed paths must not emit PolicyDenied events"
+            );
+        }
     }
 }

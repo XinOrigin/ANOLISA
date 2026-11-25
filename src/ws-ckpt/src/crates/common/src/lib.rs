@@ -1485,10 +1485,21 @@ pub fn load_config_file_unvalidated(path: &Path) -> Result<FileConfig, WsCkptErr
     }
 }
 
-/// Validate absolute mount pins and numeric ranges so downstream consumers
-/// (e.g. bootstrap's `f64 -> u64` cast on `avail * img_max_percent / 100.0`)
-/// never see NaN/Infinity/out-of-range values.
+/// Validate backend selection, absolute mount pins, and numeric ranges so
+/// downstream consumers (e.g. `parse_backend_type` or bootstrap's `f64 -> u64`
+/// cast on `avail * img_max_percent / 100.0`) never see unknown backend types
+/// or NaN/Infinity/out-of-range values.
 fn validate_file_config(fc: &FileConfig, path: &Path) -> Result<(), WsCkptError> {
+    match fc.backend.r#type.as_str() {
+        "auto" | "btrfs-base" | "btrfs-loop" => {}
+        other => {
+            return Err(WsCkptError::Config(format!(
+                "backend.type in {}: expected one of \"auto\", \"btrfs-base\", \"btrfs-loop\" (got {:?})",
+                path.display(),
+                other
+            )));
+        }
+    }
     if let Some(mount) = fc
         .backend
         .btrfs_base

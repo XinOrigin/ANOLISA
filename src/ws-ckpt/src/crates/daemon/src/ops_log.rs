@@ -3,7 +3,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
-use ws_ckpt_common::{Request, Response};
+use ws_ckpt_common::{GuardedRollbackOutcomeV2, Request, Response};
 
 const OPS_LOG_PATH: &str = "/var/log/anolisa/sls/ops/ws-ckpt.jsonl";
 const TELEMETRY_GATE: &str = "/etc/anolisa/.telemetry_disabled";
@@ -32,7 +32,7 @@ struct OpsRecord<'a> {
 pub fn ops_name_from_request(req: &Request) -> Option<&'static str> {
     match req {
         Request::Checkpoint { .. } | Request::GuardedCheckpointV2 { .. } => Some("ckpt"),
-        Request::Rollback { .. } => Some("roll"),
+        Request::Rollback { .. } | Request::GuardedRollbackV2 { .. } => Some("roll"),
         Request::Diff { .. } => Some("diff"),
         Request::List { .. } | Request::ListOrphans { .. } => Some("list"),
         // Each page is a daemon request, not the outcome of a complete CLI list.
@@ -67,19 +67,40 @@ pub fn detect_agent_name(pid: u32) -> String {
     "user".to_string()
 }
 
+/// Extract the telemetry `err_reason` string for a daemon [`Response`].
+pub fn err_reason_from_response(response: &Response) -> &str {
+    match response {
+        Response::Error { message, .. }
+        | Response::GuardedCheckpointV2Rejected { message, .. }
+        | Response::GuardedRollbackV2Rejected { message, .. } => message.as_str(),
+        Response::GuardedRollbackV2Uncertain { evidence } => match &evidence.outcome {
+            GuardedRollbackOutcomeV2::Unknown { reason } => reason.as_str(),
+            GuardedRollbackOutcomeV2::Started => "daemon could not confirm the rollback outcome",
+            GuardedRollbackOutcomeV2::Succeeded { .. } => "none",
+        },
+        _ => "none",
+    }
+}
+
 pub fn log_operation(ops_name: &'static str, agent_name: &str, response: &Response) {
-    if std::path::Path::new(TELEMETRY_GATE).exists() || !std::path::Path::new(OPS_LOG_PATH).exists()
-    {
+    let path = std::path::Path::new(OPS_LOG_PATH);
+    if std::path::Path::new(TELEMETRY_GATE).exists() || !path.exists() {
         return;
     }
 
-    let err_reason = match response {
-        Response::Error { message, .. } | Response::GuardedCheckpointV2Rejected { message, .. } => {
-            message.as_str()
-        }
-        _ => "none",
-    };
+    log_operation_to(path, ops_name, agent_name, response);
+}
 
+/// Build an [`OpsRecord`] from a daemon response and append it to `path`.
+///
+/// Split from [`log_operation`] so tests exercise the production record
+/// construction and serialization path against a temporary file.
+fn log_operation_to(
+    path: &std::path::Path,
+    ops_name: &'static str,
+    agent_name: &str,
+    response: &Response,
+) {
     let record = OpsRecord {
         component_name: "ws-ckpt",
         component_version: env!("CARGO_PKG_VERSION"),
@@ -96,22 +117,18 @@ pub fn log_operation(ops_name: &'static str, agent_name: &str, response: &Respon
         diff_time: u32::from(ops_name == "diff"),
         list_time: u32::from(ops_name == "list"),
         ops_time: 1,
-        err_reason,
+        err_reason: err_reason_from_response(response),
         supply: "none",
     };
 
-    if let Err(e) = write_record(&record) {
+    if let Err(e) = write_record_to(path, &record) {
         tracing::debug!("ops log write failed: {e}");
     }
 }
 
-fn write_record(record: &OpsRecord<'_>) -> std::io::Result<()> {
-    write_record_to(std::path::Path::new(OPS_LOG_PATH), record)
-}
-
 /// Serialize and append one JSONL record to `path`.
 ///
-/// Split from [`write_record`] so tests exercise the production
+/// Split from [`log_operation_to`] so tests exercise the production
 /// serialization/append path against a temporary file instead of
 /// re-implementing it.
 fn write_record_to(path: &std::path::Path, record: &OpsRecord<'_>) -> std::io::Result<()> {
@@ -209,6 +226,32 @@ mod tests {
             operation_digest: [2; 32],
         };
         assert_eq!(ops_name_from_request(&evidence), None);
+
+        let guarded_roll = Request::GuardedRollbackV2 {
+            registered_path: "/workspace".into(),
+            ws_id: "ws-abcdef".into(),
+            expected_generation: ws_ckpt_common::WorkspaceGenerationTokenV2::from_bytes([1; 32]),
+            target_snapshot_id: "snapshot-1".into(),
+            expected_diff_digest: [2; 32],
+            operation_id: "op-1".into(),
+            operation_digest: [3; 32],
+        };
+        assert_eq!(ops_name_from_request(&guarded_roll), Some("roll"));
+
+        let guarded_roll_preview = Request::GuardedRollbackPreviewV2 {
+            registered_path: "/workspace".into(),
+            ws_id: "ws-abcdef".into(),
+            expected_generation: ws_ckpt_common::WorkspaceGenerationTokenV2::from_bytes([1; 32]),
+            target_snapshot_id: "snapshot-1".into(),
+        };
+        assert_eq!(ops_name_from_request(&guarded_roll_preview), None);
+
+        let guarded_roll_evidence = Request::GuardedRollbackEvidenceV2 {
+            ws_id: "ws-abcdef".into(),
+            operation_id: "op-1".into(),
+            operation_digest: [3; 32],
+        };
+        assert_eq!(ops_name_from_request(&guarded_roll_evidence), None);
     }
 
     #[test]
@@ -337,5 +380,125 @@ mod tests {
         let err = write_record_to(&missing, &record).expect_err("append without create fails");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(!missing.exists(), "writer must not create its target");
+    }
+
+    fn sample_guarded_rollback_evidence(
+        outcome: GuardedRollbackOutcomeV2,
+    ) -> ws_ckpt_common::GuardedRollbackEvidenceV2 {
+        ws_ckpt_common::GuardedRollbackEvidenceV2 {
+            ws_id: "ws-abcdef".into(),
+            registered_path: "/workspace".into(),
+            expected_generation: ws_ckpt_common::WorkspaceGenerationTokenV2::from_bytes([1; 32]),
+            target_snapshot_id: "snapshot-1".into(),
+            expected_diff_digest: [2; 32],
+            operation_id: "op-1".into(),
+            operation_digest: [3; 32],
+            caller_uid: 1000,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn err_reason_extracts_error_and_guarded_failures() {
+        assert_eq!(
+            err_reason_from_response(&Response::Error {
+                code: ws_ckpt_common::ErrorCode::SnapshotNotFound,
+                message: "snapshot missing".into(),
+            }),
+            "snapshot missing"
+        );
+        assert_eq!(
+            err_reason_from_response(&Response::GuardedCheckpointV2Rejected {
+                code: ws_ckpt_common::GuardedCheckpointRejectionCodeV2::GenerationMismatch,
+                message: "stale checkpoint generation".into(),
+            }),
+            "stale checkpoint generation"
+        );
+        assert_eq!(
+            err_reason_from_response(&Response::GuardedRollbackV2Rejected {
+                code: ws_ckpt_common::GuardedRollbackRejectionCodeV2::DiffMismatch,
+                message: "workspace changed since preview".into(),
+            }),
+            "workspace changed since preview"
+        );
+        assert_eq!(
+            err_reason_from_response(&Response::GuardedRollbackV2Uncertain {
+                evidence: sample_guarded_rollback_evidence(GuardedRollbackOutcomeV2::Unknown {
+                    reason: "durable reservation disappeared".into(),
+                }),
+            }),
+            "durable reservation disappeared"
+        );
+        assert_eq!(
+            err_reason_from_response(&Response::GuardedRollbackV2Uncertain {
+                evidence: sample_guarded_rollback_evidence(GuardedRollbackOutcomeV2::Started),
+            }),
+            "daemon could not confirm the rollback outcome"
+        );
+        assert_eq!(
+            err_reason_from_response(&Response::GuardedRollbackV2Ok {
+                evidence: sample_guarded_rollback_evidence(GuardedRollbackOutcomeV2::Succeeded {
+                    resulting_generation: ws_ckpt_common::WorkspaceGenerationTokenV2::from_bytes(
+                        [4; 32],
+                    ),
+                }),
+            }),
+            "none"
+        );
+    }
+
+    #[test]
+    fn log_operation_writes_guarded_rollback_jsonl_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ws-ckpt.jsonl");
+        std::fs::File::create(&path).expect("create");
+
+        let ok = Response::GuardedRollbackV2Ok {
+            evidence: sample_guarded_rollback_evidence(GuardedRollbackOutcomeV2::Succeeded {
+                resulting_generation: ws_ckpt_common::WorkspaceGenerationTokenV2::from_bytes(
+                    [4; 32],
+                ),
+            }),
+        };
+        let rejected = Response::GuardedRollbackV2Rejected {
+            code: ws_ckpt_common::GuardedRollbackRejectionCodeV2::DiffMismatch,
+            message: "diff digest mismatch".into(),
+        };
+        let uncertain = Response::GuardedRollbackV2Uncertain {
+            evidence: sample_guarded_rollback_evidence(GuardedRollbackOutcomeV2::Unknown {
+                reason: "index save failed".into(),
+            }),
+        };
+
+        log_operation_to(&path, "roll", "hermes", &ok);
+        log_operation_to(&path, "roll", "hermes", &rejected);
+        log_operation_to(&path, "roll", "openclaw", &uncertain);
+
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("parse jsonl"))
+            .collect();
+
+        for entry in &parsed {
+            assert_eq!(entry["component.name"], "ws-ckpt");
+            assert_eq!(entry["ops_name"], "roll");
+            assert_eq!(entry["roll_time"], 1);
+            assert_eq!(entry["ckpt_time"], 0);
+            assert_eq!(entry["diff_time"], 0);
+            assert_eq!(entry["list_time"], 0);
+            assert_eq!(entry["ops_time"], 1);
+            assert_eq!(entry["supply"], "none");
+        }
+
+        assert_eq!(parsed[0]["component.agent_name"], "hermes");
+        assert_eq!(parsed[0]["err_reason"], "none");
+        assert_eq!(parsed[1]["component.agent_name"], "hermes");
+        assert_eq!(parsed[1]["err_reason"], "diff digest mismatch");
+        assert_eq!(parsed[2]["component.agent_name"], "openclaw");
+        assert_eq!(parsed[2]["err_reason"], "index save failed");
     }
 }

@@ -23,6 +23,767 @@
 
 use super::{LLMProvider, TokenUsage, detect_provider_from_usage, extract_usage_object};
 use crate::parser::sse::ParsedSseEvent;
+use std::borrow::Cow;
+
+/// Standard protocol envelope keys whose object values may hold or wrap a
+/// canonical `usage` / `usageMetadata` block.
+const PROTOCOL_WRAPPER_KEYS: &[&str] = &[
+    "response", "message", "data", "event", "delta", "payload", "chunk", "result",
+];
+
+/// Maximum nesting depth of protocol wrapper objects above `usage` /
+/// `usageMetadata` (e.g. `data -> event -> response -> usage`).
+const MAX_WRAPPER_DEPTH: usize = 4;
+
+fn is_protocol_wrapper_key(key: &str) -> bool {
+    PROTOCOL_WRAPPER_KEYS.contains(&key)
+}
+
+fn is_usage_container_key(key: &str) -> bool {
+    matches!(key, "usage" | "usageMetadata" | "usage_metadata")
+}
+
+/// Keys recognized directly inside a canonical or bare usage object.
+///
+/// Restricting bare-root recovery to objects whose top-level keys all belong to
+/// this set keeps existing bare-usage fragment tests working while preventing
+/// arbitrary non-usage or schema objects from being mistaken for token usage.
+fn is_bare_usage_key(key: &str) -> bool {
+    matches!(
+        key,
+        "input_tokens"
+            | "output_tokens"
+            | "total_tokens"
+            | "prompt_tokens"
+            | "completion_tokens"
+            | "prompt_tokens_details"
+            | "completion_tokens_details"
+            | "input_tokens_details"
+            | "output_tokens_details"
+            | "cache_creation_input_tokens"
+            | "cache_read_input_tokens"
+            | "cached_tokens"
+            | "cache_creation"
+            | "cache_type"
+            | "promptTokenCount"
+            | "candidatesTokenCount"
+            | "totalTokenCount"
+            | "thoughtsTokenCount"
+            | "cachedContentTokenCount"
+            | "toolUsePromptTokenCount"
+            | "prompt_token_count"
+            | "candidates_token_count"
+            | "total_token_count"
+            | "thoughts_token_count"
+            | "cached_content_token_count"
+            | "tool_use_prompt_token_count"
+            | "promptTokensDetails"
+            | "candidatesTokensDetails"
+            | "cacheTokensDetails"
+            | "toolUsePromptTokensDetails"
+            | "trafficType"
+            | "image_tokens"
+            | "audio_tokens"
+            | "video_tokens"
+            | "text_tokens"
+            | "reasoning_tokens"
+            | "service_tier"
+            | "server_tool_use"
+            | "inference_geo"
+            | "x_details"
+    )
+}
+
+#[derive(Default)]
+struct RawUsageCounters {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    prompt_token_count: Option<u64>,
+    prompt_token_count_snake: Option<u64>,
+    candidates_token_count: Option<u64>,
+    candidates_token_count_snake: Option<u64>,
+    thoughts_token_count: Option<u64>,
+    thoughts_token_count_snake: Option<u64>,
+    tool_use_prompt_token_count: Option<u64>,
+    tool_use_prompt_token_count_snake: Option<u64>,
+    cache_creation_top: Option<u64>,
+    cache_creation_details: Option<u64>,
+    cache_read_anthropic: Option<u64>,
+    cached_tokens_prompt_details: Option<u64>,
+    cached_tokens_input_details: Option<u64>,
+    cached_content_token_count: Option<u64>,
+    cached_content_token_count_snake: Option<u64>,
+    cached_tokens_top: Option<u64>,
+    has_responses_details: bool,
+    has_dashscope_modality: bool,
+}
+
+impl RawUsageCounters {
+    fn set_first(slot: &mut Option<u64>, value: Option<u64>) {
+        if slot.is_none() {
+            *slot = value;
+        }
+    }
+
+    fn into_token_usage(self) -> Option<TokenUsage> {
+        // Gemini's wire counters are camelCase (`promptTokenCount` /
+        // `candidatesTokenCount` under `usageMetadata`); the snake_case
+        // spellings are the gateway fallback `extract_usage_object`'s Gemini
+        // arm keeps, so the scan reads them the same way and in the same order.
+        let tool_prompt = self
+            .tool_use_prompt_token_count
+            .or(self.tool_use_prompt_token_count_snake)
+            .unwrap_or(0);
+        let gemini_input = self
+            .prompt_token_count
+            .or(self.prompt_token_count_snake)
+            .map(|prompt| prompt.saturating_add(tool_prompt));
+        // Thinking models report the reasoning budget in a counter of its own,
+        // outside `candidatesTokenCount`, while `totalTokenCount` covers both —
+        // fold it into output just like `extract_usage_object`'s Gemini arm.
+        let thoughts = self
+            .thoughts_token_count
+            .or(self.thoughts_token_count_snake);
+        let gemini_output = self
+            .candidates_token_count
+            .or(self.candidates_token_count_snake)
+            .map(|candidates| candidates.saturating_add(thoughts.unwrap_or(0)))
+            .or(thoughts);
+        let is_gemini = gemini_input.is_some() || gemini_output.is_some();
+
+        let input = self.input_tokens.or(self.prompt_tokens).or(gemini_input);
+        let output = self
+            .output_tokens
+            .or(self.completion_tokens)
+            .or(gemini_output);
+        if input.is_none() && output.is_none() {
+            return None;
+        }
+
+        let cache_creation_input_tokens = self.cache_creation_top.or(self.cache_creation_details);
+        let cache_read_input_tokens = self
+            .cache_read_anthropic
+            .or(self.cached_tokens_prompt_details)
+            .or(self.cached_tokens_input_details)
+            .or(self.cached_content_token_count)
+            .or(self.cached_content_token_count_snake)
+            .or(self.cached_tokens_top);
+
+        // Provider decides whether the cache counters are billed on top of the
+        // input count (Anthropic) or sit inside it (OpenAI-compatible / Gemini /
+        // DashScope). DashScope compatible mode nests
+        // `cache_creation_input_tokens` under `prompt_tokens_details` alongside
+        // `prompt_tokens`, and Responses API nests `cached_tokens` under
+        // `input_tokens_details`; neither may be misclassified as Anthropic.
+        let provider = if is_gemini {
+            LLMProvider::Gemini
+        } else if self.input_tokens.is_some() && self.has_dashscope_modality {
+            LLMProvider::DashScope
+        } else if self.prompt_tokens.is_none()
+            && !self.has_responses_details
+            && (self.cache_creation_top.is_some() || self.cache_read_anthropic.is_some())
+        {
+            LLMProvider::Anthropic
+        } else {
+            LLMProvider::OpenAI
+        };
+
+        Some(TokenUsage {
+            input_tokens: input.unwrap_or(0),
+            output_tokens: output.unwrap_or(0),
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            model: None,
+            provider,
+        })
+    }
+}
+
+/// Structural partial-JSON scanner that recovers token counters only from
+/// protocol usage locations (or bare top-level usage fragments), skipping
+/// strings, escapes, arrays, and unrelated subtrees such as echoed tool schemas.
+struct PartialUsageScanner<'a> {
+    src: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PartialUsageScanner<'a> {
+    fn new(src: &'a str) -> Self {
+        Self {
+            src,
+            bytes: src.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(b) = self.peek() {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn skip_string(&mut self) -> bool {
+        if self.peek() != Some(b'"') {
+            return false;
+        }
+        self.pos += 1;
+        while let Some(b) = self.peek() {
+            match b {
+                b'\\' => {
+                    self.pos += 1;
+                    if self.pos < self.bytes.len() {
+                        self.pos += 1;
+                    } else {
+                        return false;
+                    }
+                }
+                b'"' => {
+                    self.pos += 1;
+                    return true;
+                }
+                _ => {
+                    self.pos += 1;
+                }
+            }
+        }
+        false
+    }
+
+    fn parse_string_key(&mut self) -> Option<Cow<'a, str>> {
+        if self.peek() != Some(b'"') {
+            return None;
+        }
+        let quote_start = self.pos;
+        self.pos += 1;
+        let content_start = self.pos;
+        let mut has_escape = false;
+        while let Some(b) = self.peek() {
+            match b {
+                b'\\' => {
+                    has_escape = true;
+                    self.pos += 1;
+                    if self.pos < self.bytes.len() {
+                        self.pos += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                b'"' => {
+                    let content_end = self.pos;
+                    self.pos += 1;
+                    if !has_escape {
+                        return Some(Cow::Borrowed(&self.src[content_start..content_end]));
+                    }
+                    let raw_literal = &self.src[quote_start..self.pos];
+                    return serde_json::from_str::<String>(raw_literal)
+                        .ok()
+                        .map(Cow::Owned);
+                }
+                _ => {
+                    self.pos += 1;
+                }
+            }
+        }
+        None
+    }
+
+    fn skip_primitive(&mut self) -> bool {
+        let start = self.pos;
+        while let Some(b) = self.peek() {
+            if matches!(
+                b,
+                b' ' | b'\t' | b'\r' | b'\n' | b',' | b'}' | b']' | b':' | b'{' | b'[' | b'"'
+            ) {
+                break;
+            }
+            self.pos += 1;
+        }
+        self.pos > start
+    }
+
+    /// Structurally skip one JSON value using an explicit delimiter stack so
+    /// arbitrarily nested tool schemas or arrays never overflow the call stack.
+    fn skip_value(&mut self) -> bool {
+        self.skip_ws();
+        let Some(first) = self.peek() else {
+            return false;
+        };
+        match first {
+            b'"' => self.skip_string(),
+            b'{' | b'[' => {
+                let mut expected_closers: Vec<u8> = Vec::new();
+                while let Some(b) = self.peek() {
+                    match b {
+                        b'"' => {
+                            if !self.skip_string() {
+                                return false;
+                            }
+                        }
+                        b'{' => {
+                            self.pos += 1;
+                            expected_closers.push(b'}');
+                        }
+                        b'[' => {
+                            self.pos += 1;
+                            expected_closers.push(b']');
+                        }
+                        b'}' | b']' => {
+                            if expected_closers.last() != Some(&b) {
+                                return false;
+                            }
+                            expected_closers.pop();
+                            self.pos += 1;
+                            if expected_closers.is_empty() {
+                                return true;
+                            }
+                        }
+                        _ => {
+                            self.pos += 1;
+                        }
+                    }
+                }
+                false
+            }
+            _ => self.skip_primitive(),
+        }
+    }
+
+    /// Parse a non-negative JSON integer value at the current cursor, or
+    /// structurally skip any non-u64 value (string, float, negative, object,
+    /// array, boolean, null) so sibling keys remain aligned.
+    fn parse_u64_or_skip(&mut self) -> Option<u64> {
+        self.skip_ws();
+        let first = self.peek()?;
+        if !first.is_ascii_digit() {
+            self.skip_value();
+            return None;
+        }
+        let start = self.pos;
+        while let Some(b) = self.peek() {
+            if b.is_ascii_digit() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let digits = &self.src[start..self.pos];
+        if let Some(next) = self.peek() {
+            if !matches!(next, b' ' | b'\t' | b'\r' | b'\n' | b',' | b'}' | b']') {
+                self.skip_primitive();
+                return None;
+            }
+        }
+        if digits.len() > 1 && digits.starts_with('0') {
+            return None;
+        }
+        digits.parse::<u64>().ok()
+    }
+
+    fn parse_details_object(&mut self, counters: &mut RawUsageCounters, is_input_details: bool) {
+        if self.peek() != Some(b'{') {
+            self.skip_value();
+            return;
+        }
+        self.pos += 1;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => break,
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'"') => {}
+                _ => break,
+            }
+            let Some(key) = self.parse_string_key() else {
+                break;
+            };
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                break;
+            }
+            self.pos += 1;
+            self.skip_ws();
+            match key.as_ref() {
+                "cached_tokens" => {
+                    let val = self.parse_u64_or_skip();
+                    if is_input_details {
+                        RawUsageCounters::set_first(&mut counters.cached_tokens_input_details, val);
+                    } else {
+                        RawUsageCounters::set_first(
+                            &mut counters.cached_tokens_prompt_details,
+                            val,
+                        );
+                    }
+                }
+                "cache_creation_input_tokens" if !is_input_details => {
+                    let val = self.parse_u64_or_skip();
+                    RawUsageCounters::set_first(&mut counters.cache_creation_details, val);
+                }
+                _ => {
+                    if !self.skip_value() {
+                        break;
+                    }
+                }
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn consume_usage_field(&mut self, key: &str, counters: &mut RawUsageCounters) -> bool {
+        match key {
+            "input_tokens" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.input_tokens, val);
+            }
+            "output_tokens" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.output_tokens, val);
+            }
+            "prompt_tokens" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.prompt_tokens, val);
+            }
+            "completion_tokens" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.completion_tokens, val);
+            }
+            "promptTokenCount" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.prompt_token_count, val);
+            }
+            "prompt_token_count" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.prompt_token_count_snake, val);
+            }
+            "candidatesTokenCount" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.candidates_token_count, val);
+            }
+            "candidates_token_count" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.candidates_token_count_snake, val);
+            }
+            "thoughtsTokenCount" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.thoughts_token_count, val);
+            }
+            "thoughts_token_count" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.thoughts_token_count_snake, val);
+            }
+            "toolUsePromptTokenCount" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.tool_use_prompt_token_count, val);
+            }
+            "tool_use_prompt_token_count" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.tool_use_prompt_token_count_snake, val);
+            }
+            "cache_creation_input_tokens" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.cache_creation_top, val);
+            }
+            "cache_read_input_tokens" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.cache_read_anthropic, val);
+            }
+            "cached_tokens" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.cached_tokens_top, val);
+            }
+            "cachedContentTokenCount" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.cached_content_token_count, val);
+            }
+            "cached_content_token_count" => {
+                let val = self.parse_u64_or_skip();
+                RawUsageCounters::set_first(&mut counters.cached_content_token_count_snake, val);
+            }
+            "prompt_tokens_details" => {
+                self.parse_details_object(counters, false);
+            }
+            "input_tokens_details" => {
+                if self.peek() == Some(b'{') {
+                    counters.has_responses_details = true;
+                    self.parse_details_object(counters, true);
+                } else {
+                    return self.skip_value();
+                }
+            }
+            "output_tokens_details" => {
+                if self.peek() == Some(b'{') {
+                    counters.has_responses_details = true;
+                }
+                return self.skip_value();
+            }
+            "image_tokens" | "audio_tokens" | "video_tokens" => {
+                if self.parse_u64_or_skip().is_some() {
+                    counters.has_dashscope_modality = true;
+                }
+            }
+            _ => {
+                return self.skip_value();
+            }
+        }
+        true
+    }
+
+    fn parse_usage_object(&mut self) -> Option<TokenUsage> {
+        if self.peek() != Some(b'{') {
+            self.skip_value();
+            return None;
+        }
+        self.pos += 1;
+        let mut counters = RawUsageCounters::default();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => break,
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'"') => {}
+                _ => break,
+            }
+            let Some(key) = self.parse_string_key() else {
+                break;
+            };
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                break;
+            }
+            self.pos += 1;
+            self.skip_ws();
+            if !self.consume_usage_field(key.as_ref(), &mut counters) {
+                break;
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        counters.into_token_usage()
+    }
+
+    fn scan_envelope_object(&mut self, depth: usize) -> Option<TokenUsage> {
+        if self.peek() != Some(b'{') {
+            return None;
+        }
+        self.pos += 1;
+        let mut root_is_bare_usage = depth == 0;
+        let mut bare_counters = RawUsageCounters::default();
+
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => break,
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'"') => {}
+                _ => {
+                    root_is_bare_usage = false;
+                    break;
+                }
+            }
+            let Some(key) = self.parse_string_key() else {
+                break;
+            };
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                break;
+            }
+            self.pos += 1;
+            self.skip_ws();
+
+            if is_usage_container_key(key.as_ref()) {
+                root_is_bare_usage = false;
+                if self.peek() == Some(b'{') {
+                    if let Some(usage) = self.parse_usage_object() {
+                        return Some(usage);
+                    }
+                } else if !self.skip_value() {
+                    break;
+                }
+            } else if depth < MAX_WRAPPER_DEPTH && is_protocol_wrapper_key(key.as_ref()) {
+                root_is_bare_usage = false;
+                if self.peek() == Some(b'{') {
+                    if let Some(usage) = self.scan_envelope_object(depth + 1) {
+                        return Some(usage);
+                    }
+                } else if !self.skip_value() {
+                    break;
+                }
+            } else if root_is_bare_usage && is_bare_usage_key(key.as_ref()) {
+                if !self.consume_usage_field(key.as_ref(), &mut bare_counters) {
+                    break;
+                }
+            } else {
+                root_is_bare_usage = false;
+                if !self.skip_value() {
+                    break;
+                }
+            }
+
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        if root_is_bare_usage {
+            bare_counters.into_token_usage()
+        } else {
+            None
+        }
+    }
+
+    /// Scan a brace-less top-level bare usage fragment such as
+    /// `"input_tokens": 42, "output_tokens": 7`. Rejects any non-usage key or
+    /// stray closing brace so truncated fragments inside schema examples never
+    /// match.
+    fn scan_braceless_bare_usage(&mut self) -> Option<TokenUsage> {
+        let mut counters = RawUsageCounters::default();
+        let mut saw_field = false;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => break,
+                Some(b'"') => {}
+                _ => return None,
+            }
+            let Some(key) = self.parse_string_key() else {
+                break;
+            };
+            if !is_bare_usage_key(key.as_ref()) {
+                return None;
+            }
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return None;
+            }
+            self.pos += 1;
+            self.skip_ws();
+            saw_field = true;
+            if !self.consume_usage_field(key.as_ref(), &mut counters) {
+                break;
+            }
+            self.skip_ws();
+            match self.peek() {
+                None => break,
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                _ => return None,
+            }
+        }
+        if saw_field {
+            counters.into_token_usage()
+        } else {
+            None
+        }
+    }
+}
+
+fn scan_json_payload(payload: &str) -> Option<TokenUsage> {
+    let trimmed = payload
+        .strip_prefix('\u{feff}')
+        .unwrap_or(payload)
+        .trim_start();
+    if trimmed.is_empty() || trimmed == "[DONE]" || trimmed == "[END]" {
+        return None;
+    }
+
+    let mut scanner = PartialUsageScanner::new(trimmed);
+    if scanner.peek() == Some(b'{') {
+        while let Some(b) = scanner.peek() {
+            if b != b'{' {
+                break;
+            }
+            let before = scanner.pos;
+            if let Some(usage) = scanner.scan_envelope_object(0) {
+                return Some(usage);
+            }
+            if scanner.pos == before {
+                break;
+            }
+            scanner.skip_ws();
+        }
+        return None;
+    }
+
+    if scanner.peek() == Some(b'"') {
+        return scanner.scan_braceless_bare_usage();
+    }
+
+    None
+}
+
+fn merge_partial_usage(acc: Option<TokenUsage>, next: TokenUsage) -> Option<TokenUsage> {
+    let Some(cur) = acc else {
+        return Some(next);
+    };
+    let cur_empty = cur.is_empty();
+    let next_provider = next.provider;
+    let next_empty = next.is_empty();
+    let mut merged = super::merge_usage(Some(cur), next)?;
+    if cur_empty && !next_empty && next_provider != LLMProvider::Unknown {
+        merged.provider = next_provider;
+    }
+    Some(merged)
+}
+
+fn scan_sse_frame(frame_data: &str) -> Option<TokenUsage> {
+    let trimmed = frame_data.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" || trimmed == "[END]" {
+        return None;
+    }
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(usage) = TokenParser::new().parse_json(&json) {
+            return Some(usage);
+        }
+    }
+    scan_json_payload(trimmed)
+}
 
 /// Token parser for extracting usage from SSE events
 pub struct TokenParser;
@@ -83,6 +844,8 @@ impl TokenParser {
             || data.contains("\"candidatesTokenCount\"")
             || data.contains("\"prompt_token_count\"")
             || data.contains("\"candidates_token_count\"")
+            || data.contains("\"thoughtsTokenCount\"")
+            || data.contains("\"thoughts_token_count\"")
         {
             let usage = Self::scan_partial_usage(data);
             if usage.is_some() {
@@ -94,110 +857,75 @@ impl TokenParser {
         None
     }
 
-    /// Recover token usage fields from a possibly-truncated JSON string by
-    /// scanning for the integer values that follow `"input_tokens"`,
-    /// `"output_tokens"`, etc. The first *numeric* occurrence wins, which
-    /// matches dashscope's behaviour of placing the canonical `usage` block
-    /// before any `x_details` echo.
+    /// Recover token usage fields from a possibly-truncated JSON or SSE
+    /// continuation buffer by walking JSON structure (strings, escapes,
+    /// braces, brackets, and object key paths) rather than raw text matching.
     ///
-    /// A non-numeric occurrence is skipped: a committed Responses payload
-    /// echoes the request's `tools` before `usage`, so a tool parameter
-    /// named `input_tokens` appears there as an object schema. Stopping at
-    /// it lost the real count that followed.
+    /// Counters are extracted only from canonical protocol `usage` /
+    /// `usageMetadata` objects (at root or inside standard protocol wrappers
+    /// such as `response`, `message`, `data`, `event`, `delta`, `payload`,
+    /// `chunk`, or `result`) or from bare top-level usage fragments. Unrelated
+    /// subtrees such as echoed tool schemas (`tools`, `parameters`,
+    /// `properties`, `default`, `examples`, etc.) and string literals are
+    /// skipped structurally so numeric schema examples neither override real
+    /// usage nor invent usage before the protocol usage block arrives.
     fn scan_partial_usage(data: &str) -> Option<TokenUsage> {
-        fn find_u64(s: &str, key: &str) -> Option<u64> {
-            let pat = format!("\"{key}\"");
-            let mut search_from = 0usize;
-            while let Some(relative) = s.get(search_from..)?.find(&pat) {
-                let idx = search_from + relative + pat.len();
-                search_from = idx;
-                let rest = s.get(idx..)?.trim_start();
-                let Some(rest) = rest.strip_prefix(':').map(str::trim_start) else {
-                    continue;
-                };
-                let end = rest
-                    .find(|c: char| !c.is_ascii_digit())
-                    .unwrap_or(rest.len());
-                if end == 0 {
-                    continue;
-                }
-                if let Ok(value) = rest[..end].parse::<u64>() {
-                    return Some(value);
-                }
-            }
-            None
-        }
-
-        // Gemini's wire counters are camelCase (`promptTokenCount` /
-        // `candidatesTokenCount` under `usageMetadata`); the snake_case
-        // spellings are the gateway fallback `extract_usage_object`'s Gemini
-        // arm keeps, so the scan reads them the same way and in the same
-        // order. A gateway that spells them snake_case is the reason
-        // `detect_provider_from_usage` reads `prompt_token_count` as the
-        // Gemini signal.
-        let tool_prompt = find_u64(data, "toolUsePromptTokenCount")
-            .or_else(|| find_u64(data, "tool_use_prompt_token_count"))
-            .unwrap_or(0);
-        let gemini_input = find_u64(data, "promptTokenCount")
-            .or_else(|| find_u64(data, "prompt_token_count"))
-            .map(|prompt| prompt.saturating_add(tool_prompt));
-        // Thinking models report the reasoning budget in a counter of its
-        // own, outside `candidatesTokenCount`, while `totalTokenCount`
-        // covers both — the direct parse folds it into the output count
-        // (`extract_usage_object`'s Gemini arm), so the scan must read it
-        // the same way or a thinking-model chunk split across TLS records
-        // under-reports the call by the whole budget: 1 output token where
-        // the same payload parsed whole reports 816.
-        let thoughts =
-            find_u64(data, "thoughtsTokenCount").or_else(|| find_u64(data, "thoughts_token_count"));
-        let gemini_output = find_u64(data, "candidatesTokenCount")
-            .or_else(|| find_u64(data, "candidates_token_count"))
-            .map(|candidates| candidates.saturating_add(thoughts.unwrap_or(0)))
-            .or(thoughts);
-        let is_gemini = gemini_input.is_some() || gemini_output.is_some();
-        let input = find_u64(data, "input_tokens")
-            .or_else(|| find_u64(data, "prompt_tokens"))
-            .or(gemini_input);
-        let output = find_u64(data, "output_tokens")
-            .or_else(|| find_u64(data, "completion_tokens"))
-            .or(gemini_output);
-        if input.is_none() && output.is_none() {
+        let stripped = data.strip_prefix('\u{feff}').unwrap_or(data);
+        let trimmed = stripped.trim_start();
+        if trimmed.is_empty() {
             return None;
         }
 
-        let cache_creation_input_tokens = find_u64(data, "cache_creation_input_tokens");
-        let anthropic_cache_read = find_u64(data, "cache_read_input_tokens");
-        let cache_read_input_tokens = anthropic_cache_read
-            .or_else(|| find_u64(data, "cached_tokens"))
-            .or_else(|| find_u64(data, "cachedContentTokenCount"));
-        // Provider decides whether the cache counters are billed on top of the
-        // input count (Anthropic) or sit inside it (OpenAI-compatible). The
-        // cache field names alone are not enough: DashScope's compatible mode
-        // nests `cache_creation_input_tokens` under `prompt_tokens_details`,
-        // where `prompt_tokens` already includes it, so inferring Anthropic
-        // from the name alone roughly doubles the billed input. Anthropic
-        // spells the input count `input_tokens`; `prompt_tokens` is the
-        // OpenAI-compatible spelling. Gemini's camelCase counters bill like
-        // OpenAI (the cached prefix sits inside `promptTokenCount`), so they
-        // carry the Gemini label and never fall into the Anthropic inference.
-        let provider = if is_gemini {
-            LLMProvider::Gemini
-        } else if find_u64(data, "prompt_tokens").is_none()
-            && (cache_creation_input_tokens.is_some() || anthropic_cache_read.is_some())
-        {
-            LLMProvider::Anthropic
+        // Leading JSON object(s) may appear without a `data:` prefix either
+        // for direct truncated JSON buffers or when a TLS split landed right
+        // after an earlier event's `data: ` prefix; continue scanning any
+        // subsequent SSE `data:` lines in the same continuation buffer.
+        let starts_with_brace = trimmed.starts_with('{');
+        let mut merged = if starts_with_brace {
+            scan_json_payload(trimmed)
         } else {
-            LLMProvider::OpenAI
+            None
         };
 
-        Some(TokenUsage {
-            input_tokens: input.unwrap_or(0),
-            output_tokens: output.unwrap_or(0),
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-            model: None,
-            provider,
-        })
+        // Extract SSE frames (`data:` lines delimited by blank lines, plus any
+        // trailing unterminated frame at EOF) so multi-event continuation
+        // buffers are scanned frame-by-frame and merged across cumulative
+        // snapshots (preventing an earlier zero placeholder from masking a
+        // later terminal usage frame).
+        let mut saw_data_line = false;
+        let mut current_data = String::new();
+        for raw_line in stripped.split('\n') {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if line.is_empty() {
+                if !current_data.is_empty() {
+                    if let Some(usage) = scan_sse_frame(&current_data) {
+                        merged = merge_partial_usage(merged, usage);
+                    }
+                    current_data.clear();
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("data:") {
+                saw_data_line = true;
+                let value = rest.strip_prefix(' ').unwrap_or(rest);
+                if !current_data.is_empty() {
+                    current_data.push('\n');
+                }
+                current_data.push_str(value);
+            }
+        }
+        if !current_data.is_empty() {
+            if let Some(usage) = scan_sse_frame(&current_data) {
+                merged = merge_partial_usage(merged, usage);
+            }
+        }
+        if saw_data_line || starts_with_brace {
+            return merged;
+        }
+
+        // Fallback for bare top-level usage fragments without SSE framing or
+        // an outer `{` (e.g. `"input_tokens": 42, "output_tokens": 7`).
+        scan_json_payload(trimmed)
     }
 
     /// Internal method to parse JSON and extract token usage
@@ -1041,5 +1769,496 @@ data:{"sequence_number":10,"type":"response.completed","response":{"usage":{"tot
         let data = r#"{"input_tokens": "not a number"}"#;
         let parser = TokenParser::new();
         assert!(parser.parse_data(data).is_none());
+    }
+
+    fn capture_truncated_responses_sse(
+        truncated_terminal_event: &str,
+    ) -> Vec<crate::analyzer::AnalysisResult> {
+        use crate::aggregator::Aggregator;
+        use crate::analyzer::Analyzer;
+        use crate::parser::Parser;
+        use crate::probes::sslsniff::SslEvent;
+        use std::rc::Rc;
+
+        let make_ssl = |buf: &[u8], rw: i32, ts: u64| {
+            Rc::new(SslEvent {
+                source: 0,
+                timestamp_ns: ts,
+                delta_ns: 0,
+                pid: 4242,
+                tid: 4242,
+                uid: 0,
+                len: buf.len() as u32,
+                rw,
+                comm: "agent-test".to_string(),
+                buf: buf.to_vec(),
+                is_handshake: false,
+                ssl_ptr: 0x7000,
+            })
+        };
+
+        let parser = Parser::new();
+        let mut aggregator = Aggregator::new();
+
+        let req_body = r#"{"model":"gpt-5","stream":true,"input":"hi"}"#;
+        let req = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{req_body}",
+            req_body.len()
+        );
+        assert!(
+            aggregator
+                .process_result(parser.parse_ssl_event(make_ssl(req.as_bytes(), 1, 100)))
+                .is_empty()
+        );
+
+        let resp_head = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "\r\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+        );
+        assert!(
+            aggregator
+                .process_result(parser.parse_ssl_event(make_ssl(resp_head.as_bytes(), 0, 200)))
+                .is_empty()
+        );
+
+        // Truncated terminal continuation chunk (no trailing `\n\n`, cut mid-JSON).
+        assert!(
+            aggregator
+                .process_result(parser.parse_ssl_event(make_ssl(
+                    truncated_terminal_event.as_bytes(),
+                    0,
+                    300
+                )))
+                .is_empty()
+        );
+
+        let drained = aggregator.drain_pending();
+        assert_eq!(
+            drained.len(),
+            1,
+            "drained capture should emit one truncated SSE exchange"
+        );
+        Analyzer::new().analyze_aggregated(&drained[0])
+    }
+
+    #[test]
+    fn partial_usage_boundaries_ignore_schema_examples_in_captured_responses() {
+        let truncated = concat!(
+            "event: response.completed\n",
+            "data: {",
+            "\"sequence_number\":10,",
+            "\"type\":\"response.completed\",",
+            "\"response\":{",
+            "\"id\":\"resp_1\",",
+            "\"model\":\"gpt-5\",",
+            "\"tools\":[{",
+            "\"type\":\"function\",",
+            "\"name\":\"meter\",",
+            "\"parameters\":{",
+            "\"type\":\"object\",",
+            "\"default\":{\"input_tokens\":9000,\"output_tokens\":8000,\"cached_tokens\":7000},",
+            "\"examples\":[{\"input_tokens\":9000,\"output_tokens\":8000,\"cached_tokens\":7000}],",
+            "\"properties\":{",
+            "\"input_tokens\":{\"type\":\"integer\",\"default\":9000},",
+            "\"output_tokens\":{\"type\":\"integer\",\"default\":8000},",
+            "\"cached_tokens\":{\"type\":\"integer\",\"default\":7000}",
+            "}}",
+            "}],",
+            "\"usage\":{",
+            "\"input_tokens\":57,",
+            "\"output_tokens\":3,",
+            "\"total_tokens\":60,",
+            "\"input_tokens_details\":{\"cached_tokens\":2}",
+            "},",
+            "\"metadata\":{\"tail\":\"cut",
+        );
+
+        let results = capture_truncated_responses_sse(truncated);
+        let token = results
+            .iter()
+            .find_map(|r| match r {
+                crate::analyzer::AnalysisResult::Token(record) => Some(record),
+                _ => None,
+            })
+            .expect("canonical response.usage must still produce a Token record");
+
+        assert_eq!(token.input_tokens, 57);
+        assert_eq!(token.output_tokens, 3);
+        assert_eq!(token.cache_read_tokens, Some(2));
+        assert_eq!(token.provider, "openai");
+    }
+
+    #[test]
+    fn partial_usage_boundaries_do_not_invent_usage_before_the_usage_block_arrives() {
+        let truncated_before_usage = concat!(
+            "event: response.completed\n",
+            "data: {",
+            "\"sequence_number\":10,",
+            "\"type\":\"response.completed\",",
+            "\"response\":{",
+            "\"id\":\"resp_2\",",
+            "\"model\":\"gpt-5\",",
+            "\"tools\":[{",
+            "\"type\":\"function\",",
+            "\"name\":\"meter\",",
+            "\"parameters\":{",
+            "\"type\":\"object\",",
+            "\"default\":{\"usage\":{\"input_tokens\":9000,\"output_tokens\":8000,\"cached_tokens\":7000}},",
+            "\"examples\":[{\"usage\":{\"input_tokens\":9000,\"output_tokens\":8000,\"cached_tokens\":7000}}]",
+            "}}",
+            "}],",
+            "\"metadata\":{\"before_usage\":\"cut",
+        );
+
+        let results = capture_truncated_responses_sse(truncated_before_usage);
+        let token = results.iter().find_map(|r| match r {
+            crate::analyzer::AnalysisResult::Token(record) => Some(record),
+            _ => None,
+        });
+        assert!(
+            token.is_none(),
+            "schema examples before real usage must not invent a Token record, got: {token:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_partial_usage_skips_numeric_tool_schema_defaults_and_examples() {
+        let parser = TokenParser::new();
+        let data = concat!(
+            "{\"type\":\"response.completed\",\"response\":{",
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"meter\",\"parameters\":{",
+            "\"type\":\"object\",",
+            "\"default\":{\"input_tokens\":9000,\"output_tokens\":8000,\"cached_tokens\":7000},",
+            "\"examples\":[{\"usage\":{\"input_tokens\":9000,\"output_tokens\":8000,\"cached_tokens\":7000}}]",
+            "}}}],",
+            "\"usage\":{\"input_tokens\":57,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":2}},",
+            "\"metadata\":{\"tail\":\"cut",
+        );
+        let usage = parser
+            .parse_data(data)
+            .expect("canonical usage after numeric tool schema examples must parse");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+    }
+
+    #[test]
+    fn test_scan_partial_usage_rejects_nested_usage_inside_schema_before_real_usage() {
+        let parser = TokenParser::new();
+        let data = concat!(
+            "{\"type\":\"response.completed\",\"response\":{",
+            "\"tools\":[{\"type\":\"function\",\"input_schema\":{",
+            "\"type\":\"object\",",
+            "\"properties\":{\"usage\":{\"type\":\"object\",\"default\":{\"input_tokens\":9000,\"output_tokens\":8000}}},",
+            "\"$defs\":{\"UsageExample\":{\"default\":{\"usage\":{\"input_tokens\":9000,\"output_tokens\":8000}}}}",
+            "}}],",
+            "\"metadata\":{\"cut",
+        );
+        assert!(parser.parse_data(data).is_none());
+    }
+
+    #[test]
+    fn test_scan_partial_usage_ignores_escaped_quotes_and_trailing_backslashes_in_strings() {
+        let parser = TokenParser::new();
+        // String literal contains fake usage with escaped quotes and terminates
+        // immediately after an escaped backslash (`\\"`), followed by real usage.
+        let with_real_usage = r#"{"type":"response.completed","response":{"instructions":"Example \"usage\":{\"input_tokens\":9000,\"output_tokens\":8000}\\","usage":{"input_tokens":57,"output_tokens":3"#;
+        let usage = parser
+            .parse_data(with_real_usage)
+            .expect("escaped backslash before closing quote must not swallow real usage");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+
+        // Truncated inside a string literal that embeds fake JSON usage.
+        let truncated_in_string = r#"{"type":"response.output_text.delta","delta":"{\"usage\":{\"input_tokens\":9000,\"output_tokens\":8000}}"#;
+        assert!(parser.parse_data(truncated_in_string).is_none());
+    }
+
+    #[test]
+    fn test_scan_partial_usage_skips_non_protocol_containers_and_user_content() {
+        let parser = TokenParser::new();
+        for payload in [
+            r#"{"type":"response.completed","response":{"output":[{"type":"function_call","arguments":{"usage":{"input_tokens":9000,"output_tokens":8000}}}],"tail":"cut"#,
+            r#"{"type":"message_delta","content":{"usage":{"input_tokens":9000,"output_tokens":8000}},"tail":"cut"#,
+            r#"{"type":"response.completed","response":{"metadata":{"usage":{"input_tokens":9000,"output_tokens":8000}}},"tail":"cut"#,
+            r#"{"definitions":{"usage":{"input_tokens":9000,"output_tokens":8000}},"tail":"cut"#,
+        ] {
+            assert!(
+                parser.parse_data(payload).is_none(),
+                "non-protocol container must not yield usage: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_partial_usage_accepts_standard_protocol_wrappers() {
+        let parser = TokenParser::new();
+
+        // Anthropic message_start truncated inside message.usage.
+        let anthropic = r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":120,"output_tokens":1,"cache_creation_input_tokens":30,"cache_read_input_tokens":40"#;
+        let usage = parser
+            .parse_data(anthropic)
+            .expect("message.usage must parse");
+        assert_eq!(usage.provider, LLMProvider::Anthropic);
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 1);
+        assert_eq!(usage.cache_creation_input_tokens, Some(30));
+        assert_eq!(usage.cache_read_input_tokens, Some(40));
+
+        // Nested standard protocol wrappers (`data.response.usage`).
+        let wrapped = r#"{"event":"response.completed","data":{"response":{"tools":[{"default":{"input_tokens":9000}}],"usage":{"input_tokens":12,"output_tokens":4"#;
+        let usage = parser
+            .parse_data(wrapped)
+            .expect("data.response.usage must parse");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+
+        // Gemini usageMetadata wrapped inside `result`.
+        let gemini_wrapped = r#"{"result":{"candidates":[{"index":0}],"usageMetadata":{"promptTokenCount":20,"toolUsePromptTokenCount":5,"candidatesTokenCount":4,"thoughtsTokenCount":10,"cachedContentTokenCount":8"#;
+        let usage = parser
+            .parse_data(gemini_wrapped)
+            .expect("result.usageMetadata must parse");
+        assert_eq!(usage.provider, LLMProvider::Gemini);
+        assert_eq!(usage.input_tokens, 25);
+        assert_eq!(usage.output_tokens, 14);
+        assert_eq!(usage.cache_read_input_tokens, Some(8));
+    }
+
+    #[test]
+    fn test_scan_partial_usage_gemini_snake_case_tool_prompt_and_cache() {
+        let parser = TokenParser::new();
+        let data = r#"data:{"candidates":[{"index":0}],"usage_metadata":{"prompt_token_count":30,"tool_use_prompt_token_count":7,"candidates_token_count":2,"thoughts_token_count":18,"cached_content_token_count":11"#;
+        let usage = parser
+            .parse_data(data)
+            .expect("snake_case usage_metadata must parse");
+        assert_eq!(usage.provider, LLMProvider::Gemini);
+        assert_eq!(usage.input_tokens, 37);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, Some(11));
+    }
+
+    #[test]
+    fn test_scan_partial_usage_dashscope_ignores_x_details_echo() {
+        let parser = TokenParser::new();
+        let data = r#"{"type":"response.completed","response":{"usage":{"x_details":[{"input_tokens":9999,"output_tokens":8888,"prompt_tokens_details":{"cached_tokens":7777}}],"input_tokens":57,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}},"tail":"cut"#;
+        let usage = parser
+            .parse_data(data)
+            .expect("canonical usage fields must ignore x_details echo");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+    }
+
+    #[test]
+    fn test_scan_partial_usage_rejects_non_usage_roots_and_non_integer_values() {
+        let parser = TokenParser::new();
+        assert!(
+            parser
+                .parse_data(r#"{"name":"meter","input_tokens":9000"#)
+                .is_none()
+        );
+        assert!(
+            parser
+                .parse_data(r#"{"input_tokens":9000,"description":"schema example""#)
+                .is_none()
+        );
+        assert!(
+            parser
+                .parse_data(r#"{"usage":{"input_tokens":57.5,"output_tokens":-3"#)
+                .is_none()
+        );
+        assert!(
+            parser
+                .parse_data(r#""input_tokens":9000,"output_tokens":8000},"properties":{"#)
+                .is_none()
+        );
+
+        let mixed = parser
+            .parse_data(r#"{"usage":{"input_tokens":57,"output_tokens":3.5"#)
+            .expect("valid integer sibling should survive non-integer field");
+        assert_eq!(mixed.input_tokens, 57);
+        assert_eq!(mixed.output_tokens, 0);
+
+        let braceless = parser
+            .parse_data(r#""input_tokens": 42, "output_tokens": 7"#)
+            .expect("brace-less top-level bare usage fragment should parse");
+        assert_eq!(braceless.input_tokens, 42);
+        assert_eq!(braceless.output_tokens, 7);
+    }
+
+    #[test]
+    fn test_scan_partial_usage_multi_frame_sse_skips_null_usage_and_recovers_later_frame() {
+        let parser = TokenParser::new();
+        let data = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"tools\":[{\"parameters\":{\"default\":{\"input_tokens\":9000,\"output_tokens\":8000}}}],\"usage\":null}}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"usage\\\":{\\\"input_tokens\\\":9999}}\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"tools\":[{\"parameters\":{\"default\":{\"usage\":{\"input_tokens\":9000}}}}],\"usage\":{\"input_tokens\":57,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":2}},\"metadata\":{\"tail\":\"cut",
+        );
+        let usage = parser
+            .parse_data(data)
+            .expect("later truncated frame's canonical usage must be recovered");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+    }
+
+    #[test]
+    fn test_scan_partial_usage_leading_json_before_sse_frames_and_multiline_data() {
+        let parser = TokenParser::new();
+
+        // A TLS split right after `data: ` of an earlier delta leaves leading
+        // JSON before later SSE `data:` frames in the same continuation buffer.
+        let leading_json_then_sse = concat!(
+            "{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"tools\":[{\"default\":{\"input_tokens\":9000}}],",
+            "\"usage\":{\"input_tokens\":57,\"output_tokens\":3",
+        );
+        let usage = parser
+            .parse_data(leading_json_then_sse)
+            .expect("terminal SSE frame after leading JSON must be recovered");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+
+        // Earlier zero-placeholder snapshot merged with later complete
+        // Anthropic frame and trailing `[DONE]` marker.
+        let zero_then_anthropic = concat!(
+            "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":100,\"output_tokens\":42,\"cache_read_input_tokens\":20}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let usage = parser
+            .parse_data(zero_then_anthropic)
+            .expect("zero placeholder must merge with later Anthropic usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.cache_read_input_tokens, Some(20));
+        assert_eq!(usage.provider, LLMProvider::Anthropic);
+
+        // Unterminated multiline SSE `data:` event.
+        let multiline_sse = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\n",
+            "data: \"usage\":{\"input_tokens\":57,\"output_tokens\":3",
+        );
+        let usage = parser
+            .parse_data(multiline_sse)
+            .expect("multiline unterminated SSE data must parse");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+
+        // Consecutive raw JSON objects without SSE framing.
+        let ndjson = concat!(
+            "{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+            "{\"usage\":{\"input_tokens\":19,\"output_tokens\":6",
+        );
+        let usage = parser
+            .parse_data(ndjson)
+            .expect("second consecutive raw JSON object must parse");
+        assert_eq!(usage.input_tokens, 19);
+        assert_eq!(usage.output_tokens, 6);
+    }
+
+    #[test]
+    fn test_scan_partial_usage_dashscope_multimodal_and_details_edge_cases() {
+        let parser = TokenParser::new();
+
+        // DashScope multimodal usage carries modality counters and top-level
+        // `cached_tokens`; input_tokens already includes modality counts.
+        let multimodal = r#"{"output":{"choices":[]},"usage":{"input_tokens":1261,"output_tokens":382,"image_tokens":1249,"cached_tokens":12"#;
+        let usage = parser
+            .parse_data(multimodal)
+            .expect("truncated DashScope multimodal usage must parse");
+        assert_eq!(usage.provider, LLMProvider::DashScope);
+        assert_eq!(usage.input_tokens, 1261);
+        assert_eq!(usage.output_tokens, 382);
+        assert_eq!(usage.cache_read_input_tokens, Some(12));
+
+        // Non-object details fields and `output_tokens_details` keep OpenAI
+        // billing without aborting sibling counters.
+        let non_object_details = r#"{"usage":{"input_tokens_details":null,"prompt_tokens_details":"n/a","output_tokens_details":{"reasoning_tokens":5},"input_tokens":21,"output_tokens":8"#;
+        let usage = parser
+            .parse_data(non_object_details)
+            .expect("non-object details values must be skipped cleanly");
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+        assert_eq!(usage.input_tokens, 21);
+        assert_eq!(usage.output_tokens, 8);
+
+        // Unknown sibling keys and nested objects inside `prompt_tokens_details`.
+        let nested_details = r#"{"usage":{"prompt_tokens":300,"completion_tokens":20,"prompt_tokens_details":{"text_tokens":300,"cache_creation":{"ephemeral_5m_input_tokens":50},"cached_tokens":9"#;
+        let usage = parser
+            .parse_data(nested_details)
+            .expect("unknown keys inside prompt_tokens_details must be skipped");
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, Some(9));
+    }
+
+    #[test]
+    fn test_scan_partial_usage_escaped_keys_malformed_and_braceless_edges() {
+        let parser = TokenParser::new();
+
+        // Unicode-escaped `"usage"` key and quote-escaped sibling key.
+        let escaped_keys = r#"{"k\"ey":"val","us\u0061ge":{"input_tokens":57,"output_tokens":3"#;
+        let usage = parser
+            .parse_data(escaped_keys)
+            .expect("escaped JSON object keys must decode cleanly");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+
+        // Truncated escape sequence inside a trailing key still keeps earlier
+        // counters.
+        let truncated_key_escape = r#"{"usage":{"input_tokens":57,"out\"#;
+        let usage = parser
+            .parse_data(truncated_key_escape)
+            .expect("truncated trailing key escape must preserve earlier counter");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 0);
+
+        // RFC 8259 leading zero is skipped without blocking valid siblings.
+        let leading_zero = r#"{"usage":{"input_tokens":0123,"output_tokens":4"#;
+        let usage = parser
+            .parse_data(leading_zero)
+            .expect("valid sibling must parse after leading-zero number");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 4);
+
+        // Malformed / truncated skipped subtrees and invalid braceless inputs
+        // must fail closed with `None`. Each payload includes `"input_tokens"`
+        // so it enters `scan_partial_usage` past `parse_data`'s fast gate.
+        for rejected in [
+            r#"{"tools":[{"a":1}},"usage":{"input_tokens":57"#,
+            r#"{"tools":"cut\","usage":{"input_tokens":57"#,
+            "{\"tools\":\"\\\"input_tokens\\\":9000\\",
+            r#"{"tools":[{"input_tokens":9000"#,
+            r#""foo": 1, "input_tokens": 9000"#,
+            r#""input_tokens" 9000"#,
+            r#"prefix "input_tokens": 9000"#,
+            "data:   \n\ndata: [DONE]\n\n",
+        ] {
+            assert!(
+                parser.parse_data(rejected).is_none(),
+                "malformed or non-usage fragment must return None: {rejected}"
+            );
+            assert!(
+                TokenParser::scan_partial_usage(rejected).is_none(),
+                "scan_partial_usage must return None: {rejected}"
+            );
+        }
     }
 }

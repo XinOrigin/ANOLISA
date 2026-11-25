@@ -135,44 +135,63 @@ def resolve_source(
     return actual_head, clone_method
 
 
+def _cleanup_timed_out_capture(proc: subprocess.Popen[bytes], container_name: str) -> None:
+    """Force-remove any timed-out container and terminate the child process."""
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        pass
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
 def capture(
     command: list[str],
     recorded_command: list[str],
     directory: Path,
     container_name: str,
-    timeout_seconds: int = RUN_TIMEOUT_SECONDS,
+    timeout_seconds: float = RUN_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     """Preserve raw bytes and record parent pipe receipt order."""
     directory.mkdir()
-    started = time.time()
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
-        with selectors.DefaultSelector() as selector:
-            assert proc.stdout is not None and proc.stderr is not None
-            selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
-            selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
-            streams = {name: bytearray() for name in ("stdout", "stderr", "observed")}
-            chunks = []
-            while selector.get_map():
-                if time.time() - started > timeout_seconds:
-                    subprocess.run(
-                        ["docker", "rm", "-f", container_name],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                    proc.kill()
-                    proc.wait()
-                    raise TimeoutError(f"{directory.name} exceeded {timeout_seconds}s")
-                for key, _ in selector.select(timeout=1.0):
-                    chunk = key.fileobj.read1(65536)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    chunks.append({"stream": key.data, "bytes": len(chunk)})
-                    streams[key.data].extend(chunk)
-                    streams["observed"].extend(chunk)
-            status = proc.wait()
-    duration = round(time.time() - started, 3)
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    with (
+        subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc,
+        selectors.DefaultSelector() as selector,
+    ):
+        assert proc.stdout is not None and proc.stderr is not None
+        selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+        streams = {name: bytearray() for name in ("stdout", "stderr", "observed")}
+        chunks = []
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _cleanup_timed_out_capture(proc, container_name)
+                raise TimeoutError(f"{directory.name} exceeded {timeout_seconds}s")
+            for key, _ in selector.select(timeout=min(1.0, remaining)):
+                chunk = key.fileobj.read1(65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                chunks.append({"stream": key.data, "bytes": len(chunk)})
+                streams[key.data].extend(chunk)
+                streams["observed"].extend(chunk)
+        remaining = deadline - time.monotonic()
+        try:
+            status = proc.wait(timeout=max(0.0, remaining))
+        except subprocess.TimeoutExpired as exc:
+            _cleanup_timed_out_capture(proc, container_name)
+            raise TimeoutError(f"{directory.name} exceeded {timeout_seconds}s") from exc
+    duration = round(time.monotonic() - started, 3)
     record: dict[str, object] = {
         "command": recorded_command,
         "exit_code": status,

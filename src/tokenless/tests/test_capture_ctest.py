@@ -8,8 +8,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TESTS_DIR = Path(__file__).resolve().parent
 COMPONENT_ROOT = TESTS_DIR.parent
@@ -17,6 +19,132 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 import capture_ctest  # noqa: E402
+
+
+class TestCaptureCtestTimeout(unittest.TestCase):
+    def test_capture_times_out_after_pipe_eof_and_cleans_up_container(self) -> None:
+        script = (
+            "printf 'before-eof\\n'; "
+            "printf 'err-before-eof\\n' >&2; "
+            "exec 1>&- 2>&-; "
+            "sleep 0.8"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            started = time.monotonic()
+            with (
+                mock.patch.object(capture_ctest.subprocess, "run") as mock_run,
+                self.assertRaises(TimeoutError) as ctx,
+            ):
+                capture_ctest.capture(
+                    ["/bin/sh", "-c", script],
+                    ["docker", "run", "demo"],
+                    out_dir,
+                    container_name="tok-test-eof",
+                    timeout_seconds=0.15,
+                )
+            elapsed = time.monotonic() - started
+            self.assertIn("exceeded", str(ctx.exception))
+            self.assertLess(elapsed, 0.5)
+            mock_run.assert_called_once_with(
+                ["docker", "rm", "-f", "tok-test-eof"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            for artifact in (
+                "capture.json",
+                "raw_bytes.json",
+                "stdout.txt",
+                "stderr.txt",
+                "observed.txt",
+            ):
+                self.assertFalse((out_dir / artifact).exists())
+
+    def test_capture_times_out_with_open_pipes_without_select_overshoot(self) -> None:
+        script = "sleep 0.8"
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            started = time.monotonic()
+            with (
+                mock.patch.object(capture_ctest.subprocess, "run") as mock_run,
+                self.assertRaises(TimeoutError),
+            ):
+                capture_ctest.capture(
+                    ["/bin/sh", "-c", script],
+                    ["docker", "run", "demo"],
+                    out_dir,
+                    container_name="tok-test-open",
+                    timeout_seconds=0.15,
+                )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.5)
+            mock_run.assert_called_once_with(
+                ["docker", "rm", "-f", "tok-test-open"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertFalse((out_dir / "capture.json").exists())
+            self.assertFalse((out_dir / "raw_bytes.json").exists())
+
+    def test_capture_timeout_kills_process_even_when_docker_rm_raises_oserror(self) -> None:
+        script = "exec 1>&- 2>&-; sleep 0.8"
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            started = time.monotonic()
+            with (
+                mock.patch.object(
+                    capture_ctest.subprocess, "run", side_effect=FileNotFoundError("docker")
+                ),
+                self.assertRaises(TimeoutError),
+            ):
+                capture_ctest.capture(
+                    ["/bin/sh", "-c", script],
+                    ["docker", "run", "demo"],
+                    out_dir,
+                    container_name="tok-test-missing-docker",
+                    timeout_seconds=0.15,
+                )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.5)
+            self.assertFalse((out_dir / "capture.json").exists())
+
+    def test_capture_records_bytes_and_order_when_completed_before_deadline(self) -> None:
+        script = (
+            "import sys, time; "
+            "sys.stdout.buffer.write(b'first\\r\\n'); sys.stdout.buffer.flush(); "
+            "time.sleep(0.03); "
+            "sys.stderr.buffer.write(b'second\\x00\\n'); sys.stderr.buffer.flush(); "
+            "sys.exit(3)"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            with mock.patch.object(capture_ctest.subprocess, "run") as mock_run:
+                record = capture_ctest.capture(
+                    [sys.executable, "-c", script],
+                    ["docker", "run", "demo"],
+                    out_dir,
+                    container_name="tok-test-ok",
+                    timeout_seconds=5.0,
+                )
+            mock_run.assert_not_called()
+            self.assertEqual(record["exit_code"], 3)
+            self.assertEqual(record["stdout_cr"], 1)
+            self.assertEqual(record["stdout_lf"], 1)
+            self.assertEqual(record["stderr_nul"], 1)
+            self.assertEqual(record["observed_bytes"], 15)
+            self.assertEqual(
+                record["observed_chunks"],
+                [{"stream": "stdout", "bytes": 7}, {"stream": "stderr", "bytes": 8}],
+            )
+            self.assertEqual((out_dir / "stdout.txt").read_bytes(), b"first\r\n")
+            self.assertEqual((out_dir / "stderr.txt").read_bytes(), b"second\x00\n")
+            self.assertEqual((out_dir / "observed.txt").read_bytes(), b"first\r\nsecond\x00\n")
+            capture_meta = json.loads((out_dir / "capture.json").read_text(encoding="utf-8"))
+            raw_meta = json.loads((out_dir / "raw_bytes.json").read_text(encoding="utf-8"))
+            self.assertEqual(capture_meta["exit_code"], 3)
+            self.assertEqual(raw_meta, {"command": ["docker", "run", "demo"], "exit_code": 3})
 
 
 def git(repo: Path, *args: str) -> str:

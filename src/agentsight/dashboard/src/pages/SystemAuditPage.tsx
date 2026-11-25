@@ -275,16 +275,21 @@ const StatCard: React.FC<{
 const Pagination: React.FC<{
   offset: number;
   pageSize: number;
+  loadedSize?: number;
   total: number;
   loading: boolean;
   onChange: (offset: number) => void;
-}> = ({ offset, pageSize, total, loading, onChange }) => {
-  const page = Math.floor(offset / pageSize) + 1;
+}> = ({ offset, pageSize, loadedSize, total, loading, onChange }) => {
+  const span = Math.max(pageSize, loadedSize ?? pageSize);
+  const windowEnd = Math.min(offset + span, total);
+  const startPage = Math.floor(offset / pageSize) + 1;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const endPage = Math.min(pageCount, Math.max(startPage, Math.ceil(windowEnd / pageSize)));
+  const pageLabel = endPage > startPage ? `${startPage}–${endPage}/${pageCount}` : `${startPage}/${pageCount}`;
   const { t } = useI18n();
   return (
     <div className="flex items-center justify-between border-t border-gray-200 px-5 py-3 text-xs text-gray-500">
-      <span>{offset + 1}–{Math.min(offset + pageSize, total)} / {total}</span>
+      <span>{offset + 1}–{windowEnd} / {total}</span>
       <div className="flex items-center gap-2">
         <button
           type="button"
@@ -294,11 +299,11 @@ const Pagination: React.FC<{
         >
           {t('common.prev')}
         </button>
-        <span>{page}/{pageCount}</span>
+        <span>{pageLabel}</span>
         <button
           type="button"
-          disabled={offset + pageSize >= total || loading}
-          onClick={() => onChange(offset + pageSize)}
+          disabled={windowEnd >= total || loading}
+          onClick={() => onChange(offset + span)}
           className="rounded border px-2 py-1 disabled:text-gray-300"
         >
           {t('common.next')}
@@ -336,6 +341,7 @@ export const SystemAuditPage: React.FC = () => {
   const [caseSort, setCaseSort] = useState<'time' | 'risk'>('time');
   const [caseAgentFilter, setCaseAgentFilter] = useState<string | null>(() => searchParams.get('agent_id'));
   const [eventNextOffset, setEventNextOffset] = useState<number | null>(null);
+  const [eventLoadedSpan, setEventLoadedSpan] = useState(EVENT_PAGE_SIZE);
   const [loadingMore, setLoadingMore] = useState(false);
   const caseRequestVersion = useRef(0);
   const reviewRequestVersion = useRef(0);
@@ -345,6 +351,7 @@ export const SystemAuditPage: React.FC = () => {
     loadRequestVersion.current += 1;
     const version = loadRequestVersion.current;
     setLoading(true);
+    setLoadingMore(false);
     const results = await Promise.allSettled([
       fetchAuditSummary({ limit: 10 }),
       fetchSecurityCases({
@@ -378,9 +385,11 @@ export const SystemAuditPage: React.FC = () => {
       setEvents(results[3].value.data.items);
       setEventTotal(results[3].value.data.total);
       setEventNextOffset(results[3].value.data.next_offset ?? null);
+      setEventLoadedSpan(EVENT_PAGE_SIZE);
     } else {
       setEvents([]);
       setEventNextOffset(null);
+      setEventLoadedSpan(EVENT_PAGE_SIZE);
     }
     if (results[4].status === 'fulfilled') {
       setBindings(results[4].value.bindings);
@@ -538,23 +547,37 @@ export const SystemAuditPage: React.FC = () => {
   }, [eventTotal]);
 
   const loadMoreEvents = async () => {
-    if (eventNextOffset === null || loadingMore) return;
+    if (eventNextOffset === null || loading || loadingMore) return;
     const version = loadRequestVersion.current;
+    const requestedOffset = eventNextOffset;
     setLoadingMore(true);
     try {
-      const result = await fetchAuditEvents({ limit: EVENT_PAGE_SIZE, offset: eventNextOffset, include_details: true });
+      const result = await fetchAuditEvents({ limit: EVENT_PAGE_SIZE, offset: requestedOffset, include_details: true });
       // The list may have been reloaded while this page was in flight (another
       // page selected, a filter changed). Appending then would splice an old
       // page into the new list and duplicate rows.
       if (loadRequestVersion.current !== version) return;
       setEvents((prev) => [...prev, ...result.data.items]);
       setEventTotal(result.data.total);
-      setEventNextOffset(result.data.next_offset ?? null);
+      const nextOffset = result.data.next_offset ?? null;
+      setEventNextOffset(nextOffset);
+      if (result.data.items.length > 0) {
+        const coveredEnd = Math.max(
+          requestedOffset + result.data.items.length,
+          nextOffset ?? 0,
+        );
+        setEventLoadedSpan((prev) => Math.max(prev, coveredEnd - eventOffset));
+      }
     } catch (e) {
       if (loadRequestVersion.current === version) setError(errorText(e, t));
     } finally {
-      setLoadingMore(false);
+      if (loadRequestVersion.current === version) setLoadingMore(false);
     }
+  };
+
+  const changeEventOffset = (nextOffset: number) => {
+    setEventOffset(nextOffset);
+    setEventLoadedSpan(EVENT_PAGE_SIZE);
   };
 
   // The case list is filtered server-side, so a filter change has to re-issue
@@ -953,16 +976,17 @@ export const SystemAuditPage: React.FC = () => {
             <Pagination
               offset={eventOffset}
               pageSize={EVENT_PAGE_SIZE}
+              loadedSize={eventLoadedSpan}
               total={eventTotal}
               loading={loading}
-              onChange={setEventOffset}
+              onChange={changeEventOffset}
             />
           )}
           {eventNextOffset !== null && (
             <div className="border-t border-gray-200 px-5 py-3 text-center">
               <button
                 type="button"
-                disabled={loadingMore}
+                disabled={loading || loadingMore}
                 onClick={() => void loadMoreEvents()}
                 className="rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
               >

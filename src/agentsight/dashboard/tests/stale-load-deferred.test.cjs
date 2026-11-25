@@ -2153,6 +2153,306 @@ test('system audit: an event list pruned below the current page must reopen on r
   assert.ok(h.text(rendered).includes('session-0'), 'the pruned events must stay reachable');
 });
 
+// ─── SystemAuditPage: events Pagination vs loadMoreEvents sync & version guard ─
+//
+// Clicking "加载更多" appends the next slice onto the current events table while
+// `<Pagination>` stays mounted. Pagination must reflect the expanded loaded
+// window (range, page span, disabled Next at the end, and Next advancing past
+// all loaded rows), and a superseded loadMoreEvents request must neither leave
+// the new list stuck in loadingMore nor clear a newer loadMoreEvents' spinner.
+
+function eventsPaginationHarness() {
+  const driver = createHooksDriver();
+  const { calls, stubs } = deferredFetchStubs([
+    'fetchAuditSummary',
+    'fetchSecurityCases',
+    'fetchAuditSessions',
+    'fetchAuditEvents',
+    'fetchEnforcementBindings',
+  ]);
+  const t = (key, args) => (args ? `${key}:${JSON.stringify(args)}` : key);
+  const page = loadPageModule('src/pages/SystemAuditPage.tsx', {
+    'react-router-dom': {
+      useNavigate: () => () => {},
+      useSearchParams: () => [new URLSearchParams(), () => {}],
+    },
+    '../i18n': { useI18n: () => ({ t, locale: 'en-US' }), useLocaleTag: () => 'en-US' },
+    '../components/ContainmentDialog': componentStub('ContainmentDialog'),
+    '../components/ContainmentLifecycleCard': componentStub('ContainmentLifecycleCard'),
+    '../components/Pagination': loadPageModule('src/components/Pagination.tsx', {}, driver),
+    '../utils/enforcementMode': {
+      effectiveBindingMode: (request) => (request && request.policy_mode) || 'audit',
+      firstCorrelatedCaseId: firstCorrelatedCaseIdStub,
+    },
+    '../utils/ruleReason': { translateRuleReason: (summary) => summary },
+    '../utils/apiClient': {
+      ...stubs,
+      fetchSecurityCase: async () => ({ data: null }),
+      reviewSecurityCase: async () => ({}),
+    },
+  }, driver).SystemAuditPage;
+
+  const mounted = [];
+  const render = () => {
+    const rendered = driver.render(page);
+    rendered.effects.forEach((fn, index) => {
+      const deps = fn.__deps;
+      const prev = mounted[index];
+      if (prev && sameDeps(prev.deps, deps)) return;
+      if (prev && typeof prev.cleanup === 'function') prev.cleanup();
+      mounted[index] = { deps, cleanup: fn() };
+    });
+    return rendered;
+  };
+
+  const answerLoad = async ({ items = [], total = 0, nextOffset = null } = {}) => {
+    calls.fetchAuditSummary.at(-1).resolve({ data: {} });
+    calls.fetchSecurityCases.at(-1).resolve({ data: { items: [], total: 0 } });
+    calls.fetchAuditSessions.at(-1).resolve({ data: { items: [], total: 0 } });
+    calls.fetchAuditEvents.at(-1).resolve({
+      data: { items, total, next_offset: nextOffset },
+    });
+    calls.fetchEnforcementBindings.at(-1).resolve({ bindings: [] });
+    await settle();
+    await settle();
+  };
+
+  const getEventsPager = (rendered) => {
+    const pager = findElement(rendered.element, (el) => el.props
+      && el.props.pageSize === 50 && typeof el.props.onChange === 'function');
+    assert.ok(pager, 'sanity: events table must render its Pagination control');
+    const tree = pager.type(pager.props);
+    const buttons = collectElements(tree).filter((el) => el.type === 'button');
+    const spans = collectElements(tree).filter((el) => el.type === 'span');
+    return {
+      rangeText: elementText(spans[0]).join(''),
+      pageText: elementText(spans[1]).join(''),
+      prevButton: buttons[0],
+      nextButton: buttons[buttons.length - 1],
+    };
+  };
+
+  const findLoadMore = (rendered) => findElement(rendered.element, (el) => el.type === 'button'
+    && (elementText(el).join('') === '加载更多' || elementText(el).join('') === '加载中...'));
+
+  const clickButton = (rendered, label) => {
+    const btn = findElement(rendered.element, (el) => el.type === 'button'
+      && el.props && typeof el.props.onClick === 'function'
+      && elementText(el).join('') === label);
+    assert.ok(btn, `sanity: expected button "${label}"`);
+    assert.notEqual(btn.props.disabled, true, `sanity: button "${label}" must be enabled`);
+    btn.props.onClick();
+  };
+
+  return { calls, render, answerLoad, getEventsPager, findLoadMore, clickButton };
+}
+
+test('system audit: load-more expands the events pagination window and Next advances past loaded rows', async () => {
+  const h = eventsPaginationHarness();
+  let rendered = h.render();
+  await h.answerLoad({ items: auditEvents(50, 0), total: 150, nextOffset: 50 });
+  h.clickButton(rendered, 'audit.tab.events');
+  rendered = h.render();
+
+  let pager = h.getEventsPager(rendered);
+  assert.equal(pager.rangeText, '1–50 / 150', 'initial range must be 1–50 / 150');
+  assert.equal(pager.pageText, '1/3', 'initial page must be 1/3');
+
+  h.clickButton(rendered, '加载更多');
+  rendered = h.render();
+  assert.equal(h.calls.fetchAuditEvents.length, 2, 'load-more must request the continuation slice');
+  assert.equal(h.calls.fetchAuditEvents.at(-1).args[0].offset, 50);
+
+  h.calls.fetchAuditEvents.at(-1).resolve({
+    data: { items: auditEvents(50, 50), total: 150, next_offset: 100 },
+  });
+  await settle();
+  await settle();
+  rendered = h.render();
+
+  const bodyText = elementText(rendered.element).join('|');
+  assert.ok(bodyText.includes('session-0') && bodyText.includes('session-50'), 'table must retain both loaded pages');
+
+  pager = h.getEventsPager(rendered);
+  assert.equal(pager.rangeText, '1–100 / 150', 'range must reflect 100 loaded rows');
+  assert.equal(pager.pageText, '1–2/3', 'page indicator must reflect pages 1–2/3');
+  assert.notEqual(pager.nextButton.props.disabled, true, 'Next must stay enabled while rows 101–150 remain');
+
+  pager.nextButton.props.onClick();
+  rendered = h.render();
+  assert.equal(
+    h.calls.fetchAuditEvents.at(-1).args[0].offset,
+    100,
+    'Next must advance past all loaded rows (offset 100), not re-fetch already-loaded offset 50',
+  );
+
+  await h.answerLoad({ items: auditEvents(50, 100), total: 150, nextOffset: null });
+  rendered = h.render();
+  pager = h.getEventsPager(rendered);
+  assert.equal(pager.rangeText, '101–150 / 150', 'page 3 range must reset to 101–150 / 150');
+  assert.equal(pager.pageText, '3/3', 'page 3 indicator must reset to 3/3');
+  assert.equal(pager.nextButton.props.disabled, true, 'Next must be disabled on the final page');
+  assert.equal(h.findLoadMore(rendered), null, 'load-more must hide when next_offset is null');
+});
+
+test('system audit: load-more reaching the end of events disables Pagination Next', async () => {
+  const h = eventsPaginationHarness();
+  let rendered = h.render();
+  await h.answerLoad({ items: auditEvents(50, 0), total: 100, nextOffset: 50 });
+  h.clickButton(rendered, 'audit.tab.events');
+  rendered = h.render();
+
+  h.clickButton(rendered, '加载更多');
+  rendered = h.render();
+  h.calls.fetchAuditEvents.at(-1).resolve({
+    data: { items: auditEvents(50, 50), total: 100, next_offset: null },
+  });
+  await settle();
+  await settle();
+  rendered = h.render();
+
+  assert.equal(h.findLoadMore(rendered), null, 'load-more hides once every row is loaded');
+  const pager = h.getEventsPager(rendered);
+  assert.equal(pager.rangeText, '1–100 / 100', 'range must reflect all 100 rows');
+  assert.equal(pager.pageText, '1–2/2', 'page indicator must reflect 1–2/2');
+  assert.equal(pager.nextButton.props.disabled, true, 'Next must be disabled once all rows are displayed');
+});
+
+test('system audit: superseded load-more finally does not clear a newer load-more spinner', async () => {
+  const h = eventsPaginationHarness();
+  let rendered = h.render();
+  await h.answerLoad({ items: auditEvents(50, 0), total: 150, nextOffset: 50 });
+  h.clickButton(rendered, 'audit.tab.events');
+  rendered = h.render();
+
+  // Start load-more #1 (version 1) and leave it pending.
+  h.clickButton(rendered, '加载更多');
+  rendered = h.render();
+  const staleLoadMore = h.calls.fetchAuditEvents.at(-1);
+  assert.equal(elementText(h.findLoadMore(rendered)).join(''), '加载中...');
+
+  // Supersede with Refresh (version 2) while load-more #1 is still in flight.
+  h.clickButton(rendered, 'common.refresh');
+  rendered = h.render();
+  assert.equal(h.findLoadMore(rendered).props.disabled, true, 'load-more must be disabled while reload is in flight');
+
+  await h.answerLoad({ items: auditEvents(50, 0), total: 150, nextOffset: 50 });
+  rendered = h.render();
+  const readyBtn = h.findLoadMore(rendered);
+  assert.equal(elementText(readyBtn).join(''), '加载更多', 'a completed reload must clear a superseded load-more spinner');
+  assert.notEqual(readyBtn.props.disabled, true, 'load-more must be clickable again on the reloaded list');
+
+  // Start load-more #2 (version 2).
+  readyBtn.props.onClick();
+  rendered = h.render();
+  const currentLoadMore = h.calls.fetchAuditEvents.at(-1);
+  assert.equal(elementText(h.findLoadMore(rendered)).join(''), '加载中...');
+
+  // Stale load-more #1 resolves late: it must neither append stale rows nor
+  // clear load-more #2's in-flight spinner.
+  staleLoadMore.resolve({
+    data: { items: auditEvents(50, 900), total: 150, next_offset: 100 },
+  });
+  await settle();
+  await settle();
+  rendered = h.render();
+  assert.ok(!elementText(rendered.element).join('|').includes('session-900'), 'stale load-more rows must be dropped');
+  assert.equal(
+    elementText(h.findLoadMore(rendered)).join(''),
+    '加载中...',
+    'stale load-more finally must not clear a newer load-more spinner',
+  );
+  assert.equal(
+    h.findLoadMore(rendered).props.disabled,
+    true,
+    'load-more button must stay disabled while load-more #2 is still pending',
+  );
+
+  // Active load-more #2 settles and cleanly releases loadingMore.
+  currentLoadMore.resolve({
+    data: { items: auditEvents(50, 50), total: 150, next_offset: 100 },
+  });
+  await settle();
+  await settle();
+  rendered = h.render();
+  assert.ok(elementText(rendered.element).join('|').includes('session-50'), 'active load-more rows must append');
+  assert.equal(elementText(h.findLoadMore(rendered)).join(''), '加载更多');
+  assert.notEqual(h.findLoadMore(rendered).props.disabled, true);
+});
+
+test('system audit: page-2 load-more syncs range and stale load-more failure stays silent', async () => {
+  const h = eventsPaginationHarness();
+  let rendered = h.render();
+  await h.answerLoad({ items: auditEvents(50, 0), total: 150, nextOffset: 50 });
+  h.clickButton(rendered, 'audit.tab.events');
+  rendered = h.render();
+
+  // Move to page 2 (offset 50), then append page 3 via load-more.
+  h.getEventsPager(rendered).nextButton.props.onClick();
+  rendered = h.render();
+  assert.equal(h.calls.fetchAuditEvents.at(-1).args[0].offset, 50);
+  await h.answerLoad({ items: auditEvents(50, 50), total: 150, nextOffset: 100 });
+  rendered = h.render();
+
+  h.clickButton(rendered, '加载更多');
+  rendered = h.render();
+  h.calls.fetchAuditEvents.at(-1).resolve({
+    data: { items: auditEvents(50, 100), total: 150, next_offset: null },
+  });
+  await settle();
+  await settle();
+  rendered = h.render();
+
+  let pager = h.getEventsPager(rendered);
+  assert.equal(pager.rangeText, '51–150 / 150');
+  assert.equal(pager.pageText, '2–3/3');
+  assert.equal(pager.nextButton.props.disabled, true, 'Next must be disabled at the end of the list');
+  assert.notEqual(pager.prevButton.props.disabled, true, 'Prev must stay enabled on page 2');
+
+  // Prev returns cleanly to page 1 and resets the expanded span.
+  pager.prevButton.props.onClick();
+  rendered = h.render();
+  assert.equal(h.calls.fetchAuditEvents.at(-1).args[0].offset, 0);
+  await h.answerLoad({ items: auditEvents(50, 0), total: 150, nextOffset: 50 });
+  rendered = h.render();
+  pager = h.getEventsPager(rendered);
+  assert.equal(pager.rangeText, '1–50 / 150');
+  assert.equal(pager.pageText, '1/3');
+
+  // A superseded load-more rejection must neither display its error nor clear a newer load-more spinner.
+  h.clickButton(rendered, '加载更多');
+  rendered = h.render();
+  const staleFailing = h.calls.fetchAuditEvents.at(-1);
+
+  h.clickButton(rendered, 'common.refresh');
+  rendered = h.render();
+  await h.answerLoad({ items: auditEvents(50, 0), total: 150, nextOffset: 50 });
+  rendered = h.render();
+
+  h.clickButton(rendered, '加载更多');
+  rendered = h.render();
+  const activeLoadMore = h.calls.fetchAuditEvents.at(-1);
+
+  staleFailing.reject(new Error('stale continuation timeout'));
+  await settle();
+  await settle();
+  rendered = h.render();
+  assert.ok(
+    !elementText(rendered.element).join('|').includes('stale continuation timeout'),
+    'superseded load-more error must not surface on the reloaded list',
+  );
+  assert.equal(elementText(h.findLoadMore(rendered)).join(''), '加载中...');
+  assert.equal(h.findLoadMore(rendered).props.disabled, true);
+
+  activeLoadMore.resolve({
+    data: { items: auditEvents(50, 50), total: 150, next_offset: 100 },
+  });
+  await settle();
+  await settle();
+  rendered = h.render();
+  assert.equal(elementText(h.findLoadMore(rendered)).join(''), '加载更多');
+});
+
 // ─── Dead Previous click: the two pagers #7486 names ─────────────────────────
 //
 // The same asymmetry #7183 fixed on the sessions page: the display clamps the

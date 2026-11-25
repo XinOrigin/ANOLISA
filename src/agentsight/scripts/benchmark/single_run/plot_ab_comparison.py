@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,7 @@ def load_run(directory: Path) -> dict[str, Any]:
     if metrics_path.is_file():
         rows, times, columns = read_metrics(metrics_path)
         metrics = {"rows": rows, "times": times, "columns": columns}
-    resources = summary.get("resources") if isinstance(summary.get("resources"), dict) else {}
+    resources = _as_dict(summary.get("resources"))
     return {
         "dir": directory,
         "summary": summary,
@@ -60,8 +61,18 @@ def load_run(directory: Path) -> dict[str, Any]:
     }
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def number(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 AUTHORITATIVE_RESOURCE_KEYS = {
@@ -122,25 +133,25 @@ def validity_state(summary: dict[str, Any]) -> str:
 
 
 def run_value(run: dict[str, Any], key: str) -> float | None:
-    summary = run["summary"]
-    report = run["report"]
-    resources = run["resources"]
+    summary = _as_dict(run.get("summary"))
+    report = _as_dict(run.get("report"))
+    resources = _as_dict(run.get("resources"))
     authoritative = run.get("authoritative")
     if key in AUTHORITATIVE_RESOURCE_KEYS and isinstance(authoritative, dict):
         # The load-window statistics in resource-summary.json are the same
         # values the CI gate evaluates; never mix them with run-summary.json
         # arithmetic over the whole CSV.
         return number(authoritative.get(AUTHORITATIVE_RESOURCE_KEYS[key]))
-    latency = summary.get("latency_ms") if isinstance(summary.get("latency_ms"), dict) else {}
-    tps = summary.get("tokens_per_second") if isinstance(summary.get("tokens_per_second"), dict) else {}
+    latency = _as_dict(summary.get("latency_ms"))
+    tps = _as_dict(summary.get("tokens_per_second"))
     if key == "rss_peak":
-        return number((resources.get("rss_mb") or {}).get("max"))
+        return number(_as_dict(resources.get("rss_mb")).get("max"))
     if key == "rss_avg":
-        return number((resources.get("rss_mb") or {}).get("avg"))
+        return number(_as_dict(resources.get("rss_mb")).get("avg"))
     if key == "cpu_avg":
-        return number((resources.get("cpu_pct") or {}).get("avg"))
+        return number(_as_dict(resources.get("cpu_pct")).get("avg"))
     if key == "cpu_p95":
-        return number((resources.get("cpu_pct") or {}).get("p95"))
+        return number(_as_dict(resources.get("cpu_pct")).get("p95"))
     if key == "qps":
         return number(summary.get("effective_qps"))
     if key == "tps":
@@ -150,33 +161,36 @@ def run_value(run: dict[str, Any], key: str) -> float | None:
         return value / 1000.0 if value is not None else None
     if key == "drop_rate":
         value = number(summary.get("drop_rate"))
-        return value * 100.0 if value is not None else None
+        return number(value * 100.0) if value is not None else None
     if key == "completeness":
-        value = report.get("admitted_completeness")
-        if not isinstance(value, (int, float)):
-            value = report.get("completeness_ratio")
-        return number(value)
+        value = number(report.get("admitted_completeness"))
+        if value is None:
+            value = number(report.get("completeness_ratio"))
+        return value
     if key == "token_accuracy":
         return number(report.get("token_accuracy"))
     if key == "fd_slope":
-        return number((resources.get("file_descriptors") or {}).get("slope_per_hour"))
+        return number(_as_dict(resources.get("file_descriptors")).get("slope_per_hour"))
     if key == "thread_slope":
-        return number((resources.get("threads") or {}).get("slope_per_hour"))
+        return number(_as_dict(resources.get("threads")).get("slope_per_hour"))
     return None
 
 
 def run_rss_slope(run: dict[str, Any], warmup: float, window: float) -> float | None:
-    metrics = run["metrics"]
+    metrics = _as_dict(run.get("metrics"))
     if metrics:
+        columns = _as_dict(metrics.get("columns"))
         post, _, _ = warmup_slope(
-            metrics["times"],
-            metrics["columns"].get("rss_mb", []),
+            metrics.get("times") or [],
+            columns.get("rss_mb") or [],
             warmup,
             window,
         )
-        if post is not None:
-            return post
-    return number((run["resources"].get("rss_mb") or {}).get("slope"))
+        slope = number(post)
+        if slope is not None:
+            return slope
+    rss = _as_dict(_as_dict(run.get("resources")).get("rss_mb"))
+    return number(rss.get("slope"))
 
 
 def stability_counts(run: dict[str, Any]) -> tuple[int, int]:
@@ -185,45 +199,63 @@ def stability_counts(run: dict[str, Any]) -> tuple[int, int]:
 
 
 def format_metric(key: str, value: float | None) -> str:
-    if value is None:
+    numeric = number(value)
+    if numeric is None:
         return "—"
     if key in {"rss_peak", "rss_avg"}:
-        return f"{value:.1f} MiB"
+        return f"{numeric:.1f} MiB"
     if key == "rss_slope":
-        return f"{value:+.1f} MiB/h"
+        return f"{numeric:+.1f} MiB/h"
     if key in {"cpu_avg", "cpu_p95", "drop_rate"}:
-        return f"{value:.1f} %" if key != "drop_rate" else f"{value:.2f}%"
+        return f"{numeric:.1f} %" if key != "drop_rate" else f"{numeric:.2f}%"
     if key == "qps":
-        return f"{value:.1f}"
+        return f"{numeric:.1f}"
     if key == "tps":
-        return f"{value:,.0f} tok/s"
+        return f"{numeric:,.0f} tok/s"
     if key == "p99":
-        return f"{value:.2f} s"
+        return f"{numeric:.2f} s"
     if key in {"completeness", "token_accuracy"}:
-        return f"{value * 100:.1f}%"
+        scaled = number(numeric * 100.0)
+        return f"{scaled:.1f}%" if scaled is not None else "—"
     if key in {"fd_slope", "thread_slope"}:
-        return f"{value:+.1f}/h"
-    return f"{value:g}"
+        return f"{numeric:+.1f}/h"
+    return f"{numeric:g}"
+
+
+def _direction_verdict(lower_is_better: bool, decreased: bool) -> str:
+    if lower_is_better:
+        return "改善" if decreased else "轻微退化"
+    return "轻微退化" if decreased else "改善"
 
 
 def delta_and_verdict(key: str, base: float | None, opt: float | None) -> tuple[str, str]:
-    if base is None or opt is None:
+    base_val = number(base)
+    opt_val = number(opt)
+    if base_val is None or opt_val is None:
         return "—", "N/A"
-    lower_is_better = key in {"rss_peak", "rss_avg", "rss_slope", "cpu_avg", "cpu_p95", "p99", "drop_rate", "fd_slope", "thread_slope"}
-    if base == 0:
-        delta = "0.0%" if opt == 0 else "—"
-        if opt == 0:
-            return delta, "持平"
-        if lower_is_better:
-            return delta, "改善" if opt < 0 else "轻微退化"
-        return delta, "改善" if opt > 0 else "轻微退化"
-    delta = f"{(opt - base) / abs(base) * 100:+.1f}%"
-    change = (opt - base) / abs(base)
+    lower_is_better = key in {
+        "rss_peak",
+        "rss_avg",
+        "rss_slope",
+        "cpu_avg",
+        "cpu_p95",
+        "p99",
+        "drop_rate",
+        "fd_slope",
+        "thread_slope",
+    }
+    if base_val == 0:
+        if opt_val == 0:
+            return "0.0%", "持平"
+        return "—", _direction_verdict(lower_is_better, opt_val < 0)
+    change = (opt_val - base_val) / abs(base_val)
+    pct = change * 100.0
+    if not math.isfinite(pct):
+        return "—", _direction_verdict(lower_is_better, opt_val < base_val)
+    delta = f"{pct:+.1f}%"
     if abs(change) <= 0.02:
         return delta, "持平"
-    if lower_is_better:
-        return delta, "改善" if change < 0 else "轻微退化"
-    return delta, "改善" if change > 0 else "轻微退化"
+    return delta, _direction_verdict(lower_is_better, change < 0)
 
 
 def verdict_class(verdict: str) -> str:
@@ -248,11 +280,13 @@ def _interpolate(
     grid: Sequence[float],
 ) -> list[float | None]:
     """Linearly sample one run at shared times, keeping gaps outside its range."""
-    points = sorted(
-        (float(time), float(value))
-        for time, value in zip(times, values)
-        if time is not None and value is not None
-    )
+    points: list[tuple[float, float]] = []
+    for raw_time, raw_value in zip(times, values):
+        time = number(raw_time)
+        value = number(raw_value)
+        if time is not None and value is not None:
+            points.append((time, value))
+    points.sort()
     if not points:
         return [None] * len(grid)
     result: list[float | None] = []
@@ -283,7 +317,11 @@ def align_series(
 ) -> tuple[list[float], list[float | None], list[float | None]]:
     """Align two independently sampled runs on the union of their timestamps."""
     grid = sorted(
-        {float(time) for time in (*base_times, *opt_times) if time is not None}
+        {
+            numeric
+            for raw_time in (*base_times, *opt_times)
+            if (numeric := number(raw_time)) is not None
+        }
     )
     return (
         grid,
@@ -418,29 +456,18 @@ def render(args: argparse.Namespace) -> Path:
         rss_delta = avg_delta = cpu_delta = p99_delta = "—"
         rss_class = avg_class = cpu_class = p99_class = "delta-neutral"
     else:
-        rss_delta = (
-            f"{(rss_peak_opt - rss_peak_base) / abs(rss_peak_base) * 100:+.1f}%"
-            if rss_peak_base and rss_peak_opt is not None
-            else "—"
-        )
-        avg_delta = (
-            f"{(rss_avg_opt - rss_avg_base) / abs(rss_avg_base) * 100:+.1f}%"
-            if rss_avg_base and rss_avg_opt is not None
-            else "—"
-        )
-        cpu_delta = (
-            f"{(cpu_opt - cpu_base) / abs(cpu_base) * 100:+.1f}%"
-            if cpu_base and cpu_opt is not None
-            else "—"
-        )
-        p99_delta = (
-            f"{p99_opt - p99_base:+.2f} s"
+        rss_delta, rss_verdict = delta_and_verdict("rss_peak", rss_peak_base, rss_peak_opt)
+        avg_delta, avg_verdict = delta_and_verdict("rss_avg", rss_avg_base, rss_avg_opt)
+        cpu_delta, cpu_verdict = delta_and_verdict("cpu_avg", cpu_base, cpu_opt)
+        p99_diff = (
+            number(p99_opt - p99_base)
             if p99_base is not None and p99_opt is not None
-            else "—"
+            else None
         )
-        rss_class = verdict_class(delta_and_verdict("rss_peak", rss_peak_base, rss_peak_opt)[1])
-        avg_class = verdict_class(delta_and_verdict("rss_avg", rss_avg_base, rss_avg_opt)[1])
-        cpu_class = verdict_class(delta_and_verdict("cpu_avg", cpu_base, cpu_opt)[1])
+        p99_delta = f"{p99_diff:+.2f} s" if p99_diff is not None else "—"
+        rss_class = verdict_class(rss_verdict)
+        avg_class = verdict_class(avg_verdict)
+        cpu_class = verdict_class(cpu_verdict)
         p99_class = verdict_class(delta_and_verdict("p99", p99_base, p99_opt)[1])
 
     rss_gate_references: list[tuple[float, str]] = []

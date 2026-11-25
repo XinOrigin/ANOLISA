@@ -326,25 +326,42 @@ impl LedgerBackingRoot {
 
         // Backing root is different from source. We need to either create
         // a new directory + bind mount, or verify a pre-existing alias.
-        let exists = expected_canonical.is_dir();
+        // Inspect the leaf without following symlinks so a symlink is
+        // resolved below rather than triggering directory creation, and
+        // validate parent permissions before creating any directory on disk.
         let mut created_temp_dir: Option<PathBuf> = None;
-
-        if !exists {
-            // Create the directory with restrictive permissions (P1-2).
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&expected_canonical)
-                .map_err(BackingRootError::CreateFailed)?;
-            created_temp_dir = Some(expected_canonical.clone());
+        match std::fs::symlink_metadata(&expected_canonical) {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if !ft.is_dir() && !ft.is_symlink() {
+                    return Err(BackingRootError::NotADirectory {
+                        path: expected_canonical,
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Self::validate_permissions(&parent_canon)?;
+                // Create the directory with restrictive permissions (P1-2).
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&expected_canonical)
+                    .map_err(BackingRootError::CreateFailed)?;
+                created_temp_dir = Some(expected_canonical.clone());
+            }
+            Err(e) => {
+                return Err(BackingRootError::CanonicalizeFailed {
+                    path: expected_canonical,
+                    source: e,
+                });
+            }
         }
 
         // Canonicalize the (now existing) backing root.
         let backing_canon = expected_canonical.canonicalize().map_err(|e| {
             // Clean up if we created the dir.
             if let Some(ref dir) = created_temp_dir {
-                let _ = std::fs::remove_dir_all(dir);
+                let _ = std::fs::remove_dir(dir);
             }
             BackingRootError::CanonicalizeFailed {
                 path: expected_canonical.clone(),
@@ -367,6 +384,9 @@ impl LedgerBackingRoot {
         // A source alias is safe only when no in-place over-mount can hide
         // it. Return it directly instead of attempting a self-bind.
         if backing_canon == source_canon {
+            if let Some(ref dir) = created_temp_dir {
+                let _ = std::fs::remove_dir(dir);
+            }
             if in_place {
                 return Err(BackingRootError::InsideMountPath {
                     path: backing_canon,
@@ -391,16 +411,54 @@ impl LedgerBackingRoot {
             });
         }
 
-        // Validate permissions on the backing root's parent directory.
-        // After bind mount, the backing root itself shows the source's
-        // permissions. The real security boundary is the parent directory
-        // that gates traversal to the backing root. Require the parent to
-        // have owner-only access (mode & 0o077 == 0) and correct ownership.
+        // Reject filesystem root (`/`): a backing root must sit beneath a
+        // private parent directory and must never over-mount `/`.
+        let backing_parent = match backing_canon.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(p) => p,
+            None => {
+                if let Some(ref dir) = created_temp_dir {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                return Err(BackingRootError::CanonicalizeFailed {
+                    path: backing_canon,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "resolved backing root has no parent directory",
+                    ),
+                });
+            }
+        };
+
+        // Validate permissions on both the configured parent directory and
+        // the resolved backing root's parent directory (when a leaf symlink
+        // crosses directories). After bind mount, the backing root itself
+        // shows the source's permissions; the parent directory is the
+        // security boundary that gates traversal and must have owner-only
+        // access (mode & 0o077 == 0) and correct ownership.
         if let Err(e) = Self::validate_permissions(&parent_canon) {
             if let Some(ref dir) = created_temp_dir {
-                let _ = std::fs::remove_dir_all(dir);
+                let _ = std::fs::remove_dir(dir);
             }
             return Err(e);
+        }
+        if backing_parent != parent_canon.as_path() {
+            if let Err(e) = Self::validate_permissions(backing_parent) {
+                if let Some(ref dir) = created_temp_dir {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                return Err(e);
+            }
+        }
+
+        // Ensure a symlink leaf did not resolve to a non-directory (e.g. a
+        // regular file inside a private parent).
+        if !backing_canon.is_dir() {
+            if let Some(ref dir) = created_temp_dir {
+                let _ = std::fs::remove_dir(dir);
+            }
+            return Err(BackingRootError::NotADirectory {
+                path: backing_canon,
+            });
         }
 
         // Try to create a bind mount from source to backing root.
@@ -503,7 +561,7 @@ impl LedgerBackingRoot {
                     Err(id_err) => {
                         // Not an alias — fail-closed. Clean up if we created it.
                         if let Some(ref dir) = created_temp_dir {
-                            let _ = std::fs::remove_dir_all(dir);
+                            let _ = std::fs::remove_dir(dir);
                         }
                         Err(id_err)
                     }
@@ -1405,5 +1463,251 @@ mod tests {
         );
         // Clean up
         std::fs::set_permissions(&source_canon, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn symlink_into_open_parent_rejected_by_permissions_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let source_canon = source.path().canonicalize().unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        let mount_canon = mount.path().canonicalize().unwrap();
+
+        let private_parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            private_parent.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        for open_mode in [0o755u32, 0o777u32] {
+            let open_parent = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(
+                open_parent.path(),
+                std::fs::Permissions::from_mode(open_mode),
+            )
+            .unwrap();
+            let open_parent_canon = open_parent.path().canonicalize().unwrap();
+            let target_dir = open_parent_canon.join("target");
+            std::fs::create_dir(&target_dir).unwrap();
+            std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let backing_link = private_parent.path().join(format!("backing_{open_mode:o}"));
+            std::os::unix::fs::symlink(&target_dir, &backing_link).unwrap();
+
+            for (in_place, mnt) in [(false, &mount_canon), (true, &source_canon)] {
+                let result = LedgerBackingRoot::setup(&source_canon, &backing_link, mnt, in_place);
+                match result {
+                    Err(BackingRootError::PermissionsTooOpen { ref path, mode }) => {
+                        assert_eq!(path, &open_parent_canon);
+                        assert_ne!(mode & 0o077, 0);
+                    }
+                    other => panic!(
+                        "symlink into 0o{open_mode:o} parent (in_place={in_place}) must fail \
+                         with PermissionsTooOpen on resolved parent, got: {other:?}"
+                    ),
+                }
+            }
+        }
+
+        // Under root, also verify that a symlink into a 0o700 foreign-owned
+        // parent is rejected with WrongOwner on the resolved parent.
+        if unsafe { libc::geteuid() } == 0 {
+            let foreign_parent = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(
+                foreign_parent.path(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let foreign_parent_canon = foreign_parent.path().canonicalize().unwrap();
+            let foreign_target = foreign_parent_canon.join("target");
+            std::fs::create_dir(&foreign_target).unwrap();
+            std::fs::set_permissions(&foreign_target, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+
+            let c_parent = CString::new(foreign_parent_canon.as_os_str().as_bytes()).unwrap();
+            let c_target = CString::new(foreign_target.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c_parent.as_ptr(), 65534, 65534) }, 0);
+            assert_eq!(unsafe { libc::chown(c_target.as_ptr(), 65534, 65534) }, 0);
+
+            let foreign_link = private_parent.path().join("backing_foreign");
+            std::os::unix::fs::symlink(&foreign_target, &foreign_link).unwrap();
+
+            let result =
+                LedgerBackingRoot::setup(&source_canon, &foreign_link, &mount_canon, false);
+            match result {
+                Err(BackingRootError::WrongOwner { ref path, uid }) => {
+                    assert_eq!(path, &foreign_parent_canon);
+                    assert_eq!(uid, 65534);
+                }
+                other => panic!(
+                    "symlink into foreign-owned parent must fail with WrongOwner, got: {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn open_parent_missing_backing_dir_has_no_side_effect() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let source_canon = source.path().canonicalize().unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        let mount_canon = mount.path().canonicalize().unwrap();
+
+        let open_parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(open_parent.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let open_parent_canon = open_parent.path().canonicalize().unwrap();
+        let backing_path = open_parent_canon.join("backing_root");
+
+        #[cfg(target_os = "linux")]
+        let inotify_fd = {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            let raw_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(raw_fd >= 0, "inotify_init1 failed");
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            let c_dir = CString::new(open_parent_canon.as_os_str().as_bytes()).unwrap();
+            let wd =
+                unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c_dir.as_ptr(), libc::IN_CREATE) };
+            assert!(wd >= 0, "inotify_add_watch failed");
+            fd
+        };
+
+        let result = LedgerBackingRoot::setup(&source_canon, &backing_path, &mount_canon, false);
+
+        assert!(
+            matches!(
+                &result,
+                Err(BackingRootError::PermissionsTooOpen { path, .. })
+                    if path == &open_parent_canon
+            ),
+            "missing dir under 0o755 parent must fail with PermissionsTooOpen: {result:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&backing_path).is_err(),
+            "missing dir under open parent must not exist on disk"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut buf = [0u8; 256];
+            let n = unsafe {
+                libc::read(
+                    inotify_fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            assert!(
+                n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN),
+                "setup must not create any entry inside an overly permissive parent before failing"
+            );
+        }
+
+        // Under non-root, a read/search-only open parent (0o555) also proves
+        // permission validation runs before mkdir (which would otherwise fail
+        // with EACCES -> CreateFailed).
+        if unsafe { libc::geteuid() } != 0 {
+            let ro_open_parent = tempfile::tempdir().unwrap();
+            let ro_open_canon = ro_open_parent.path().canonicalize().unwrap();
+            let ro_backing = ro_open_canon.join("backing_root");
+            std::fs::set_permissions(&ro_open_canon, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+
+            let ro_result =
+                LedgerBackingRoot::setup(&source_canon, &ro_backing, &mount_canon, false);
+            std::fs::set_permissions(&ro_open_canon, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+
+            assert!(
+                matches!(
+                    &ro_result,
+                    Err(BackingRootError::PermissionsTooOpen { path, .. })
+                        if path == &ro_open_canon
+                ),
+                "0o555 parent must fail with PermissionsTooOpen before mkdir: {ro_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_to_filesystem_root_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let source_canon = source.path().canonicalize().unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        let mount_canon = mount.path().canonicalize().unwrap();
+
+        let private_parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            private_parent.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let backing_link = private_parent.path().join("backing");
+        std::os::unix::fs::symlink(Path::new("/"), &backing_link).unwrap();
+
+        for (in_place, mnt) in [(false, &mount_canon), (true, &source_canon)] {
+            let result = LedgerBackingRoot::setup(&source_canon, &backing_link, mnt, in_place);
+            assert!(
+                matches!(
+                    &result,
+                    Err(BackingRootError::CanonicalizeFailed { path, source })
+                        if path == Path::new("/")
+                            && source.kind() == std::io::ErrorKind::InvalidInput
+                ),
+                "symlink to '/' (in_place={in_place}) must be rejected before mount setup, \
+                 got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_directory_and_symlink_to_file_rejected_as_not_a_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let source_canon = source.path().canonicalize().unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        let mount_canon = mount.path().canonicalize().unwrap();
+
+        let private_parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            private_parent.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let private_canon = private_parent.path().canonicalize().unwrap();
+
+        let regular_file = private_canon.join("regular_file");
+        std::fs::write(&regular_file, "not a directory").unwrap();
+
+        let direct_result =
+            LedgerBackingRoot::setup(&source_canon, &regular_file, &mount_canon, false);
+        assert!(
+            matches!(
+                &direct_result,
+                Err(BackingRootError::NotADirectory { path }) if path == &regular_file
+            ),
+            "regular file must fail with NotADirectory, got: {direct_result:?}"
+        );
+
+        let link_to_file = private_canon.join("link_to_file");
+        std::os::unix::fs::symlink(&regular_file, &link_to_file).unwrap();
+
+        let symlink_result =
+            LedgerBackingRoot::setup(&source_canon, &link_to_file, &mount_canon, false);
+        assert!(
+            matches!(
+                &symlink_result,
+                Err(BackingRootError::NotADirectory { path }) if path == &regular_file
+            ),
+            "symlink to regular file must fail with NotADirectory, got: {symlink_result:?}"
+        );
     }
 }

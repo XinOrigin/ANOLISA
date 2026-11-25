@@ -4,6 +4,7 @@
 //! string column so the schema stays stable while dimension payloads evolve.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -87,10 +88,35 @@ pub struct OptimizationMaintenanceReport {
     pub size: MaintenanceReport,
 }
 
+const GET_WITH_SUMMARY_SQL: &str =
+    "SELECT session_id, perf, perf_issues, cost, cost_waste, accuracy, summary,
+            created_at_ns, updated_at_ns
+     FROM optimization_results WHERE session_id = ?1";
+
+const GET_WITHOUT_SUMMARY_SQL: &str =
+    "SELECT session_id, perf, perf_issues, cost, cost_waste, accuracy, NULL,
+            created_at_ns, updated_at_ns
+     FROM optimization_results WHERE session_id = ?1";
+
+const LIST_WITH_SUMMARY_SQL: &str =
+    "SELECT session_id, perf, perf_issues, cost, cost_waste, accuracy, summary,
+            created_at_ns, updated_at_ns
+     FROM optimization_results
+     WHERE updated_at_ns >= ?1 AND updated_at_ns <= ?2
+     ORDER BY updated_at_ns DESC LIMIT ?3";
+
+const LIST_WITHOUT_SUMMARY_SQL: &str =
+    "SELECT session_id, perf, perf_issues, cost, cost_waste, accuracy, NULL,
+            created_at_ns, updated_at_ns
+     FROM optimization_results
+     WHERE updated_at_ns >= ?1 AND updated_at_ns <= ?2
+     ORDER BY updated_at_ns DESC LIMIT ?3";
+
 /// Thread-safe store over a dedicated `optimization.db`.
 pub struct OptimizationStore {
     conn: Mutex<Connection>,
     db_path: PathBuf,
+    has_summary: AtomicBool,
 }
 
 impl OptimizationStore {
@@ -119,6 +145,7 @@ impl OptimizationStore {
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
+            has_summary: AtomicBool::new(true),
         })
     }
 
@@ -135,9 +162,11 @@ impl OptimizationStore {
                 ..ConnectionOptions::default()
             },
         )?;
+        let has_summary = Self::has_summary_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
+            has_summary: AtomicBool::new(has_summary),
         })
     }
 
@@ -152,11 +181,12 @@ impl OptimizationStore {
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = Self::column_names(&transaction)?;
         // (column, DDL) pairs — append here when a new dimension is introduced.
-        for (column, ddl) in [(
+        const MIGRATIONS: &[(&str, &str)] = &[(
             "summary",
             "ALTER TABLE optimization_results ADD COLUMN summary TEXT",
-        )] {
-            if !existing.iter().any(|c| c == column) {
+        )];
+        for &(column, ddl) in MIGRATIONS {
+            if !existing.iter().any(|c| c.eq_ignore_ascii_case(column)) {
                 transaction.execute(ddl, [])?;
             }
         }
@@ -173,6 +203,23 @@ impl OptimizationStore {
             names.push(row?);
         }
         Ok(names)
+    }
+
+    fn has_summary_column(conn: &Connection) -> Result<bool, OptStoreError> {
+        Ok(Self::column_names(conn)?
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("summary")))
+    }
+
+    fn resolve_has_summary(&self, conn: &Connection) -> Result<bool, OptStoreError> {
+        if self.has_summary.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        let present = Self::has_summary_column(conn)?;
+        if present {
+            self.has_summary.store(true, Ordering::Release);
+        }
+        Ok(present)
     }
 
     /// Upserts one dimension result (JSON string) for a session.
@@ -203,14 +250,13 @@ impl OptimizationStore {
     /// Returns an error on SQL failure or poisoned mutex.
     pub fn get(&self, session_id: &str) -> Result<Option<OptimizationRecord>, OptStoreError> {
         let conn = self.conn.lock().map_err(|_| OptStoreError::Poisoned)?;
+        let sql = if self.resolve_has_summary(&conn)? {
+            GET_WITH_SUMMARY_SQL
+        } else {
+            GET_WITHOUT_SUMMARY_SQL
+        };
         let record = conn
-            .query_row(
-                "SELECT session_id, perf, perf_issues, cost, cost_waste, accuracy, summary,
-                        created_at_ns, updated_at_ns
-                 FROM optimization_results WHERE session_id = ?1",
-                params![session_id],
-                Self::map_row,
-            )
+            .query_row(sql, params![session_id], Self::map_row)
             .optional()?;
         Ok(record)
     }
@@ -226,14 +272,16 @@ impl OptimizationStore {
         limit: usize,
     ) -> Result<Vec<OptimizationRecord>, OptStoreError> {
         let conn = self.conn.lock().map_err(|_| OptStoreError::Poisoned)?;
-        let mut stmt = conn.prepare(
-            "SELECT session_id, perf, perf_issues, cost, cost_waste, accuracy, summary,
-                    created_at_ns, updated_at_ns
-             FROM optimization_results
-             WHERE updated_at_ns >= ?1 AND updated_at_ns <= ?2
-             ORDER BY updated_at_ns DESC LIMIT ?3",
+        let sql = if self.resolve_has_summary(&conn)? {
+            LIST_WITH_SUMMARY_SQL
+        } else {
+            LIST_WITHOUT_SUMMARY_SQL
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![start_ns, end_ns, clamp_list_limit(limit)],
+            Self::map_row,
         )?;
-        let rows = stmt.query_map(params![start_ns, end_ns, limit as i64], Self::map_row)?;
         let mut records = Vec::new();
         for row in rows {
             records.push(row?);
@@ -347,6 +395,10 @@ impl OptimizationStore {
             updated_at_ns: row.get(8)?,
         })
     }
+}
+
+fn clamp_list_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
 fn now_ns() -> i64 {
@@ -543,6 +595,98 @@ mod tests {
 
         let read_only = OptimizationStore::open_read_only_existing(&path).unwrap();
         assert!(read_only.get("session").unwrap().is_some());
+    }
+
+    #[test]
+    fn read_only_open_reads_legacy_db_without_summary_column() {
+        let path = temp_path("legacy-read-only");
+        create_legacy_db(&path);
+
+        let read_only = OptimizationStore::open_read_only_existing(&path).unwrap();
+
+        let rec = read_only.get("legacy").unwrap().unwrap();
+        assert_eq!(rec.session_id, "legacy");
+        assert_eq!(rec.perf.as_deref(), Some("legacy-perf"));
+        assert!(rec.summary.is_none());
+        assert_eq!(rec.created_at_ns, 1);
+        assert_eq!(rec.updated_at_ns, 1);
+        assert!(read_only.get("missing").unwrap().is_none());
+
+        let listed = read_only.list(0, i64::MAX, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, "legacy");
+        assert_eq!(listed[0].perf.as_deref(), Some("legacy-perf"));
+        assert!(listed[0].summary.is_none());
+
+        // Read-only open must not mutate the legacy schema.
+        {
+            let conn = read_only.conn.lock().unwrap();
+            assert!(!OptimizationStore::has_summary_column(&conn).unwrap());
+        }
+
+        // Once another handle migrates the DB and stores a summary, the
+        // existing read-only handle picks up the new column on subsequent reads.
+        let writable = OptimizationStore::new_with_path(&path).unwrap();
+        writable
+            .save_dimension("legacy", Dimension::Summary, "fresh-summary")
+            .unwrap();
+        drop(writable);
+
+        assert_eq!(
+            read_only.get("legacy").unwrap().unwrap().summary.as_deref(),
+            Some("fresh-summary")
+        );
+        let listed_after = read_only.list(0, i64::MAX, 10).unwrap();
+        assert_eq!(listed_after.len(), 1);
+        assert_eq!(listed_after[0].summary.as_deref(), Some("fresh-summary"));
+    }
+
+    #[test]
+    fn read_only_open_reads_summary_when_column_exists() {
+        let path = temp_path("modern-read-only");
+        let writable = OptimizationStore::new_with_path(&path).unwrap();
+        writable
+            .save_dimension("s1", Dimension::Perf, "perf-json")
+            .unwrap();
+        writable
+            .save_dimension("s1", Dimension::Summary, "summary-json")
+            .unwrap();
+        drop(writable);
+
+        let read_only = OptimizationStore::open_read_only_existing(&path).unwrap();
+        let rec = read_only.get("s1").unwrap().unwrap();
+        assert_eq!(rec.perf.as_deref(), Some("perf-json"));
+        assert_eq!(rec.summary.as_deref(), Some("summary-json"));
+
+        let listed = read_only.list(0, i64::MAX, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary.as_deref(), Some("summary-json"));
+    }
+
+    #[test]
+    fn list_clamps_limit_above_i64_max() {
+        assert_eq!(clamp_list_limit(0), 0);
+        assert_eq!(clamp_list_limit(1), 1);
+        assert_eq!(clamp_list_limit(42), 42);
+        if let Ok(max_i64) = usize::try_from(i64::MAX) {
+            assert_eq!(clamp_list_limit(max_i64), i64::MAX);
+            assert_eq!(clamp_list_limit(max_i64 + 1), i64::MAX);
+            assert_eq!(clamp_list_limit(usize::MAX), i64::MAX);
+        }
+
+        let (store, _path) = temp_store();
+        store.save_dimension("s1", Dimension::Perf, "{}").unwrap();
+        store.save_dimension("s2", Dimension::Perf, "{}").unwrap();
+
+        assert!(store.list(0, i64::MAX, 0).unwrap().is_empty());
+        assert_eq!(store.list(0, i64::MAX, 1).unwrap().len(), 1);
+        assert_eq!(store.list(0, i64::MAX, usize::MAX).unwrap().len(), 2);
+
+        let legacy_path = temp_path("legacy-limit");
+        create_legacy_db(&legacy_path);
+        let legacy_ro = OptimizationStore::open_read_only_existing(&legacy_path).unwrap();
+        assert!(legacy_ro.list(0, i64::MAX, 0).unwrap().is_empty());
+        assert_eq!(legacy_ro.list(0, i64::MAX, usize::MAX).unwrap().len(), 1);
     }
 
     #[test]

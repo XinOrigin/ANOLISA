@@ -1752,57 +1752,316 @@ pub async fn diff_against_live(
     result
 }
 
+/// Maximum stderr bytes retained per side of the `btrfs send | btrfs receive --dump`
+/// diff pipeline. Diagnostics beyond this cap are still drained to EOF so neither
+/// child can stall on a full pipe buffer while daemon memory stays bounded.
+const DIFF_DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Default)]
+struct BoundedDiagnostics {
+    bytes: Vec<u8>,
+    truncated_bytes: usize,
+}
+
+impl BoundedDiagnostics {
+    fn into_display_string(self) -> String {
+        let text = String::from_utf8_lossy(&self.bytes);
+        let trimmed = text.trim();
+        if self.truncated_bytes == 0 {
+            trimmed.to_string()
+        } else if trimmed.is_empty() {
+            format!("[{} diagnostic bytes truncated]", self.truncated_bytes)
+        } else {
+            format!(
+                "{trimmed} [... {} diagnostic bytes truncated]",
+                self.truncated_bytes
+            )
+        }
+    }
+}
+
+fn drain_bounded_diagnostics<R: std::io::Read>(
+    mut reader: R,
+    max_bytes: usize,
+) -> std::io::Result<BoundedDiagnostics> {
+    let mut out = BoundedDiagnostics::default();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        let remaining = max_bytes.saturating_sub(out.bytes.len());
+        let keep = read.min(remaining);
+        if keep > 0 {
+            out.bytes.extend_from_slice(&buf[..keep]);
+        }
+        out.truncated_bytes = out.truncated_bytes.saturating_add(read - keep);
+    }
+    Ok(out)
+}
+
+/// Stop and reap a child process on early pipeline exit.
+///
+/// Returns `(status, killed_by_cleanup)` where `killed_by_cleanup` is `true`
+/// only when the child had not exited yet and we sent `SIGKILL`.
+fn stop_and_reap_child(
+    child: &mut std::process::Child,
+    label: &str,
+) -> (Option<std::process::ExitStatus>, bool) {
+    match child.try_wait() {
+        Ok(Some(status)) => return (Some(status), false),
+        Ok(None) => {}
+        Err(err) => {
+            warn!(error = %err, "failed to poll {label} before cleanup");
+        }
+    }
+    let mut killed = false;
+    match child.kill() {
+        Ok(()) => {
+            killed = true;
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(err) => {
+            warn!(error = %err, "failed to kill {label} during cleanup");
+        }
+    }
+    match child.wait() {
+        Ok(status) => (Some(status), killed),
+        Err(err) => {
+            warn!(error = %err, "failed to reap {label} during cleanup");
+            (None, killed)
+        }
+    }
+}
+
+fn sender_failed_independently(status: std::process::ExitStatus, killed_by_cleanup: bool) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+
+    if status.success() {
+        return false;
+    }
+    if killed_by_cleanup && status.signal() == Some(libc::SIGKILL) {
+        return false;
+    }
+    if status.signal() == Some(libc::SIGPIPE) {
+        return false;
+    }
+    true
+}
+
+fn join_diagnostic_thread(
+    handle: std::thread::ScopedJoinHandle<'_, std::io::Result<BoundedDiagnostics>>,
+    label: &str,
+) -> String {
+    match handle.join() {
+        Ok(Ok(diag)) => diag.into_display_string(),
+        Ok(Err(err)) => {
+            warn!(error = %err, "failed to drain {label} stderr");
+            String::new()
+        }
+        Err(_) => {
+            warn!("{label} stderr reader thread panicked");
+            String::new()
+        }
+    }
+}
+
 /// Blocking implementation of snapshot diff using `btrfs send | btrfs receive --dump`.
 fn diff_between_snapshots_blocking(snap_from: &Path, snap_to: &Path) -> Result<Vec<DiffEntry>> {
-    use std::process::{Command as StdCommand, Stdio};
+    use std::process::Command as StdCommand;
 
-    let mut sender = StdCommand::new("btrfs")
+    let mut sender_cmd = StdCommand::new("btrfs");
+    sender_cmd
         .args(["send", "--no-data", "-p"])
         .arg(snap_from)
-        .arg(snap_to)
+        .arg(snap_to);
+
+    let mut receiver_cmd = StdCommand::new("btrfs");
+    receiver_cmd.args(["receive", "--dump"]);
+
+    run_diff_pipeline_blocking(sender_cmd, receiver_cmd)
+}
+
+fn run_diff_pipeline_blocking(
+    mut sender_cmd: std::process::Command,
+    receiver_cmd: std::process::Command,
+) -> Result<Vec<DiffEntry>> {
+    let sender = sender_cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn btrfs send")?;
 
-    let sender_stdout = sender
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture btrfs send stdout"))?;
+    run_diff_pipeline_with_sender(sender, receiver_cmd)
+}
 
-    // Take sender's stderr before passing stdout to receiver, so we can
-    // read the correct error stream when btrfs send fails.
-    let sender_stderr = sender
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture btrfs send stderr"))?;
+fn run_diff_pipeline_with_sender(
+    mut sender: std::process::Child,
+    mut receiver_cmd: std::process::Command,
+) -> Result<Vec<DiffEntry>> {
+    use std::io::Read;
 
-    // std::process::ChildStdout implements Into<Stdio>, keeping the fd in blocking mode
-    let receiver_output = StdCommand::new("btrfs")
-        .args(["receive", "--dump"])
-        .stdin(sender_stdout)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to run btrfs receive --dump")?;
+    let sender_stdout = match sender.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            stop_and_reap_child(&mut sender, "btrfs send");
+            bail!("Failed to capture btrfs send stdout");
+        }
+    };
 
-    let sender_status = sender.wait().context("failed to wait for btrfs send")?;
+    // Take sender's stderr before passing stdout to receiver so we can drain it
+    // concurrently while both commands run and avoid pipe-buffer deadlocks.
+    let sender_stderr = match sender.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(sender_stdout);
+            stop_and_reap_child(&mut sender, "btrfs send");
+            bail!("Failed to capture btrfs send stderr");
+        }
+    };
 
-    if !sender_status.success() {
-        let mut err_msg = String::new();
-        use std::io::Read;
-        let _ = std::io::BufReader::new(sender_stderr).read_to_string(&mut err_msg);
-        error!("btrfs send failed (exit={}): {}", sender_status, err_msg);
-        bail!("btrfs send failed: {}", err_msg.trim());
-    }
+    // std::process::ChildStdout implements Into<Stdio>, keeping the fd in blocking mode.
+    // Drop receiver_cmd immediately after spawn so the parent does not hold a duplicate
+    // read end of sender's stdout pipe if receiver exits early.
+    let receiver_spawn = {
+        let res = receiver_cmd
+            .stdin(Stdio::from(sender_stdout))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        drop(receiver_cmd);
+        res
+    };
 
-    if !receiver_output.status.success() {
-        let stderr = String::from_utf8_lossy(&receiver_output.stderr);
-        error!("btrfs receive --dump failed: {}", stderr);
-        bail!("btrfs receive --dump failed: {}", stderr.trim());
-    }
+    let mut receiver = match receiver_spawn {
+        Ok(child) => child,
+        Err(err) => {
+            drop(sender_stderr);
+            stop_and_reap_child(&mut sender, "btrfs send");
+            return Err(err).context("failed to run btrfs receive --dump");
+        }
+    };
 
-    parse_btrfs_diff_bytes(&receiver_output.stdout)
+    let mut receiver_stdout = match receiver.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            drop(sender_stderr);
+            stop_and_reap_child(&mut receiver, "btrfs receive --dump");
+            stop_and_reap_child(&mut sender, "btrfs send");
+            bail!("Failed to capture btrfs receive --dump stdout");
+        }
+    };
+
+    let receiver_stderr = match receiver.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(receiver_stdout);
+            drop(sender_stderr);
+            stop_and_reap_child(&mut receiver, "btrfs receive --dump");
+            stop_and_reap_child(&mut sender, "btrfs send");
+            bail!("Failed to capture btrfs receive --dump stderr");
+        }
+    };
+
+    std::thread::scope(|scope| {
+        let sender_stderr_thread = match std::thread::Builder::new()
+            .name("btrfs-send-stderr".to_string())
+            .spawn_scoped(scope, move || {
+                drain_bounded_diagnostics(sender_stderr, DIFF_DIAGNOSTIC_CAPTURE_LIMIT)
+            }) {
+            Ok(handle) => handle,
+            Err(err) => {
+                drop(receiver_stdout);
+                drop(receiver_stderr);
+                stop_and_reap_child(&mut receiver, "btrfs receive --dump");
+                stop_and_reap_child(&mut sender, "btrfs send");
+                return Err(err).context("failed to spawn btrfs send stderr reader");
+            }
+        };
+
+        let receiver_stderr_thread = match std::thread::Builder::new()
+            .name("btrfs-recv-stderr".to_string())
+            .spawn_scoped(scope, move || {
+                drain_bounded_diagnostics(receiver_stderr, DIFF_DIAGNOSTIC_CAPTURE_LIMIT)
+            }) {
+            Ok(handle) => handle,
+            Err(err) => {
+                drop(receiver_stdout);
+                stop_and_reap_child(&mut receiver, "btrfs receive --dump");
+                stop_and_reap_child(&mut sender, "btrfs send");
+                let _ = sender_stderr_thread.join();
+                return Err(err).context("failed to spawn btrfs receive stderr reader");
+            }
+        };
+
+        let mut receiver_stdout_bytes = Vec::new();
+        if let Err(err) = receiver_stdout.read_to_end(&mut receiver_stdout_bytes) {
+            drop(receiver_stdout);
+            stop_and_reap_child(&mut receiver, "btrfs receive --dump");
+            stop_and_reap_child(&mut sender, "btrfs send");
+            let _ = receiver_stderr_thread.join();
+            let _ = sender_stderr_thread.join();
+            return Err(err).context("failed to read btrfs receive --dump stdout");
+        }
+        drop(receiver_stdout);
+
+        let receiver_status = match receiver.wait() {
+            Ok(status) => status,
+            Err(err) => {
+                stop_and_reap_child(&mut receiver, "btrfs receive --dump");
+                stop_and_reap_child(&mut sender, "btrfs send");
+                let _ = receiver_stderr_thread.join();
+                let _ = sender_stderr_thread.join();
+                return Err(err).context("failed to wait for btrfs receive --dump");
+            }
+        };
+
+        if !receiver_status.success() {
+            // Stop and reap sender before joining its stderr reader so a live
+            // sender cannot keep the stderr pipe open after receiver fails.
+            let (sender_status, killed_by_cleanup) = stop_and_reap_child(&mut sender, "btrfs send");
+            let sender_err = join_diagnostic_thread(sender_stderr_thread, "btrfs send");
+            let receiver_err =
+                join_diagnostic_thread(receiver_stderr_thread, "btrfs receive --dump");
+
+            if let Some(status) = sender_status
+                .filter(|status| sender_failed_independently(*status, killed_by_cleanup))
+            {
+                error!("btrfs send failed (exit={}): {}", status, sender_err);
+                bail!("btrfs send failed: {}", sender_err);
+            }
+
+            error!("btrfs receive --dump failed: {}", receiver_err);
+            bail!("btrfs receive --dump failed: {}", receiver_err);
+        }
+
+        let sender_status = match sender.wait() {
+            Ok(status) => status,
+            Err(err) => {
+                stop_and_reap_child(&mut sender, "btrfs send");
+                let _ = sender_stderr_thread.join();
+                let _ = receiver_stderr_thread.join();
+                return Err(err).context("failed to wait for btrfs send");
+            }
+        };
+
+        let sender_err = join_diagnostic_thread(sender_stderr_thread, "btrfs send");
+        let _receiver_err = join_diagnostic_thread(receiver_stderr_thread, "btrfs receive --dump");
+
+        if !sender_status.success() {
+            error!("btrfs send failed (exit={}): {}", sender_status, sender_err);
+            bail!("btrfs send failed: {}", sender_err);
+        }
+
+        parse_btrfs_diff_bytes(&receiver_stdout_bytes)
+    })
 }
 
 fn parse_btrfs_diff_bytes(output: &[u8]) -> Result<Vec<DiffEntry>> {
@@ -4966,5 +5225,247 @@ proc /proc proc rw 0 0
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    fn run_with_timeout<T: Send + 'static>(
+        timeout: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(timeout)
+            .expect("diff pipeline stalled past bounded test timeout")
+    }
+
+    fn spawn_live_sleep_sender() -> (std::process::Child, u32) {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 8"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fake sender");
+        let pid = child.id();
+        assert!(
+            PathBuf::from(format!("/proc/{pid}")).exists(),
+            "fake sender pid {pid} should exist before pipeline runs"
+        );
+        (child, pid)
+    }
+
+    #[test]
+    fn diff_pipeline_drains_large_diagnostics_on_both_ends() {
+        let mut sender = std::process::Command::new("timeout");
+        sender.args([
+            "8",
+            "sh",
+            "-c",
+            "head -c 2097152 /dev/zero | tr '\\0' 's' >&2; \
+             printf '%s\\n' \
+               'snapshot  ./snap  uuid=abc transid=42' \
+               'mkfile  ./snap/src/main.rs' \
+               'write  ./snap/src/lib.rs'",
+        ]);
+        let mut receiver = std::process::Command::new("timeout");
+        receiver.args([
+            "8",
+            "sh",
+            "-c",
+            "head -c 2097152 /dev/zero | tr '\\0' 'r' >&2; exec cat",
+        ]);
+
+        let entries = run_with_timeout(Duration::from_secs(5), move || {
+            run_diff_pipeline_blocking(sender, receiver)
+        })
+        .expect("pipeline with 2 MiB diagnostics on both ends must succeed");
+
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        assert_eq!(entries[0].path, "src/main.rs");
+        assert_eq!(entries[0].change_type, ChangeType::Added);
+        assert_eq!(entries[1].path, "src/lib.rs");
+        assert_eq!(entries[1].change_type, ChangeType::Modified);
+    }
+
+    #[test]
+    fn diff_pipeline_reaps_sender_after_receiver_spawn_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (sender, sender_pid) = spawn_live_sleep_sender();
+        let receiver = std::process::Command::new(temp.path().join("missing-btrfs-receive"));
+
+        let err = run_with_timeout(Duration::from_secs(5), move || {
+            run_diff_pipeline_with_sender(sender, receiver)
+        })
+        .expect_err("missing receiver binary must fail");
+
+        assert!(
+            format!("{err:#}").contains("failed to run btrfs receive --dump"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert!(
+            !PathBuf::from(format!("/proc/{sender_pid}")).exists(),
+            "sender pid {sender_pid} must be killed and reaped before returning"
+        );
+    }
+
+    #[test]
+    fn diff_pipeline_reaps_sender_after_receiver_exits_with_error() {
+        let (sender, sender_pid) = spawn_live_sleep_sender();
+        let mut receiver = std::process::Command::new("sh");
+        receiver.args(["-c", "printf 'simulated receiver failure\\n' >&2; exit 2"]);
+
+        let err = run_with_timeout(Duration::from_secs(5), move || {
+            run_diff_pipeline_with_sender(sender, receiver)
+        })
+        .expect_err("failing receiver must fail diff pipeline");
+
+        assert!(
+            err.to_string()
+                .contains("btrfs receive --dump failed: simulated receiver failure"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !PathBuf::from(format!("/proc/{sender_pid}")).exists(),
+            "sender pid {sender_pid} must be killed and reaped before returning"
+        );
+    }
+
+    #[test]
+    fn diff_pipeline_reports_sender_failure_and_bounds_diagnostics() {
+        let mut sender = std::process::Command::new("timeout");
+        sender.args([
+            "8",
+            "sh",
+            "-c",
+            "printf 'sender-root-cause\\n' >&2; \
+             head -c 2097152 /dev/zero | tr '\\0' 'e' >&2; \
+             exit 1",
+        ]);
+        let mut receiver = std::process::Command::new("timeout");
+        receiver.args([
+            "8",
+            "sh",
+            "-c",
+            "cat >/dev/null; printf 'ERROR: empty stream is not considered valid\\n' >&2; exit 1",
+        ]);
+
+        let err = run_with_timeout(Duration::from_secs(5), move || {
+            run_diff_pipeline_blocking(sender, receiver)
+        })
+        .expect_err("failing sender must fail diff pipeline");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("btrfs send failed:"),
+            "sender failure must take precedence over secondary receiver EOF failure: {msg}"
+        );
+        assert!(
+            msg.contains("sender-root-cause"),
+            "sender diagnostic prefix must be preserved: {msg}"
+        );
+        assert!(
+            msg.contains("diagnostic bytes truncated"),
+            "oversized stderr diagnostics must be bounded and marked truncated: {msg}"
+        );
+        assert!(
+            msg.len() < 70 * 1024,
+            "error message should stay bounded, got {} bytes",
+            msg.len()
+        );
+    }
+
+    #[test]
+    fn diff_pipeline_preserves_unsupported_workspace_path_error() {
+        let mut sender = std::process::Command::new("sh");
+        sender.args([
+            "-c",
+            "printf 'snapshot ./snap uuid=abc transid=1\\nmkfile ./snap/bad\\\\377\\n'",
+        ]);
+        let receiver = std::process::Command::new("cat");
+
+        let err = run_with_timeout(Duration::from_secs(5), move || {
+            run_diff_pipeline_blocking(sender, receiver)
+        })
+        .expect_err("non-UTF-8 dump path must surface typed DiffError");
+
+        match err.downcast_ref::<DiffError>() {
+            Some(DiffError::UnsupportedWorkspacePath {
+                operation,
+                field,
+                token,
+            }) => {
+                assert_eq!(*operation, "mkfile");
+                assert_eq!(*field, "path");
+                assert!(token.ends_with(r"bad\377"), "token: {token:?}");
+            }
+            other => {
+                panic!("expected DiffError::UnsupportedWorkspacePath, got {other:?} ({err:#})")
+            }
+        }
+    }
+
+    #[test]
+    fn diff_pipeline_bounds_receiver_diagnostics_on_error() {
+        let (sender, sender_pid) = spawn_live_sleep_sender();
+        let mut receiver = std::process::Command::new("timeout");
+        receiver.args([
+            "8",
+            "sh",
+            "-c",
+            "printf 'receiver-root-cause\\n' >&2; \
+             head -c 2097152 /dev/zero | tr '\\0' 'r' >&2; \
+             exit 2",
+        ]);
+
+        let err = run_with_timeout(Duration::from_secs(5), move || {
+            run_diff_pipeline_with_sender(sender, receiver)
+        })
+        .expect_err("failing receiver must fail diff pipeline");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("btrfs receive --dump failed:"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("receiver-root-cause"),
+            "receiver diagnostic prefix must be preserved: {msg}"
+        );
+        assert!(
+            msg.contains("diagnostic bytes truncated"),
+            "oversized receiver stderr must be bounded and marked truncated: {msg}"
+        );
+        assert!(
+            msg.len() < 70 * 1024,
+            "error message should stay bounded, got {} bytes",
+            msg.len()
+        );
+        assert!(
+            !PathBuf::from(format!("/proc/{sender_pid}")).exists(),
+            "sender pid {sender_pid} must be killed and reaped before returning"
+        );
+    }
+
+    #[test]
+    fn diff_pipeline_reports_receiver_failure_when_sender_gets_sigpipe() {
+        let mut sender = std::process::Command::new("head");
+        sender.args(["-c", "4194304", "/dev/zero"]);
+        let mut receiver = std::process::Command::new("sh");
+        receiver.args(["-c", "printf 'receiver-closed-early\\n' >&2; exit 2"]);
+
+        let err = run_with_timeout(Duration::from_secs(5), move || {
+            run_diff_pipeline_blocking(sender, receiver)
+        })
+        .expect_err("receiver exit error must fail diff pipeline");
+
+        assert!(
+            err.to_string()
+                .contains("btrfs receive --dump failed: receiver-closed-early"),
+            "SIGPIPE on sender must not mask receiver error: {err:#}"
+        );
     }
 }

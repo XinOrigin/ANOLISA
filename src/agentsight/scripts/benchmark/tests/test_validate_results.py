@@ -283,3 +283,152 @@ def test_resolve_metrics_baseline_prefers_cli_then_sibling(tmp_path: Path) -> No
 
     sibling.unlink()
     assert validate_results.resolve_metrics_baseline(load_results, None) is None
+
+
+def test_find_request_ids_handles_deep_nesting_cycles_big_ints_and_scalars() -> None:
+    deep_dict: dict[str, object] = {"leaf": "ok"}
+    for _ in range(1500):
+        deep_dict = {"child": deep_dict}
+    deep_with_sibling = {"deep": deep_dict, "meta": {"request_id": "bench-sibling"}}
+    assert validate_results.find_request_ids(deep_with_sibling) == {"bench-sibling"}
+
+    cyclic: dict[str, object] = {"request_id": "bench-cyclic"}
+    cyclic["self"] = cyclic
+    assert validate_results.find_request_ids(cyclic) == {"bench-cyclic"}
+
+    deep_json = "[" * 1500 + "]" * 1500
+    big_int_json = '{"n": ' + ("9" * 4500) + "}"
+    assert validate_results.find_request_ids(deep_json) == set()
+    assert validate_results.find_request_ids(big_int_json) == set()
+    assert validate_results.find_request_ids({"request": {"raw_body": big_int_json}}) == set()
+    assert validate_results.find_request_ids([{"request_id": "bench-list"}]) == {"bench-list"}
+    for non_container in (None, 123, True, "plain", '"scalar"'):
+        assert validate_results.find_request_ids(non_container) == set()
+
+
+@pytest.mark.parametrize("mode", ["full", "incremental"])
+def test_load_captured_handles_pathological_and_non_dict_event_json(
+    tmp_path: Path, mode: str
+) -> None:
+    db_path = tmp_path / "capture.db"
+    deep_json = "[" * 1500 + "]" * 1500
+    big_int_json = '{"n": ' + ("1" * 4500) + "}"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE genai_events (
+                id INTEGER PRIMARY KEY,
+                call_id TEXT,
+                status TEXT,
+                total_tokens INTEGER,
+                event_json TEXT
+            );
+            """
+        )
+        rows = [
+            (1, "bench-deep", "complete", 10, deep_json),
+            (2, "bench-bigint", "complete", 11, big_int_json),
+            (3, "bench-scalar-null", "complete", 12, "null"),
+            (4, "bench-scalar-int", "complete", 13, "123"),
+            (5, "bench-scalar-str", "complete", 14, '"hello"'),
+            (6, None, "complete", 15, '[{"request_id": "bench-from-list"}]'),
+        ]
+        connection.executemany("INSERT INTO genai_events VALUES (?, ?, ?, ?, ?)", rows)
+
+    if mode == "full":
+        captured = validate_results.load_captured(db_path, "bench-")
+    else:
+        captured, _, _, _ = validate_results.load_captured_incremental(
+            db_path, "bench-", None, 0, 0, set()
+        )
+
+    assert captured == {
+        "bench-deep": [("complete", 10)],
+        "bench-bigint": [("complete", 11)],
+        "bench-scalar-null": [("complete", 12)],
+        "bench-scalar-int": [("complete", 13)],
+        "bench-scalar-str": [("complete", 14)],
+        "bench-from-list": [("complete", 15)],
+    }
+
+
+def test_capture_status_and_json_lines_handle_pathological_json(tmp_path: Path) -> None:
+    deep_json = "[" * 1500 + "]" * 1500
+    big_int_json = '{"n": ' + ("1" * 4500) + "}"
+    assert validate_results.capture_status("complete", deep_json) == "complete"
+    assert validate_results.capture_status("complete", big_int_json) == "complete"
+    assert validate_results.capture_status("complete", "null") == "complete"
+
+    jsonl = tmp_path / "events.jsonl"
+    jsonl.write_text(
+        "\n".join(
+            [
+                deep_json,
+                big_int_json,
+                '{"request_id": "bench-valid", "http_status": 200}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert list(validate_results.json_lines(jsonl)) == [
+        {"request_id": "bench-valid", "http_status": 200}
+    ]
+
+
+def test_load_ffi_captured_handles_bad_utf8_and_non_dict_payloads(tmp_path: Path) -> None:
+    path = tmp_path / "ffi-events.log"
+    deep_json = "[" * 1500 + "]" * 1500
+    big_int_json = '{"n": ' + ("1" * 4500) + "}"
+    lines = [
+        b"\n",
+        b'J\t{"request":{"text":"bad\xff\xfe"},"metadata":{"request_id":"bench-utf8","status_code":200}}\n',
+        b'J\t{"broken":\xff}\n',
+        b"J\tnull\n",
+        b"J\t[1, 2, 3]\n",
+        b"J\t123\n",
+        f"J\t{deep_json}\n".encode("utf-8"),
+        f"J\t{big_int_json}\n".encode("utf-8"),
+        b'J\t{"request":{"messages":[{"content":"[agentsight-benchmark:bench-bad-meta]"}]},"metadata":["bad"],"token_usage":["bad"]}\n',
+        b'J\t{"metadata":{"request_id":"bench-abandoned","status_code":null,"abandon_reason":"over_budget"}}\n',
+        b"T\tmalformed-only-two-cols\t200\n",
+        b"T\tbench-bad-typed\tnot-int\tnot-int\t1\n",
+        b"T\tbench-neg-tokens\t200\t-5\t1\n",
+        b'J\t{"metadata":{"request_id":"bench-ok","status_code":"200"},"token_usage":{"total_tokens":42}}\n',
+    ]
+    path.write_bytes(b"".join(lines))
+
+    captured, offset = validate_results.load_ffi_captured(path)
+    assert offset == path.stat().st_size
+    assert captured == {
+        "bench-utf8": [("complete", None)],
+        "bench-bad-meta": [("error", None)],
+        "bench-abandoned": [("incomplete:over_budget", None)],
+        "bench-bad-typed": [("error", None)],
+        "bench-neg-tokens": [("complete", None)],
+        "bench-ok": [("complete", 42)],
+    }
+
+
+@pytest.mark.parametrize(
+    "status_code",
+    ["__missing__", None, True, False, "not-a-number", "", "9" * 4500, ["200"]],
+)
+def test_load_ffi_captured_handles_invalid_status_code_without_crashing(
+    tmp_path: Path, status_code: object
+) -> None:
+    path = tmp_path / "ffi-events.log"
+    metadata: dict[str, object] = {"request_id": "bench-status"}
+    if status_code != "__missing__":
+        metadata["status_code"] = status_code
+    path.write_text("J\t" + json.dumps({"metadata": metadata}) + "\n", encoding="utf-8")
+
+    captured, _ = validate_results.load_ffi_captured(path)
+    assert captured == {"bench-status": [("error", None)]}
+
+
+def test_load_ffi_captured_rejects_unknown_receipt_kind(tmp_path: Path) -> None:
+    path = tmp_path / "ffi-events.log"
+    path.write_text("X\tpayload\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown FFI callback receipt type"):
+        validate_results.load_ffi_captured(path)

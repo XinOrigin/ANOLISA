@@ -12,12 +12,18 @@ import os
 import re
 import sqlite3
 import time
+from collections import deque
 from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 Captured = dict[str, list[tuple[str, int | None]]]
+
+_JSON_DECODE_ERROR = object()
+_MAX_EVENT_TRAVERSAL_DEPTH = 64
+_MAX_EVENT_TRAVERSAL_NODES = 10_000
+_MAX_EMBEDDED_JSON_DEPTH = 4
 
 
 CAPACITY_REJECTED_PATTERN = re.compile(
@@ -140,15 +146,70 @@ def capture_status_from_event(status: str, event: Any) -> str:
     return f"incomplete:{reason}"
 
 
+def _safe_json_loads(raw: Any) -> Any:
+    """Decode JSON safely, returning ``_JSON_DECODE_ERROR`` on malformed or pathological input."""
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return _JSON_DECODE_ERROR
+
+
 def capture_status(status: str, event_json: str | None) -> str:
     """Tag explicit abandonment without changing ordinary statuses."""
     if not event_json:
         return capture_status_from_event(status, None)
-    try:
-        event = json.loads(event_json)
-    except (json.JSONDecodeError, TypeError):
+    event = _safe_json_loads(event_json)
+    if event is _JSON_DECODE_ERROR:
         return capture_status_from_event(status, None)
     return capture_status_from_event(status, event)
+
+
+def _parse_ffi_typed_receipt(payload: str) -> tuple[set[str], str, int | None] | None:
+    """Parse a tab-delimited ``T`` FFI callback receipt."""
+    parts = payload.split("\t")
+    if len(parts) != 4:
+        return None
+    request_id, status_raw, total_raw, usage = parts
+    tokens = _coerce_optional_status(total_raw) if usage == "1" else None
+    if tokens is not None and tokens < 0:
+        tokens = None
+    status_code = _coerce_optional_status(status_raw)
+    complete = status_code is not None and 200 <= status_code < 400
+    return {request_id}, ("complete" if complete else "error"), tokens
+
+
+def _parse_ffi_json_receipt(payload: str) -> tuple[set[str], str, int | None] | None:
+    """Parse a JSON ``J`` FFI callback receipt without failing on malformed fields."""
+    call = _safe_json_loads(payload)
+    if not isinstance(call, dict):
+        return None
+    identifiers = set(re.findall(r"\[agentsight-benchmark:([A-Za-z0-9_-]+)\]", payload))
+    usage = call.get("token_usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    tokens = usage.get("total_tokens")
+    if type(tokens) is not int or tokens < 0:
+        tokens = None
+    metadata = call.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    request_id = metadata.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        identifiers.add(request_id)
+    status = _coerce_optional_status(metadata.get("status_code"))
+    complete = (
+        not call.get("error")
+        and metadata.get("incomplete") not in (True, "true")
+        and status is not None
+        and 200 <= status < 400
+    )
+    receipt_status = "complete" if complete else "error"
+    # An explicit abandonment reason is terminal, so it can be
+    # attributed to a request immediately. A bare incomplete flag
+    # may still be superseded by a later complete receipt.
+    if metadata.get("abandon_reason"):
+        receipt_status = capture_status_from_event(receipt_status, call)
+    return identifiers, receipt_status, tokens
 
 
 def load_ffi_captured(
@@ -164,40 +225,19 @@ def load_ffi_captured(
             if not line.endswith(b"\n"):
                 break
             offset = handle.tell()
-            kind, payload = line.decode("utf-8").rstrip("\n").split("\t", 1)
+            raw_line = line.decode("utf-8", errors="replace").rstrip("\n")
+            if "\t" not in raw_line:
+                continue
+            kind, payload = raw_line.split("\t", 1)
             if kind == "T":
-                request_id, status, total, usage = payload.split("\t")
-                identifiers = {request_id}
-                tokens = int(total) if usage == "1" else None
-                complete = 200 <= int(status) < 400
-                receipt_status = "complete" if complete else "error"
+                parsed = _parse_ffi_typed_receipt(payload)
             elif kind == "J":
-                call = json.loads(payload)
-                identifiers = set(re.findall(r"\[agentsight-benchmark:([A-Za-z0-9_-]+)\]", payload))
-                usage = call.get("token_usage") or {}
-                tokens = usage.get("total_tokens")
-                if type(tokens) is not int or tokens < 0:
-                    tokens = None
-                metadata = call.get("metadata")
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                request_id = metadata.get("request_id")
-                if isinstance(request_id, str) and request_id:
-                    identifiers.add(request_id)
-                status = int(metadata.get("status_code", 0))
-                complete = (
-                    not call.get("error")
-                    and metadata.get("incomplete") not in (True, "true")
-                    and 200 <= status < 400
-                )
-                receipt_status = "complete" if complete else "error"
-                # An explicit abandonment reason is terminal, so it can be
-                # attributed to a request immediately. A bare incomplete flag
-                # may still be superseded by a later complete receipt.
-                if metadata.get("abandon_reason"):
-                    receipt_status = capture_status_from_event(receipt_status, call)
+                parsed = _parse_ffi_json_receipt(payload)
             else:
                 raise ValueError(f"unknown FFI callback receipt type: {kind}")
+            if parsed is None:
+                continue
+            identifiers, receipt_status, tokens = parsed
             for request_id in identifiers:
                 if (not prefix or request_id.startswith(prefix)) and (
                     expected is None or request_id in expected
@@ -216,7 +256,7 @@ def json_lines(path: Path) -> Iterable[dict[str, Any]]:
         for line in handle:
             try:
                 item = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
+            except (UnicodeDecodeError, ValueError, RecursionError):
                 skipped += 1
                 continue
             if isinstance(item, dict):
@@ -226,12 +266,14 @@ def json_lines(path: Path) -> Iterable[dict[str, Any]]:
 
 
 def _coerce_optional_status(status: Any) -> int | None:
-    """Coerce an optional k6 ``data.status`` value to an integer code.
+    """Coerce an optional k6 ``data.status`` or receipt status value to an integer code.
 
-    The status field is optional load-generator metadata: a list, object,
-    non-numeric string or non-finite number contributes no success evidence
-    instead of aborting the read of the remaining records.
+    The status field is optional load-generator or receipt metadata: a boolean,
+    list, object, non-numeric string or non-finite number contributes no success
+    evidence instead of aborting the read of the remaining records.
     """
+    if isinstance(status, bool):
+        return None
     try:
         return int(status)
     except (TypeError, ValueError, OverflowError):
@@ -350,13 +392,8 @@ def load_captured(
                     identifiers = {
                         str(record[name]) for name in ("call_id", "trace_id") if record.get(name)
                     }
-                    event: Any = None
-                    if record.get("event_json"):
-                        try:
-                            event = json.loads(record["event_json"])
-                            identifiers.update(find_request_ids(event))
-                        except (json.JSONDecodeError, TypeError):
-                            pass
+                    event, event_ids = _decode_event_json(record.get("event_json"))
+                    identifiers.update(event_ids)
                     status = capture_status_from_event(
                         str(record.get("status") or "complete"), event
                     )
@@ -472,13 +509,8 @@ def load_captured_incremental(
                     identifiers = {
                         str(record[name]) for name in ("call_id", "trace_id") if record.get(name)
                     }
-                    event: Any = None
-                    if record.get("event_json"):
-                        try:
-                            event = json.loads(record["event_json"])
-                            identifiers.update(find_request_ids(event))
-                        except (json.JSONDecodeError, TypeError):
-                            pass
+                    event, event_ids = _decode_event_json(record.get("event_json"))
+                    identifiers.update(event_ids)
                     db_status = str(record.get("status") or "complete")
                     status = capture_status_from_event(db_status, event)
                     for request_id in identifiers:
@@ -520,29 +552,72 @@ def merge_captured(target: Captured, source: Captured) -> None:
             merge_capture(target, request_id, status, total)
 
 
-def find_request_ids(value: Any) -> set[str]:
-    """Recursively extract request_id values from serialized semantic events."""
-    if isinstance(value, dict):
-        found = {str(value["request_id"])} if value.get("request_id") else set()
-        for child in value.values():
-            found.update(find_request_ids(child))
-        return found
-    if isinstance(value, list):
-        found: set[str] = set()
-        for child in value:
-            found.update(find_request_ids(child))
-        return found
-    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
-        # AgentSight preserves the original HTTP request as a JSON-encoded
-        # string in ``request.raw_body``. Decode one nested JSON layer so the
-        # benchmark can correlate records even when the response parser did
-        # not copy the request_id into the semantic event metadata.
-        try:
-            decoded = json.loads(value)
-        except json.JSONDecodeError:
-            return set()
-        return find_request_ids(decoded)
-    return set()
+def _decode_event_json(raw_event: Any) -> tuple[Any, set[str]]:
+    """Decode an ``event_json`` payload and extract request IDs safely."""
+    if not raw_event:
+        return None, set()
+    decoded = _safe_json_loads(raw_event)
+    if decoded is _JSON_DECODE_ERROR or not isinstance(decoded, (dict, list)):
+        return None, set()
+    return decoded, find_request_ids(decoded)
+
+
+def _should_enqueue_event_child(child: Any, json_depth: int, max_json_depth: int) -> bool:
+    """Return whether a child node needs further traversal or nested JSON decoding."""
+    if isinstance(child, (dict, list)):
+        return True
+    return (
+        isinstance(child, str)
+        and json_depth < max_json_depth
+        and child.lstrip().startswith(("{", "["))
+    )
+
+
+def find_request_ids(
+    value: Any,
+    *,
+    max_depth: int = _MAX_EVENT_TRAVERSAL_DEPTH,
+    max_nodes: int = _MAX_EVENT_TRAVERSAL_NODES,
+    max_json_depth: int = _MAX_EMBEDDED_JSON_DEPTH,
+) -> set[str]:
+    """Extract request_id values from serialized semantic events with bounded traversal."""
+    found: set[str] = set()
+    queue: deque[tuple[Any, int, int]] = deque([(value, 0, 0)])
+    visited_nodes = 0
+
+    while queue and visited_nodes < max_nodes:
+        current, depth, json_depth = queue.popleft()
+        visited_nodes += 1
+        if isinstance(current, (dict, list)):
+            if isinstance(current, dict):
+                request_id = current.get("request_id")
+                if (
+                    isinstance(request_id, (str, int))
+                    and not isinstance(request_id, bool)
+                    and request_id
+                ):
+                    found.add(str(request_id))
+                children = current.values()
+            else:
+                children = current
+            if depth < max_depth:
+                for child in children:
+                    if _should_enqueue_event_child(child, json_depth, max_json_depth):
+                        queue.append((child, depth + 1, json_depth))
+        elif (
+            isinstance(current, str)
+            and depth < max_depth
+            and json_depth < max_json_depth
+            and current.lstrip().startswith(("{", "["))
+        ):
+            # AgentSight preserves the original HTTP request as a JSON-encoded
+            # string in ``request.raw_body``. Decode nested JSON layers up to
+            # ``max_json_depth`` so the benchmark can correlate records even when
+            # the response parser did not copy request_id into event metadata.
+            decoded = _safe_json_loads(current)
+            if decoded is not _JSON_DECODE_ERROR and isinstance(decoded, (dict, list)):
+                queue.append((decoded, depth + 1, json_depth + 1))
+    return found
 
 
 def make_report(

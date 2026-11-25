@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use ws_ckpt_common::backend::{CreateAdmissionRefused, DiffError, SnapshotDeleteOutcome};
 use ws_ckpt_common::{ChangeType, DiffEntry};
 
-use crate::util::{proc_mounts_in, unescape_proc_mount};
+use crate::util::proc_mounts_in;
 
 /// init_workspace backup path (#673).
 pub fn backup_path_for(original_path: &str) -> String {
@@ -719,11 +719,11 @@ pub async fn sync_subvolume_deletes(fs_root: &Path, ids: &[u64], timeout: Durati
     }
 }
 
-/// Parse `/proc/mounts` content and return EVERY mount point of the
-/// filesystem containing `path`: longest-prefix match locates the mount
-/// holding `path`, then all mounts sharing that line's device field are
-/// collected (octal escapes decoded, result sorted for deterministic
-/// messages).
+/// Parse `/proc/mounts` content and return EVERY active mount point of the
+/// filesystem containing `path`: longest-prefix match against effective mounts
+/// (last stacked entry per mount point) locates the mount holding `path`, then
+/// all active mounts sharing that entry's device are collected (octal escapes
+/// decoded, result sorted for deterministic messages).
 ///
 /// Collecting the whole device matters because the btrfs cleaner only resets
 /// when the LAST mount of the filesystem goes away: umounting one of
@@ -733,37 +733,20 @@ pub async fn sync_subvolume_deletes(fs_root: &Path, ids: &[u64], timeout: Durati
 /// review P2). Mounts in other namespaces are invisible from here; this is
 /// best-effort by nature.
 fn mount_points_for_device_in(content: &str, path: &Path) -> Vec<PathBuf> {
-    let mut best: Option<(String, PathBuf)> = None;
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let mp = PathBuf::from(unescape_proc_mount(parts[1]));
-        if path == mp || path.starts_with(&mp) {
-            let better = match &best {
-                Some((_, b)) => mp.as_os_str().len() > b.as_os_str().len(),
-                None => true,
-            };
-            if better {
-                best = Some((parts[0].to_string(), mp));
-            }
-        }
-    }
-    let Some((device, _)) = best else {
+    let mounts = proc_mounts_in(content);
+    let Some(device) = mounts
+        .iter()
+        .filter(|m| path == m.mount_point || path.starts_with(&m.mount_point))
+        .max_by_key(|m| m.mount_point.as_os_str().len())
+        .map(|m| m.device.clone())
+    else {
         return Vec::new();
     };
-    let mut all: Vec<PathBuf> = Vec::new();
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 || parts[0] != device {
-            continue;
-        }
-        let mp = PathBuf::from(unescape_proc_mount(parts[1]));
-        if !all.contains(&mp) {
-            all.push(mp);
-        }
-    }
+    let mut all: Vec<PathBuf> = mounts
+        .into_iter()
+        .filter(|m| m.device == device)
+        .map(|m| m.mount_point)
+        .collect();
     all.sort();
     all
 }
@@ -4529,6 +4512,62 @@ proc /proc proc rw 0 0
     fn mount_points_garbage_lines_skipped() {
         assert!(mount_points_for_device_in("", Path::new("/a")).is_empty());
         assert!(mount_points_for_device_in("oneword\n", Path::new("/a")).is_empty());
+    }
+
+    #[test]
+    fn mount_points_stacked_root_prefers_effective_mount() {
+        let mounts = "\
+rootfs / rootfs rw 0 0
+/dev/vda1 / btrfs rw,relatime 0 0
+/dev/vda1 /var/lib/ws-ckpt btrfs rw,relatime 0 0
+";
+        assert_eq!(
+            mount_points_for_device_in(mounts, Path::new("/etc/hosts")),
+            vec![PathBuf::from("/"), PathBuf::from("/var/lib/ws-ckpt")]
+        );
+    }
+
+    #[test]
+    fn mount_points_stacked_mount_ignores_obscured_device() {
+        let mounts = "\
+/dev/loop0 /mnt/btrfs btrfs rw,relatime 0 0
+/dev/loop0 /mnt/btrfs-alt btrfs rw,subvol=other 0 0
+/dev/loop1 /mnt/btrfs btrfs rw,relatime 0 0
+";
+        // Topmost mount at /mnt/btrfs is /dev/loop1, not buried /dev/loop0.
+        assert_eq!(
+            mount_points_for_device_in(mounts, Path::new("/mnt/btrfs/ws-ckpt-data")),
+            vec![PathBuf::from("/mnt/btrfs")]
+        );
+        // Active mount of /dev/loop0 is only /mnt/btrfs-alt; obscured /mnt/btrfs is excluded.
+        assert_eq!(
+            mount_points_for_device_in(mounts, Path::new("/mnt/btrfs-alt/ws-ckpt-data")),
+            vec![PathBuf::from("/mnt/btrfs-alt")]
+        );
+    }
+
+    #[test]
+    fn mount_points_root_and_prefix_edge_cases() {
+        let mounts = "\
+/dev/sda1 / ext4 rw 0 0
+/dev/loop0 /mnt/ws btrfs rw 0 0
+";
+        assert_eq!(
+            mount_points_for_device_in(mounts, Path::new("/mnt/ws2/data")),
+            vec![PathBuf::from("/")]
+        );
+        assert_eq!(
+            mount_points_for_device_in(mounts, Path::new("/a")),
+            vec![PathBuf::from("/")]
+        );
+        assert_eq!(
+            mount_points_for_device_in(mounts, Path::new("/")),
+            vec![PathBuf::from("/")]
+        );
+        assert_eq!(
+            mount_points_for_device_in(mounts, Path::new("/mnt/ws/")),
+            vec![PathBuf::from("/mnt/ws")]
+        );
     }
 
     // ── Recovery guidance phrasing (#3053 review P1-a / P2) ──

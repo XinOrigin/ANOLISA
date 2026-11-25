@@ -37,59 +37,77 @@ const AuthGate: React.FC<{ children: (status: AuthStatusResponse | null) => Reac
   const { t } = useI18n();
 
   useEffect(() => {
+    let cancelled = false;
     // Check for token in URL query parameter (e.g. ?token=xxx from CLI link)
     const urlParams = new URLSearchParams(window.location.search);
     const urlToken = urlParams.get('token');
     if (urlToken) {
-      // Auto-login with the token from URL, then clean the URL
+      // Auto-login with the token from URL, then clean the URL unconditionally
       (async () => {
         try {
           const ok = await login(urlToken);
-          // Remove token from URL regardless of success
-          urlParams.delete('token');
-          const cleanSearch = urlParams.toString();
-          const cleanUrl = window.location.pathname
-            + (cleanSearch ? '?' + cleanSearch : '')
-            + window.location.hash;
-          window.history.replaceState(null, '', cleanUrl);
+          if (cancelled) return;
           if (ok) {
+            try {
+              const nextStatus = await fetchAuthStatus();
+              if (cancelled) return;
+              setStatus(nextStatus);
+            } catch {
+              if (cancelled) return;
+              // Status endpoint unreachable — fall back to full capabilities like the non-token path.
+              setStatus(null);
+            }
             setAuthState('authenticated');
           } else {
             setAuthState('unauthenticated');
           }
         } catch {
-          setAuthState('unauthenticated');
+          if (!cancelled) setAuthState('unauthenticated');
+        } finally {
+          // Remove token from URL regardless of success, failure, or cancellation
+          const currentParams = new URLSearchParams(window.location.search);
+          if (currentParams.has('token')) {
+            currentParams.delete('token');
+            const cleanSearch = currentParams.toString();
+            const cleanUrl = window.location.pathname
+              + (cleanSearch ? '?' + cleanSearch : '')
+              + window.location.hash;
+            window.history.replaceState(null, '', cleanUrl);
+          }
         }
       })();
-      return;
-    }
-
-    // Always allow the login page itself
-    if (location.pathname === '/login') {
+    } else if (location.pathname === '/login') {
+      // Always allow the login page itself
       setAuthState('unauthenticated');
-      return;
+    } else {
+      (async () => {
+        try {
+          const nextStatus = await fetchAuthStatus();
+          if (cancelled) return;
+          setStatus(nextStatus);
+          if (!nextStatus.auth_enabled) {
+            setAuthState('disabled');
+            return;
+          }
+          const verify = await fetchAuthVerify();
+          if (cancelled) return;
+          if (verify.authenticated) {
+            setAuthState('authenticated');
+          } else {
+            setAuthState('unauthenticated');
+          }
+        } catch {
+          if (cancelled) return;
+          // Server unreachable — skip auth check and assume full capabilities for compatibility.
+          setStatus(null);
+          setAuthState('disabled');
+        }
+      })();
     }
 
-    (async () => {
-      try {
-        const nextStatus = await fetchAuthStatus();
-        setStatus(nextStatus);
-        if (!nextStatus.auth_enabled) {
-          setAuthState('disabled');
-          return;
-        }
-        const verify = await fetchAuthVerify();
-        if (verify.authenticated) {
-          setAuthState('authenticated');
-        } else {
-          setAuthState('unauthenticated');
-        }
-      } catch {
-        // Server unreachable — skip auth check and assume full capabilities for compatibility.
-        setStatus(null);
-        setAuthState('disabled');
-      }
-    })();
+    return () => {
+      cancelled = true;
+    };
   }, [location.pathname]);
 
   const handleAuthenticated = () => {

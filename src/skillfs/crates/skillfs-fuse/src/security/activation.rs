@@ -67,6 +67,9 @@ pub enum ActivationError {
     SnapshotNotDirectory {
         path: PathBuf,
     },
+    SnapshotSymlink {
+        path: PathBuf,
+    },
     SnapshotEscapesSkillDir {
         path: PathBuf,
     },
@@ -118,6 +121,13 @@ impl std::fmt::Display for ActivationError {
                 write!(
                     f,
                     "activation snapshot is not a directory: '{}'",
+                    path.display()
+                )
+            }
+            ActivationError::SnapshotSymlink { path } => {
+                write!(
+                    f,
+                    "activation path must not be a symlink: '{}'",
                     path.display()
                 )
             }
@@ -269,6 +279,11 @@ fn validate_activation_target(raw: &str) -> Result<PathBuf, ActivationError> {
             reason: "target must not contain NUL bytes".to_string(),
         });
     }
+    if raw.ends_with('/') {
+        return Err(ActivationError::InvalidTarget {
+            reason: format!("target must not end with '/': '{raw}'"),
+        });
+    }
 
     let path = Path::new(raw);
 
@@ -292,6 +307,15 @@ fn validate_activation_target(raw: &str) -> Result<PathBuf, ActivationError> {
                 });
             }
         }
+    }
+
+    if raw
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(ActivationError::InvalidTarget {
+            reason: format!("must not contain empty, '.', or '..' path segments: '{raw}'"),
+        });
     }
 
     let mut comps = path.components();
@@ -340,20 +364,83 @@ fn validate_activation_target(raw: &str) -> Result<PathBuf, ActivationError> {
         });
     }
 
-    if !snapshot_name.ends_with(SNAPSHOT_SUFFIX) {
-        return Err(ActivationError::InvalidTarget {
-            reason: format!(
-                "snapshot component must end with '{SNAPSHOT_SUFFIX}', got '{snapshot_name}'"
-            ),
-        });
+    match snapshot_name.strip_suffix(SNAPSHOT_SUFFIX) {
+        None => {
+            return Err(ActivationError::InvalidTarget {
+                reason: format!(
+                    "snapshot component must end with '{SNAPSHOT_SUFFIX}', got '{snapshot_name}'"
+                ),
+            });
+        }
+        Some("") => {
+            return Err(ActivationError::InvalidTarget {
+                reason: format!(
+                    "snapshot component must have a non-empty version prefix before '{SNAPSHOT_SUFFIX}', got '{snapshot_name}'"
+                ),
+            });
+        }
+        Some(_) => {}
     }
 
-    Ok(path.to_path_buf())
+    let mut clean = PathBuf::from(SNAPSHOT_PREFIX_FIRST);
+    clean.push(SNAPSHOT_PREFIX_SECOND);
+    clean.push(snapshot_name);
+    Ok(clean)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Conversion to ActiveTarget
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Verify `path` is not a symlink using `lstat` (`symlink_metadata`).
+/// Returns `ActivationError::Io` when `path` does not exist or cannot be stat'd.
+fn check_no_symlink(path: &Path) -> Result<(), ActivationError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                Err(ActivationError::SnapshotSymlink {
+                    path: path.to_path_buf(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) => Err(ActivationError::Io(e)),
+    }
+}
+
+/// Read `<skill_dir>/.skill-meta/activation.json` without following symlinks
+/// at `.skill-meta` or `activation.json`.
+fn read_activation_file(skill_dir: &Path) -> Result<String, ActivationError> {
+    let meta_dir = skill_dir.join(SNAPSHOT_PREFIX_FIRST);
+    check_no_symlink(&meta_dir)?;
+    let activation_path = skill_dir.join(ACTIVATION_FILE);
+    check_no_symlink(&activation_path)?;
+    std::fs::read_to_string(&activation_path).map_err(ActivationError::Io)
+}
+
+/// Verify `dir` exists as a real (non-symlink) directory using `lstat`.
+fn check_real_dir(dir: &Path, snapshot_dir: &Path) -> Result<(), ActivationError> {
+    // Strip any trailing '/' so POSIX lstat never dereferences a final symlink.
+    let clean_dir: PathBuf = dir.components().collect();
+    match std::fs::symlink_metadata(&clean_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(ActivationError::SnapshotSymlink { path: clean_dir });
+            }
+            if !meta.is_dir() {
+                return Err(ActivationError::SnapshotNotDirectory { path: clean_dir });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ActivationError::SnapshotNotFound {
+                path: snapshot_dir.to_path_buf(),
+            })
+        }
+        Err(e) => Err(ActivationError::Io(e)),
+    }
+}
 
 /// Read and parse `<skill_dir>/.skill-meta/activation.json`, validate
 /// the target path against the real filesystem, and return the
@@ -363,8 +450,7 @@ fn validate_activation_target(raw: &str) -> Result<PathBuf, ActivationError> {
 /// [`ActiveTarget::Hidden`] — this function does **not** do that
 /// automatically so the caller can log the diagnostic reason.
 pub fn load_activation(skill_dir: &Path) -> Result<ActiveTarget, ActivationError> {
-    let activation_path = skill_dir.join(ACTIVATION_FILE);
-    let content = std::fs::read_to_string(&activation_path).map_err(ActivationError::Io)?;
+    let content = read_activation_file(skill_dir)?;
     let record = ActivationRecord::from_json_str(&content)?;
     resolve_activation(skill_dir, &record)
 }
@@ -380,29 +466,42 @@ pub fn resolve_activation(
             reason: "activation target is null".to_string(),
         }),
         Some(rel_target) => {
-            let snapshot_dir = skill_dir.join(rel_target);
-
-            if !snapshot_dir.exists() {
-                return Err(ActivationError::SnapshotNotFound { path: snapshot_dir });
+            // Strip trailing slashes via component reconstruction so
+            // symlink_metadata inspects the final entry rather than following it.
+            let clean_rel: PathBuf = rel_target.components().collect();
+            if clean_rel.as_os_str().is_empty() {
+                return Err(ActivationError::InvalidTarget {
+                    reason: "target must be non-empty".to_string(),
+                });
             }
-            if !snapshot_dir.is_dir() {
-                return Err(ActivationError::SnapshotNotDirectory { path: snapshot_dir });
-            }
 
-            // Canonicalize both to check containment.
+            let meta_dir = skill_dir.join(SNAPSHOT_PREFIX_FIRST);
+            let versions_dir = meta_dir.join(SNAPSHOT_PREFIX_SECOND);
+            let snapshot_dir = skill_dir.join(&clean_rel);
+
+            check_real_dir(&meta_dir, &snapshot_dir)?;
+            check_real_dir(&versions_dir, &snapshot_dir)?;
+            check_real_dir(&snapshot_dir, &snapshot_dir)?;
+
+            // Canonicalize skill_dir, versions_dir, and snapshot_dir to verify
+            // both containment in skill_dir and direct parentage in versions_dir.
             let skill_canon = skill_dir.canonicalize().map_err(ActivationError::Io)?;
+            let versions_canon = versions_dir.canonicalize().map_err(ActivationError::Io)?;
             let snapshot_canon = snapshot_dir.canonicalize().map_err(ActivationError::Io)?;
 
-            if !snapshot_canon.starts_with(&skill_canon) {
+            if !snapshot_canon.starts_with(&skill_canon)
+                || !versions_canon.starts_with(&skill_canon)
+                || snapshot_canon.parent() != Some(versions_canon.as_path())
+            {
                 return Err(ActivationError::SnapshotEscapesSkillDir {
                     path: snapshot_canon,
                 });
             }
 
-            let version = rel_target
+            let version = clean_rel
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| rel_target.to_string_lossy().into_owned());
+                .unwrap_or_else(|| clean_rel.to_string_lossy().into_owned());
 
             Ok(ActiveTarget::Snapshot {
                 snapshot_dir,
@@ -444,8 +543,7 @@ pub fn load_activation_prefer_xattr(skill_dir: &Path) -> Result<ActiveTarget, Ac
             })?;
 
             // Check whether activation.json also exists and agrees.
-            let activation_path = skill_dir.join(ACTIVATION_FILE);
-            if let Ok(json_content) = std::fs::read_to_string(&activation_path) {
+            if let Ok(json_content) = read_activation_file(skill_dir) {
                 if let Ok(json_record) = ActivationRecord::from_json_str(&json_content) {
                     if xattr_record.target != json_record.target {
                         return Err(ActivationError::XattrJsonMismatch {
@@ -858,6 +956,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_version_prefix_before_snapshot_suffix() {
+        let json = r#"{"schemaVersion": 1, "target": ".skill-meta/versions/.snapshot"}"#;
+        let err = ActivationRecord::from_json_str(json).unwrap_err();
+        assert!(matches!(err, ActivationError::InvalidTarget { .. }));
+    }
+
+    #[test]
     fn rejects_extra_components_after_snapshot() {
         let json =
             r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot/extra"}"#;
@@ -871,6 +976,23 @@ mod tests {
         let json = serde_json::json!({"schemaVersion": 1, "target": target_with_nul});
         let err = ActivationRecord::from_json_str(&json.to_string()).unwrap_err();
         assert!(matches!(err, ActivationError::InvalidTarget { .. }));
+    }
+
+    #[test]
+    fn rejects_trailing_slash_in_target() {
+        for bad in [
+            ".skill-meta/versions/v000001.snapshot/",
+            ".skill-meta/versions/v000001.snapshot//",
+            ".skill-meta/versions/v000001.snapshot/.",
+            ".skill-meta/versions//v000001.snapshot",
+        ] {
+            let json = serde_json::json!({"schemaVersion": 1, "target": bad});
+            let err = ActivationRecord::from_json_str(&json.to_string()).unwrap_err();
+            assert!(
+                matches!(err, ActivationError::InvalidTarget { .. }),
+                "expected InvalidTarget for '{bad}', got {err:?}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -937,6 +1059,191 @@ mod tests {
         assert!(
             matches!(err, ActivationError::SnapshotNotDirectory { .. }),
             "expected SnapshotNotDirectory, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_symlink_snapshot_pointing_to_skill_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join(".skill-meta/versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        std::os::unix::fs::symlink("../..", versions.join("v000001.snapshot")).unwrap();
+
+        let record = ActivationRecord {
+            schema_version: 1,
+            target: Some(PathBuf::from(".skill-meta/versions/v000001.snapshot")),
+        };
+        let err = resolve_activation(dir.path(), &record).unwrap_err();
+        assert!(
+            matches!(err, ActivationError::SnapshotSymlink { .. }),
+            "expected SnapshotSymlink, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_symlink_snapshot_pointing_to_sibling_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join(".skill-meta/versions");
+        std::fs::create_dir_all(versions.join("real.snapshot")).unwrap();
+        std::os::unix::fs::symlink(
+            "../versions/real.snapshot",
+            versions.join("v000001.snapshot"),
+        )
+        .unwrap();
+
+        let record = ActivationRecord {
+            schema_version: 1,
+            target: Some(PathBuf::from(".skill-meta/versions/v000001.snapshot")),
+        };
+        let err = resolve_activation(dir.path(), &record).unwrap_err();
+        assert!(
+            matches!(err, ActivationError::SnapshotSymlink { .. }),
+            "expected SnapshotSymlink, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_trailing_slash_symlink_snapshot_into_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join(".skill-meta/versions");
+        std::fs::create_dir_all(versions.join("real.snapshot")).unwrap();
+        std::os::unix::fs::symlink("real.snapshot", versions.join("v000001.snapshot")).unwrap();
+        std::os::unix::fs::symlink(
+            "../versions/real.snapshot",
+            versions.join("v000002.snapshot"),
+        )
+        .unwrap();
+
+        for target in [
+            ".skill-meta/versions/v000001.snapshot/",
+            ".skill-meta/versions/v000001.snapshot//",
+            ".skill-meta/versions/v000001.snapshot/.",
+            ".skill-meta/versions/v000002.snapshot/",
+        ] {
+            let record = ActivationRecord {
+                schema_version: 1,
+                target: Some(PathBuf::from(target)),
+            };
+            let err = resolve_activation(dir.path(), &record).unwrap_err();
+            assert!(
+                matches!(err, ActivationError::SnapshotSymlink { .. }),
+                "expected SnapshotSymlink for '{target}', got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_dangling_symlink_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join(".skill-meta/versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        std::os::unix::fs::symlink("does-not-exist", versions.join("v000001.snapshot")).unwrap();
+
+        let record = ActivationRecord {
+            schema_version: 1,
+            target: Some(PathBuf::from(".skill-meta/versions/v000001.snapshot")),
+        };
+        let err = resolve_activation(dir.path(), &record).unwrap_err();
+        assert!(
+            matches!(err, ActivationError::SnapshotSymlink { .. }),
+            "expected SnapshotSymlink for dangling symlink, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_symlink_versions_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join(".skill-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::create_dir_all(dir.path().join("alt/v000001.snapshot")).unwrap();
+        std::os::unix::fs::symlink("../alt", meta.join("versions")).unwrap();
+
+        let record = ActivationRecord {
+            schema_version: 1,
+            target: Some(PathBuf::from(".skill-meta/versions/v000001.snapshot")),
+        };
+        let err = resolve_activation(dir.path(), &record).unwrap_err();
+        assert!(
+            matches!(err, ActivationError::SnapshotSymlink { .. }),
+            "expected SnapshotSymlink, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_symlink_skill_meta_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("alt/versions/v000001.snapshot")).unwrap();
+        std::os::unix::fs::symlink("alt", dir.path().join(".skill-meta")).unwrap();
+
+        let record = ActivationRecord {
+            schema_version: 1,
+            target: Some(PathBuf::from(".skill-meta/versions/v000001.snapshot")),
+        };
+        let err = resolve_activation(dir.path(), &record).unwrap_err();
+        assert!(
+            matches!(err, ActivationError::SnapshotSymlink { .. }),
+            "expected SnapshotSymlink, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_escape_target_not_direct_child_of_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join(".skill-meta/versions");
+        std::fs::create_dir_all(versions.join("nested/v000001.snapshot")).unwrap();
+
+        for bad in [
+            ".skill-meta/versions/nested/v000001.snapshot",
+            ".skill-meta/versions/../..",
+            ".skill-meta/versions/..",
+        ] {
+            let record = ActivationRecord {
+                schema_version: 1,
+                target: Some(PathBuf::from(bad)),
+            };
+            let err = resolve_activation(dir.path(), &record).unwrap_err();
+            assert!(
+                matches!(err, ActivationError::SnapshotEscapesSkillDir { .. }),
+                "expected SnapshotEscapesSkillDir for '{bad}', got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_symlink_activation_json_and_symlink_skill_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join(".skill-meta/versions/v000001.snapshot");
+        std::fs::create_dir_all(&snap).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(
+            &outside,
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(".skill-meta/activation.json"))
+            .unwrap();
+
+        let err = load_activation(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ActivationError::SnapshotSymlink { .. }),
+            "expected SnapshotSymlink for symlinked activation.json, got {err:?}"
+        );
+
+        // Symlinked .skill-meta even when activation.json inside target has null target.
+        let dir2 = tempfile::tempdir().unwrap();
+        let alt_meta = dir2.path().join("alt-meta");
+        std::fs::create_dir_all(&alt_meta).unwrap();
+        std::fs::write(
+            alt_meta.join("activation.json"),
+            r#"{"schemaVersion": 1, "target": null}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("alt-meta", dir2.path().join(".skill-meta")).unwrap();
+
+        let err2 = load_activation(dir2.path()).unwrap_err();
+        assert!(
+            matches!(err2, ActivationError::SnapshotSymlink { .. }),
+            "expected SnapshotSymlink for symlinked .skill-meta, got {err2:?}"
         );
     }
 

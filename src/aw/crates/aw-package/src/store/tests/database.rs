@@ -271,6 +271,44 @@ fn doctor_never_follows_payload_symlinks_or_blocks_on_a_fifo() {
 }
 
 #[test]
+fn doctor_reports_unix_socket_payload_as_nonregular() {
+    use std::os::unix::fs::FileTypeExt;
+    let fixture = Fixture::new();
+    fixture.database(vec![fixture.installation()]);
+    fixture.registration(&fixture.prefix, "install-1");
+    let socket = fixture.prefix.join("bin/tool");
+    fs::remove_file(&socket).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let report = fixture.read().unwrap().doctor().unwrap();
+    assert!(!report.healthy());
+    assert_eq!(report.files_checked, 1);
+    assert_eq!(report.issues.len(), 1, "{:?}", report.issues);
+    assert_eq!(report.issues[0].code, DoctorIssueCode::Nonregular);
+    assert_eq!(report.issues[0].path, socket);
+    assert!(fs::symlink_metadata(&socket)
+        .unwrap()
+        .file_type()
+        .is_socket());
+    drop(listener);
+}
+
+#[test]
+fn doctor_reports_dangling_payload_symlink_as_symlink() {
+    let fixture = Fixture::new();
+    fixture.database(vec![fixture.installation()]);
+    fixture.registration(&fixture.prefix, "install-1");
+    let link = fixture.prefix.join("bin/tool");
+    fs::remove_file(&link).unwrap();
+    symlink(fixture.directory.path().join("absent"), &link).unwrap();
+    let report = fixture.read().unwrap().doctor().unwrap();
+    assert!(!report.healthy());
+    assert_eq!(report.files_checked, 1);
+    assert_eq!(report.issues.len(), 1, "{:?}", report.issues);
+    assert_eq!(report.issues[0].code, DoctorIssueCode::Symlink);
+    assert_eq!(report.issues[0].path, link);
+}
+
+#[test]
 fn unsafe_database_files_and_ancestor_symlinks_are_rejected() {
     for target in ["installed.json", "lock"] {
         let fixture = Fixture::new();

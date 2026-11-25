@@ -288,6 +288,19 @@ fn file(
     expected: &Payload,
     budget: &mut u64,
 ) -> Result<Vec<(DoctorIssueCode, String)>> {
+    let meta = paths::metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(vec![(
+            DoctorIssueCode::Symlink,
+            "recorded payload is a symbolic link".into(),
+        )]);
+    }
+    if !meta.file_type().is_file() {
+        return Ok(vec![(
+            DoctorIssueCode::Nonregular,
+            "recorded payload is not a regular file".into(),
+        )]);
+    }
     let mut file = paths::opened(path)?;
     let before = file.metadata()?;
     if !before.is_file() {

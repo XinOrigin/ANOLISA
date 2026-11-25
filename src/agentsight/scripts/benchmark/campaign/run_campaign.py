@@ -716,9 +716,26 @@ def quick_value(summary: dict[str, Any], path: tuple[str, ...]) -> float | None:
     return None
 
 
-def quick_number(value: float | None, suffix: str = "") -> str:
+def quick_number(value: Any, suffix: str = "") -> str:
     """Format one human-readable quick comparison value."""
-    return "—" if value is None else f"{value:.3f}{suffix}"
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "—"
+    numeric = finite_float(value)
+    return "—" if numeric is None else f"{numeric:.3f}{suffix}"
+
+
+def _quick_object(
+    run: dict[str, Any],
+    field: str,
+    label: str,
+    issues: list[str],
+) -> dict[str, Any]:
+    """Return one nested quick-run object, recording malformed values as issues."""
+    value = run.get(field)
+    if isinstance(value, dict):
+        return value
+    issues.append(f"malformed quick run {field}: {label}")
+    return {}
 
 
 def write_quick_report(results: Path) -> tuple[Path, str]:
@@ -732,14 +749,21 @@ def write_quick_report(results: Path) -> tuple[Path, str]:
     issues: list[str] = []
     for scenario in ("smoke", "metrics_off"):
         for path in sorted(results.glob(f"runs/{scenario}/**/run-result.json")):
-            run = read_json(path)
-            key = (run.get("version"), scenario)
+            try:
+                run = read_json(path)
+            except (OSError, ValueError, TypeError) as error:
+                # Covers OSError, UnicodeDecodeError, JSONDecodeError, and non-dict JSON.
+                issues.append(f"unreadable or malformed quick run {path}: {error}")
+                continue
+            version = run.get("version")
+            key = (version, scenario) if isinstance(version, str) else None
             if key not in expected or key in raw_runs:
                 issues.append(f"unexpected or duplicate quick run: {path}")
                 continue
             raw_runs[key] = run
 
     runs = []
+    summaries: dict[tuple[str, str], dict[str, Any]] = {}
     for (version, scenario), metrics_enabled in expected.items():
         run = raw_runs.get((version, scenario))
         if run is None:
@@ -747,17 +771,27 @@ def write_quick_report(results: Path) -> tuple[Path, str]:
             continue
         if run.get("metrics_enabled") is not metrics_enabled:
             issues.append(f"metrics mode was not recorded correctly: {version}:{scenario}")
-        summary = run.get("summary", {})
+        label = f"{version}:{scenario}"
+        summary = _quick_object(run, "summary", label, issues)
+        evaluation = _quick_object(run, "evaluation", label, issues)
+        summaries[(version, scenario)] = summary
+        raw_verdict = evaluation.get("verdict")
+        run_verdict = raw_verdict if isinstance(raw_verdict, str) else None
+        if raw_verdict is not None and run_verdict is None:
+            issues.append(f"malformed quick run verdict: {label}")
+        raw_survived = summary.get("process_survived")
         runs.append(
             {
                 "version": version,
                 "scenario": scenario,
                 "metrics_enabled": metrics_enabled,
-                "verdict": run.get("evaluation", {}).get("verdict"),
-                "http_success_rate": summary.get("http_success_rate"),
-                "trace_completeness": summary.get("trace_completeness"),
-                "capture_loss_rate": summary.get("capture_loss_rate"),
-                "process_survived": summary.get("process_survived"),
+                "verdict": run_verdict,
+                "http_success_rate": quick_value(summary, ("http_success_rate",)),
+                "trace_completeness": quick_value(summary, ("trace_completeness",)),
+                "capture_loss_rate": quick_value(summary, ("capture_loss_rate",)),
+                "process_survived": (
+                    raw_survived if isinstance(raw_survived, bool) else None
+                ),
             }
         )
 
@@ -771,8 +805,8 @@ def write_quick_report(results: Path) -> tuple[Path, str]:
     if not snapshot_available:
         issues.append("optimized metrics snapshot is missing stage calls")
 
-    on = raw_runs.get(("optimized", "smoke"), {}).get("summary", {})
-    off = raw_runs.get(("optimized", "metrics_off"), {}).get("summary", {})
+    on = summaries.get(("optimized", "smoke"), {})
+    off = summaries.get(("optimized", "metrics_off"), {})
     measurements = {}
     for name, path in QUICK_OVERHEAD_METRICS.items():
         disabled = quick_value(off, path)
@@ -783,10 +817,12 @@ def write_quick_report(results: Path) -> tuple[Path, str]:
             "disabled": disabled,
             "enabled": enabled,
             "delta_enabled_minus_disabled": (
-                enabled - disabled if enabled is not None and disabled is not None else None
+                finite_float(enabled - disabled)
+                if enabled is not None and disabled is not None
+                else None
             ),
             "relative_change_pct": (
-                (enabled / disabled - 1) * 100
+                finite_float((enabled / disabled - 1) * 100)
                 if enabled is not None and disabled is not None and disabled != 0
                 else None
             ),
@@ -831,7 +867,7 @@ def write_quick_report(results: Path) -> tuple[Path, str]:
         "| --- | --- | --- | ---: |",
         *[
             f"| {run['version']} | {'on' if run['metrics_enabled'] else 'off'} | "
-            f"{run['verdict']} | {quick_number(run['trace_completeness'])} |"
+            f"{run['verdict'] or '—'} | {quick_number(run['trace_completeness'])} |"
             for run in runs
         ],
         "",

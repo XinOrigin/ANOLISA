@@ -133,13 +133,13 @@ def load_json(path: Path | None) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def number(row: dict[str, str], key: str) -> float | None:
+def number(row: dict[str, Any], key: str | None) -> float | None:
     raw = row.get(key)
-    if raw is None or raw == "":
+    if raw is None or raw == "" or isinstance(raw, bool):
         return None
     try:
         value = float(raw)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
 
@@ -167,6 +167,8 @@ def read_metrics(path: Path) -> tuple[list[str], list[float | None], dict[str, l
 
     columns: dict[str, list[float | None]] = {}
     for key in rows[0]:
+        if key is None:
+            continue
         values = [number(row, key) for row in rows]
         if any(value is not None for value in values):
             columns[key] = values
@@ -880,16 +882,19 @@ def runtime_limits_section(run_dir: Path) -> str:
         if key not in limits:
             continue
         value = limits[key]
-        if key.endswith("_mb"):
-            shown = f"{value:,} MiB"
-        elif key.endswith("_secs"):
-            shown = f"{value:,} s"
-        elif key == "cpu_budget_percent":
-            shown = f"{value} %"
+        if value is None:
+            shown = "N/A"
         elif isinstance(value, bool):
             shown = "true" if value else "false"
-        elif isinstance(value, int):
-            shown = f"{value:,}"
+        elif isinstance(value, (int, float)) and math.isfinite(value):
+            if key.endswith("_mb"):
+                shown = f"{value:,} MiB"
+            elif key.endswith("_secs"):
+                shown = f"{value:,} s"
+            elif key == "cpu_budget_percent":
+                shown = f"{value} %"
+            else:
+                shown = f"{value:,}"
         else:
             shown = str(value)
         rows.append(
@@ -1315,6 +1320,9 @@ def render(args: argparse.Namespace) -> Path:
         '<article class="card"><h3>滚动 RSS 斜率</h3>'
         '<div class="empty">样本不足，无法计算滚动斜率</div></article>'
     )
+    post_slope_text = (
+        f"{post_slope:+.1f} MiB/h" if isinstance(post_slope, (int, float)) else "—"
+    )
     if rolling_times:
         rolling_svg, rolling_data = build_chart(
             "chart-rss-rolling",
@@ -1331,7 +1339,7 @@ def render(args: argparse.Namespace) -> Path:
                 )
             ],
             (
-                (post_slope, f"warmup 后 +{post_slope:.0f} MiB/h")
+                (post_slope, f"warmup 后 {post_slope:+.0f} MiB/h")
                 if isinstance(post_slope, (int, float))
                 else None
             ),
@@ -1345,7 +1353,7 @@ def render(args: argparse.Namespace) -> Path:
         rolling_card = (
             '<article class="card"><h3>滚动 RSS 斜率</h3>'
             f'<div class="meta">{args.slope_window_seconds:g}s 窗口 · warmup 后 '
-            f'+{post_slope:.1f} MiB/h</div>{rolling_svg}</article>'
+            f'{post_slope_text}</div>{rolling_svg}</article>'
         )
     rss_slope_section = (
         '<section><h2>RSS 斜率分析</h2><div class="grid">'
@@ -1353,7 +1361,7 @@ def render(args: argparse.Namespace) -> Path:
         f'<div class="meta">峰值 {fmt_value(rss["max"], "MiB", 1)} · '
         f'warmup {fmt_value(rss_at_warmup, "MiB", 1)} → '
         f'{fmt_value(rss["last"], "MiB", 1)} · 斜率 '
-        f'{(f"+{post_slope:.1f} MiB/h") if isinstance(post_slope, (int, float)) else "—"}'
+        f'{post_slope_text}'
         f'</div>{rss_svg}</article>{rolling_card}</div>'
         f'<p class="sub">{args.warmup_seconds:g}s warmup、{args.slope_window_seconds:g}s 滚动窗口；'
         "窗口过短时斜率只能看方向，正式长稳建议 warmup 300–600s、滚动窗口 30–60min。</p>"

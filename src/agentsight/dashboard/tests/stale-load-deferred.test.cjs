@@ -1864,6 +1864,199 @@ test('interruption refresh retains unresolved rows and newly arrived events', as
   assert.deepEqual(driver.slots[0].value.map((event) => event.interruption_id), ['first', 'new']);
 });
 
+test('InterruptionPanel: superseded prop-change responses cannot overwrite newer events, error, or loading', async () => {
+  const { calls, stubs } = deferredFetchStubs([
+    'fetchSessionInterruptions',
+    'fetchConversationInterruptions',
+    'resolveInterruption',
+  ]);
+  const driver = createHooksDriver();
+  const Panel = loadPageModule('src/components/InterruptionPanel.tsx', {
+    '../utils/apiClient': stubs,
+    '../i18n': { useI18n: () => ({ t: (key) => key }), useLocaleTag: () => 'en-US', interruptionTypeKey: () => null },
+    '../utils/datetime': { formatNs: String },
+  }, driver).InterruptionPanel;
+
+  const r1 = driver.render(Panel, { sessionId: 's1' });
+  const cleanup1 = r1.effects[0]();
+  assert.equal(calls.fetchSessionInterruptions.length, 1);
+
+  // Switch to s2 while s1 is still in flight.
+  const r2 = driver.render(Panel, { sessionId: 's2' });
+  if (typeof cleanup1 === 'function') cleanup1();
+  const cleanup2 = r2.effects[0]();
+  assert.equal(calls.fetchSessionInterruptions.length, 2);
+
+  // Stale s1 resolves while s2 is still loading: must not overwrite events or clear loading.
+  calls.fetchSessionInterruptions[0].resolve([{ interruption_id: 'from-s1', resolved: false }]);
+  await settle();
+  assert.deepEqual(driver.slots[0].value, [], 'stale s1 response must not populate events for s2');
+  assert.equal(driver.slots[1].value, true, 'stale s1 response must not clear loading while s2 is in flight');
+  assert.equal(driver.slots[2].value, null);
+
+  // Switch to conversation c3 while s2 is still in flight.
+  const r3 = driver.render(Panel, { conversationId: 'c3' });
+  if (typeof cleanup2 === 'function') cleanup2();
+  const cleanup3 = r3.effects[0]();
+  assert.equal(calls.fetchConversationInterruptions.length, 1);
+
+  // Stale s2 rejects while c3 is still in flight: must not set error or clear loading.
+  calls.fetchSessionInterruptions[1].reject(new Error('stale s2 failure'));
+  await settle();
+  assert.equal(driver.slots[2].value, null, 'stale s2 rejection must not set error for c3');
+  assert.equal(driver.slots[1].value, true, 'stale s2 rejection must not clear loading while c3 is in flight');
+
+  // Active c3 resolves cleanly.
+  calls.fetchConversationInterruptions[0].resolve([{ interruption_id: 'from-c3', resolved: false }]);
+  await settle();
+  assert.deepEqual(driver.slots[0].value.map((e) => e.interruption_id), ['from-c3']);
+  assert.equal(driver.slots[1].value, false);
+  assert.equal(driver.slots[2].value, null);
+
+  // Switching to s4 clears c3 rows immediately so a failing s4 does not display c3 rows under its error.
+  const r4 = driver.render(Panel, { sessionId: 's4' });
+  if (typeof cleanup3 === 'function') cleanup3();
+  r4.effects[0]();
+  assert.deepEqual(driver.slots[0].value, [], 'changing target must clear previous target rows');
+  calls.fetchSessionInterruptions[2].reject(new Error('s4 load failed'));
+  await settle();
+  assert.deepEqual(driver.slots[0].value, [], 'failed target load must not retain previous target rows');
+  assert.equal(driver.slots[2].value, 's4 load failed');
+  assert.equal(driver.slots[1].value, false);
+});
+
+test('InterruptionPanel: effect cleanup on unmount drops in-flight success and error responses', async () => {
+  for (const outcome of ['resolve', 'reject']) {
+    const { calls, stubs } = deferredFetchStubs([
+      'fetchSessionInterruptions',
+      'fetchConversationInterruptions',
+      'resolveInterruption',
+    ]);
+    const driver = createHooksDriver();
+    const Panel = loadPageModule('src/components/InterruptionPanel.tsx', {
+      '../utils/apiClient': stubs,
+      '../i18n': { useI18n: () => ({ t: (key) => key }), useLocaleTag: () => 'en-US', interruptionTypeKey: () => null },
+      '../utils/datetime': { formatNs: String },
+    }, driver).InterruptionPanel;
+
+    const rendered = driver.render(Panel, { sessionId: 's-unmount' });
+    const cleanup = rendered.effects[0]();
+    assert.equal(typeof cleanup, 'function', 'load effect must register a cleanup function');
+    cleanup();
+
+    if (outcome === 'resolve') {
+      calls.fetchSessionInterruptions[0].resolve([{ interruption_id: 'late-evt', resolved: false }]);
+    } else {
+      calls.fetchSessionInterruptions[0].reject(new Error('late unmount error'));
+    }
+    await settle();
+
+    assert.deepEqual(driver.slots[0].value, [], `unmounted panel must ignore late ${outcome} events`);
+    assert.equal(driver.slots[1].value, true, `unmounted panel must not flip loading on late ${outcome}`);
+    assert.equal(driver.slots[2].value, null, `unmounted panel must ignore late ${outcome} error`);
+  }
+});
+
+test('InterruptionPanel: concurrent resolve attempts deduplicate mutation and ignore post-unmount row errors', async () => {
+  const { calls, stubs } = deferredFetchStubs([
+    'fetchSessionInterruptions',
+    'fetchConversationInterruptions',
+    'resolveInterruption',
+  ]);
+  const driver = createHooksDriver();
+  const Panel = loadPageModule('src/components/InterruptionPanel.tsx', {
+    '../utils/apiClient': stubs,
+    '../i18n': { useI18n: () => ({ t: (key) => key }), useLocaleTag: () => 'en-US', interruptionTypeKey: () => null },
+    '../utils/datetime': { formatNs: String },
+  }, driver).InterruptionPanel;
+
+  const notifications = [];
+  const evt1 = {
+    interruption_id: 'evt-1', resolved: false, severity: 'high',
+    interruption_type: 'loop', occurred_at_ns: 1, session_id: 's1',
+    trace_id: 't1', conversation_id: 'c1', call_id: null, detail: null,
+  };
+  const evt2 = {
+    interruption_id: 'evt-2', resolved: false, severity: 'low',
+    interruption_type: 'loop', occurred_at_ns: 2, session_id: 's1',
+    trace_id: 't1', conversation_id: 'c1', call_id: null, detail: null,
+  };
+  const props = { sessionId: 's1', onResolvedEvent: (info) => notifications.push(info) };
+  driver.render(Panel, props).effects[0]();
+  calls.fetchSessionInterruptions[0].resolve([evt1, evt2]);
+  await settle();
+
+  const rendered = driver.render(Panel, props);
+  const rows = collectElements(rendered.element).filter(
+    (el) => el.props && el.props.event && typeof el.props.onResolved === 'function',
+  );
+  assert.equal(rows.length, 2);
+
+  const prevWindow = globalThis.window;
+  globalThis.window = { confirm: () => true };
+  try {
+    // Load InterruptionRow bound to its own hooks driver so row hooks and effects
+    // are isolated from InterruptionPanel's slots.
+    async function mountIsolatedRow(event, onResolved) {
+      const rowDriver = createHooksDriver();
+      const rowStubs = {
+        ...stubs,
+        fetchSessionInterruptions: async () => [event],
+      };
+      const RowPanel = loadPageModule('src/components/InterruptionPanel.tsx', {
+        '../utils/apiClient': rowStubs,
+        '../i18n': { useI18n: () => ({ t: (key) => key }), useLocaleTag: () => 'en-US', interruptionTypeKey: () => null },
+        '../utils/datetime': { formatNs: String },
+      }, rowDriver).InterruptionPanel;
+      await rowDriver.render(RowPanel, { sessionId: 'row-host' }).callbacks[0]();
+      const hostRow = collectElements(rowDriver.render(RowPanel, { sessionId: 'row-host' }).element).find(
+        (el) => el.props && el.props.event && typeof el.props.onResolved === 'function',
+      );
+      rowDriver.slots.length = 0;
+      const rowRender = rowDriver.render(hostRow.type, { event, onResolved });
+      return { rowDriver, rowRender };
+    }
+
+    // Double-invoking Resolve on the same row before React re-renders must only issue one mutation.
+    const { rowRender: rowRender1 } = await mountIsolatedRow(evt1, rows[0].props.onResolved);
+    const resolveBtn1 = collectElements(rowRender1.element).find(
+      (el) => el.props && el.props.title === 'comp.interrupt.markResolvedTitle',
+    );
+    const p1 = resolveBtn1.props.onClick();
+    const p2 = resolveBtn1.props.onClick();
+    assert.equal(calls.resolveInterruption.length, 1, 're-entrant resolve clicks must not send duplicate API calls');
+
+    calls.resolveInterruption[0].resolve();
+    await Promise.all([p1, p2]);
+    assert.equal(notifications.length, 1, 'onResolvedEvent must fire once for the resolved event');
+    // Duplicate onResolved callback for the same id must also be idempotent.
+    rows[0].props.onResolved(evt1);
+    assert.equal(notifications.length, 1, 'duplicate handleResolved calls must not double-notify parent');
+    assert.deepEqual(driver.slots[0].value.map((e) => e.interruption_id), ['evt-2']);
+
+    // If a row unmounts while its resolve request is in flight and that request fails,
+    // no post-unmount error/loading state should be written on the row.
+    const { rowDriver: rowDriver2, rowRender: rowRender2 } = await mountIsolatedRow(evt2, rows[1].props.onResolved);
+    const rowUnmount = rowRender2.effects[0]?.();
+    assert.equal(typeof rowUnmount, 'function', 'InterruptionRow must register an unmount cleanup');
+    const resolveBtn2 = collectElements(rowRender2.element).find(
+      (el) => el.props && el.props.title === 'comp.interrupt.markResolvedTitle',
+    );
+    const pendingFail = resolveBtn2.props.onClick();
+    rowUnmount();
+    calls.resolveInterruption[1].reject(new Error('network down'));
+    await pendingFail;
+    assert.equal(rowDriver2.slots[1].value, true, 'unmounted row must not flip resolving after unmount');
+    assert.equal(rowDriver2.slots[2].value, null, 'unmounted row must not write resolveErr after unmount');
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
+
 // ─── SystemAuditPage: process cycles ───
 
 function auditTreeFunctions() {

@@ -52,23 +52,43 @@ const InterruptionRow: React.FC<RowProps> = ({ event, onResolved }) => {
   const [expanded, setExpanded] = useState(false);
   const [resolving, setResolving] = useState(false);
   const [resolveErr, setResolveErr] = useState<string | null>(null);
+  const resolvingRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const dotStyle = SEVERITY_DOT[event.severity as InterruptionSeverity] ?? 'bg-gray-400';
   const typeKey = interruptionTypeKey(event.interruption_type);
   const typeLabel = typeKey ? t(typeKey) : event.interruption_type;
 
   const handleResolve = async () => {
+    if (resolvingRef.current) return;
     const confirmed = window.confirm(t('comp.interrupt.markResolvedConfirm'));
     if (!confirmed) return;
+    resolvingRef.current = true;
     setResolving(true);
     setResolveErr(null);
+    let succeeded = false;
     try {
       await resolveInterruption(event.interruption_id);
+      succeeded = true;
       onResolved(event);
     } catch (e: any) {
-      setResolveErr(e.message ?? t('comp.interrupt.operationFailed'));
+      if (mountedRef.current) {
+        setResolveErr(e?.message ?? t('comp.interrupt.operationFailed'));
+      }
     } finally {
-      setResolving(false);
+      if (!succeeded) {
+        resolvingRef.current = false;
+      }
+      if (mountedRef.current) {
+        setResolving(false);
+      }
     }
   };
 
@@ -141,8 +161,19 @@ export const InterruptionPanel: React.FC<Props> = ({ sessionId, conversationId, 
   // A read started before Resolve can finish after it. Interruption IDs are
   // global and resolution is one-way, so retain acknowledged IDs until unmount.
   const resolvedIds = useRef(new Set<string>());
+  const loadRequestIdRef = useRef(0);
+  const lastTargetRef = useRef({ sessionId, conversationId });
+  const mountedRef = useRef(true);
 
   const load = useCallback(async () => {
+    const requestId = ++loadRequestIdRef.current;
+    if (
+      lastTargetRef.current.sessionId !== sessionId ||
+      lastTargetRef.current.conversationId !== conversationId
+    ) {
+      lastTargetRef.current = { sessionId, conversationId };
+      setEvents([]);
+    }
     setLoading(true);
     setError(null);
     try {
@@ -162,22 +193,42 @@ export const InterruptionPanel: React.FC<Props> = ({ sessionId, conversationId, 
       } else {
         data = [];
       }
+      if (requestId !== loadRequestIdRef.current) return;
       // The session/conversation endpoints return resolved rows too; this panel
       // shows and counts only what still needs attention, and a resolved event
       // must not be offered the Resolve action again.
       setEvents(data.filter((event) => !event.resolved && !resolvedIds.current.has(event.interruption_id)));
     } catch (e: any) {
-      setError(e.message ?? t('comp.interrupt.failedToLoad'));
+      if (requestId === loadRequestIdRef.current) {
+        setError(e?.message ?? t('comp.interrupt.failedToLoad'));
+      }
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestIdRef.current) {
+        setLoading(false);
+      }
     }
   }, [sessionId, conversationId, t]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    return () => {
+      loadRequestIdRef.current += 1;
+    };
+  }, [load]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const handleResolved = (resolved: InterruptionRecord) => {
+    if (resolvedIds.current.has(resolved.interruption_id)) return;
     resolvedIds.current.add(resolved.interruption_id);
-    setEvents(prev => prev.filter(e => e.interruption_id !== resolved.interruption_id));
+    if (mountedRef.current) {
+      setEvents(prev => prev.filter(e => e.interruption_id !== resolved.interruption_id));
+    }
     onResolvedEvent?.({
       interruption_id: resolved.interruption_id,
       severity: resolved.severity,

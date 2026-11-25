@@ -23,6 +23,11 @@ export interface MergedSession {
   subagent_count: number;
 }
 
+/** Normalize blank message previews to null so fallback precedence holds. */
+function nonEmptyPreview(value: string | null | undefined): string | null {
+  return value && value.trim().length > 0 ? value : null;
+}
+
 /** Last activity of a log-collected trajectory in epoch milliseconds. */
 function trajectoryLastActiveMs(t: TrajectorySummary): number | null {
   if (t.end_time) {
@@ -80,8 +85,8 @@ export function mergeSessions(
       count: s.conversation_count,
       input_tokens: s.total_input_tokens,
       output_tokens: s.total_output_tokens,
-      first_message: s.first_user_query ?? null,
-      last_message: s.last_user_query ?? null,
+      first_message: nonEmptyPreview(s.first_user_query),
+      last_message: nonEmptyPreview(s.last_user_query),
       last_active_ms: s.last_seen_ns > 0 ? Math.floor(s.last_seen_ns / 1_000_000) : null,
       subagent_count: subagentCount.get(s.session_id) ?? 0,
     });
@@ -119,13 +124,15 @@ export function mergeSessions(
     const existing =
       byId.get(t.session_id) ?? (uuid && uuid !== t.session_id ? byId.get(uuid) : undefined);
     if (existing) {
-      existing.sources.push('log');
+      if (!existing.sources.includes('log')) {
+        existing.sources.push('log');
+      }
       existing.project = t.project || existing.project;
       existing.agent_name = existing.agent_name || t.agent_name;
       existing.model = existing.model || t.model_name;
-      // The log side carries the full trajectory — its previews win.
-      existing.first_message = t.first_user_message ?? existing.first_message;
-      existing.last_message = t.last_user_message ?? existing.last_message;
+      // The log side carries the full trajectory — its non-empty previews win.
+      existing.first_message = nonEmptyPreview(t.first_user_message) ?? existing.first_message;
+      existing.last_message = nonEmptyPreview(t.last_user_message) ?? existing.last_message;
       // A Codex parent's children are tallied under the collected rollout
       // stem while this row may have been initialized from the bare eBPF
       // UUID (count 0). Carry the collected parent's count over, taking the
@@ -148,8 +155,8 @@ export function mergeSessions(
         count: t.num_steps,
         input_tokens: t.total_prompt_tokens,
         output_tokens: t.total_completion_tokens,
-        first_message: t.first_user_message ?? null,
-        last_message: t.last_user_message ?? null,
+        first_message: nonEmptyPreview(t.first_user_message),
+        last_message: nonEmptyPreview(t.last_user_message),
         last_active_ms: lastMs,
         subagent_count: subagentCount.get(t.session_id) ?? 0,
       });

@@ -155,3 +155,89 @@ test('the production page keeps its public model export and consumes the same fu
   });
   assert.equal(page.mergeSessions, model.mergeSessions);
 });
+
+test('merging multiple Codex rollouts for the same captured UUID keeps sources deduplicated', () => {
+  const uuid = '019ef987-dbc1-7663-81b0-589cbe5e47e8';
+  const rollout1 = `rollout-2026-10-01T10-00-00-${uuid}`;
+  const rollout2 = `rollout-2026-10-01T14-30-00-${uuid}`;
+  const result = merge(
+    [captured(uuid)],
+    [
+      logged(rollout2, {
+        end_time: '2026-10-01T14:35:00Z',
+        collected_at_ns: 9_000_000_000,
+        last_user_message: 'resumed follow-up',
+      }),
+      logged(rollout1, {
+        end_time: '2026-10-01T10:05:00Z',
+        collected_at_ns: 6_000_000_000,
+      }),
+    ],
+  );
+  assert.equal(result.length, 1);
+  assert.equal(result[0].session_id, uuid);
+  assert.deepEqual(result[0].sources, ['ebpf', 'log']);
+  assert.equal(result[0].last_active_ms, Date.parse('2026-10-01T14:35:00Z'));
+});
+
+test('log-only sessions merged by exact ID and rollout alias keep a single log source', () => {
+  const uuid = '019ef987-dbc1-7663-81b0-589cbe5e47e8';
+  const rollout = `rollout-2026-10-01T10-00-00-${uuid}`;
+  const result = merge([], [logged(uuid), logged(rollout)]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].session_id, uuid);
+  assert.deepEqual(result[0].sources, ['log']);
+});
+
+test('empty or whitespace-only log message previews do not overwrite captured user queries', () => {
+  const emptyResult = merge(
+    [captured('sess-empty')],
+    [logged('sess-empty', { first_user_message: '', last_user_message: '' })],
+  );
+  assert.equal(emptyResult.length, 1);
+  assert.equal(emptyResult[0].first_message, 'capture first');
+  assert.equal(emptyResult[0].last_message, 'capture last');
+
+  const blankResult = merge(
+    [captured('sess-blank')],
+    [logged('sess-blank', { first_user_message: '   \n\t ', last_user_message: '   ' })],
+  );
+  assert.equal(blankResult.length, 1);
+  assert.equal(blankResult[0].first_message, 'capture first');
+  assert.equal(blankResult[0].last_message, 'capture last');
+});
+
+test('empty or whitespace-only standalone previews normalize to null instead of blank strings', () => {
+  const result = merge(
+    [captured('ebpf-blank', { first_user_query: '', last_user_query: '   ' })],
+    [logged('log-blank', { first_user_message: '', last_user_message: ' \t ' })],
+  );
+  const byId = new Map(result.map((row) => [row.session_id, row]));
+  assert.equal(byId.get('ebpf-blank').first_message, null);
+  assert.equal(byId.get('ebpf-blank').last_message, null);
+  assert.equal(byId.get('log-blank').first_message, null);
+  assert.equal(byId.get('log-blank').last_message, null);
+});
+
+test('a later blank rollout does not erase previews carried by an earlier rollout for the same UUID', () => {
+  const uuid = '019ef987-dbc1-7663-81b0-589cbe5e47e8';
+  const rollout1 = `rollout-2026-10-01T10-00-00-${uuid}`;
+  const rollout2 = `rollout-2026-10-01T15-00-00-${uuid}`;
+  const result = merge(
+    [captured(uuid, { first_user_query: null, last_user_query: null })],
+    [
+      logged(rollout1, {
+        first_user_message: 'initial rollout prompt',
+        last_user_message: 'initial rollout follow-up',
+      }),
+      logged(rollout2, {
+        first_user_message: '',
+        last_user_message: '   ',
+      }),
+    ],
+  );
+  assert.equal(result.length, 1);
+  assert.deepEqual(result[0].sources, ['ebpf', 'log']);
+  assert.equal(result[0].first_message, 'initial rollout prompt');
+  assert.equal(result[0].last_message, 'initial rollout follow-up');
+});

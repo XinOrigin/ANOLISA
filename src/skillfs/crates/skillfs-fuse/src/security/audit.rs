@@ -21,6 +21,8 @@
 //! the field names; downstream consumers may rely on them.
 
 use std::io::{BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +32,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 use tracing::warn;
+
+use crate::sys::openat_leaf;
 
 use super::event::{SkillEvent, SkillEventAction, SkillEventKind, SkillEventSink};
 
@@ -127,6 +131,48 @@ impl AuditRuntimeConfig {
         }
     }
 
+    /// Resolve and validate that the audit log will not write into the source
+    /// tree, returning the approved canonical path when resolution succeeds.
+    ///
+    /// Returns:
+    /// * `Ok(None)` — audit is disabled (`path = None`) or the path could not
+    ///   be resolved yet (e.g. parent directory does not exist); callers
+    ///   should keep the raw path so [`build_sink`](Self::build_sink) surfaces
+    ///   the underlying [`std::io::Error`].
+    /// * `Ok(Some(canonical))` — audit is enabled and resolved outside
+    ///   `source_canonical`. Callers should open `canonical` rather than
+    ///   re-resolving the raw flag so valid relative paths, `..` segments, and
+    ///   external OS directory symlinks (such as `/var/run -> /run`) resolve
+    ///   once and cannot be redirected between validation and open.
+    /// * `Err(AuditPathError::InsideSource { .. })` — the resolved destination
+    ///   (including through dangling symlinks) lies under `source_canonical`.
+    pub fn resolve_audit_path_outside_source(
+        &self,
+        source_canonical: &Path,
+    ) -> Result<Option<PathBuf>, AuditPathError> {
+        let Some(audit_log) = self.path.as_ref() else {
+            return Ok(None);
+        };
+        let audit_canonical = match resolve_audit_path(audit_log) {
+            Ok(p) => p,
+            // Couldn't resolve the audit log location lexically. The
+            // ambiguity is genuine (e.g. parent does not exist yet); let
+            // build_sink surface the underlying io::Error rather than
+            // guess. The inside-source check is intentionally skipped
+            // here — false positives would refuse legitimate paths just
+            // because their parent could not be canonicalized.
+            Err(_) => return Ok(None),
+        };
+        if audit_canonical.starts_with(source_canonical) {
+            return Err(AuditPathError::InsideSource {
+                audit_log: audit_log.clone(),
+                source_canonical: source_canonical.to_path_buf(),
+                audit_canonical,
+            });
+        }
+        Ok(Some(audit_canonical))
+    }
+
     /// Validate that the audit log will not write into the source tree.
     ///
     /// W1 wires the source drift watcher to the same audit sink as
@@ -140,9 +186,9 @@ impl AuditRuntimeConfig {
     ///
     /// This helper rejects either failure mode at startup. Disabled
     /// configs (`path = None`) always pass. Enabled configs canonicalize
-    /// the audit log target — using the parent + filename when the file
-    /// itself does not yet exist — and refuse to proceed if the resolved
-    /// path lies under `source_canonical`.
+    /// the audit log target — following dangling symlinks and using the
+    /// parent + filename when the target does not yet exist — and refuse
+    /// to proceed if the resolved path lies under `source_canonical`.
     ///
     /// Resolution failures (audit log parent missing, permission denied)
     /// are treated as a "do not know" signal and are deferred to
@@ -152,27 +198,8 @@ impl AuditRuntimeConfig {
         &self,
         source_canonical: &Path,
     ) -> Result<(), AuditPathError> {
-        let Some(audit_log) = self.path.as_ref() else {
-            return Ok(());
-        };
-        let audit_canonical = match resolve_audit_path(audit_log) {
-            Ok(p) => p,
-            // Couldn't resolve the audit log location lexically. The
-            // ambiguity is genuine (e.g. parent does not exist yet); let
-            // build_sink surface the underlying io::Error rather than
-            // guess. The inside-source check is intentionally skipped
-            // here — false positives would refuse legitimate paths just
-            // because their parent could not be canonicalized.
-            Err(_) => return Ok(()),
-        };
-        if audit_canonical.starts_with(source_canonical) {
-            return Err(AuditPathError::InsideSource {
-                audit_log: audit_log.clone(),
-                source_canonical: source_canonical.to_path_buf(),
-                audit_canonical,
-            });
-        }
-        Ok(())
+        self.resolve_audit_path_outside_source(source_canonical)
+            .map(|_| ())
     }
 
     /// Construct an audit sink from the runtime configuration.
@@ -248,27 +275,62 @@ impl std::fmt::Display for AuditPathError {
 
 impl std::error::Error for AuditPathError {}
 
-/// Resolve an audit log target to an absolute, lexically-clean path.
+/// Resolve an audit log target to the path a later open would act on:
+/// follow every symlinked final component (bounded, like the kernel) and
+/// canonicalize the rest.
 ///
-/// If the file already exists, [`Path::canonicalize`] is used directly.
-/// Otherwise we canonicalize the parent directory and append the
-/// filename, so callers can validate paths that don't yet exist on disk
-/// (which is the common case — the audit log is created by
-/// [`JsonlFileAuditSink::new`]). Returns the underlying [`std::io::Error`]
-/// when neither the path nor its parent can be canonicalized.
+/// Relative paths (including bare filenames whose `parent()` is empty) are
+/// anchored against the process current working directory before walking
+/// symlinks. Dangling symlinks are followed too, because a plain
+/// `open(O_CREAT)` would follow them and create the target inside the
+/// source tree. Returns the underlying [`std::io::Error`] when neither the
+/// path nor its parent can be resolved, or `ELOOP` on symlink loops.
 fn resolve_audit_path(audit_log: &Path) -> std::io::Result<PathBuf> {
-    if audit_log.exists() {
-        return audit_log.canonicalize();
+    // A relative path is resolved against the process cwd; `parent()` of a
+    // bare filename is the empty path, whose `canonicalize()` fails with
+    // ENOENT and would otherwise defer validation to `build_sink`.
+    let path = if audit_log.is_absolute() {
+        audit_log.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(audit_log)
+    };
+    let mut current = path;
+    for _ in 0..32 {
+        match std::fs::symlink_metadata(&current) {
+            // A real entry ends the chain: canonicalize still resolves any
+            // symlinked parent components.
+            Ok(meta) if !meta.file_type().is_symlink() => return current.canonicalize(),
+            // Follow symlinks (including dangling ones) so validation sees
+            // the true destination rather than the link's own directory.
+            Ok(_) => {
+                let target = std::fs::read_link(&current)?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"))
+                        .join(target)
+                };
+            }
+            // Nothing exists at the final component: canonicalize its parent
+            // and append the filename.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let parent = current.parent().unwrap_or_else(|| Path::new("."));
+                let parent_canonical = parent.canonicalize()?;
+                let file_name = current.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "audit log path has no file name component",
+                    )
+                })?;
+                return Ok(parent_canonical.join(file_name));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let parent = audit_log.parent().unwrap_or_else(|| Path::new("."));
-    let parent_canonical = parent.canonicalize()?;
-    let file_name = audit_log.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "audit log path has no file name component",
-        )
-    })?;
-    Ok(parent_canonical.join(file_name))
+    // ELOOP: matches open(2) on a symlink loop or an excessively deep chain.
+    Err(std::io::Error::from_raw_os_error(libc::ELOOP))
 }
 
 /// Stable string mapping for [`SkillEventKind`].
@@ -373,8 +435,111 @@ pub struct JsonlFileAuditSink {
     worker: Option<JoinHandle<()>>,
 }
 
+/// Open the audit log without following symlinks at any parent or leaf
+/// component, and refuse hard-linked targets that may alias a file inside
+/// the source tree.
+///
+/// `O_NOFOLLOW` on a plain `open` guards only the final component; walking
+/// each directory component from `/` with
+/// `openat(O_PATH | O_DIRECTORY | O_NOFOLLOW)` pins every ancestor to the
+/// real directory it resolved to and fails with `ELOOP`/`ENOTDIR` if any
+/// parent was swapped for a symlink after validation. Using `O_PATH` for
+/// parent anchors keeps search+write-only (`0300`) directories usable.
+///
+/// Relative paths are refused: callers must resolve user-supplied paths
+/// via [`AuditRuntimeConfig::resolve_audit_path_outside_source`] before
+/// opening so `cwd`, `..`, and legitimate external directory symlinks are
+/// resolved once at validation time rather than re-resolved at open time.
+fn open_audit_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let raw_bytes = path.as_os_str().as_bytes();
+    if raw_bytes.ends_with(b"/") || raw_bytes.ends_with(b"/.") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "audit log path must name a file, not a directory",
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| parent.is_absolute())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "audit log path must be absolute so every component can be checked",
+            )
+        })?;
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "audit log path has no file name component",
+        )
+    })?;
+
+    let mut dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open("/")?;
+    for component in parent.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                dir = openat_leaf(
+                    &dir,
+                    name,
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                    0,
+                )?;
+            }
+            // The path was canonicalized before it was approved, so neither `.`
+            // nor `..` can appear; resolving one here would step over a
+            // component nobody checked.
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("audit log path component {other:?} is not a plain directory name"),
+                ));
+            }
+        }
+    }
+
+    let file = openat_leaf(
+        &dir,
+        leaf,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW,
+        0o666,
+    )?;
+    refuse_aliased_target(&file, path)?;
+    Ok(file)
+}
+
+/// Refuse an audit log target whose inode has more than one directory entry.
+///
+/// Path canonicalization cannot detect a hard link from outside the source
+/// tree to a file inside it, and `O_NOFOLLOW` only rejects symlinks. A
+/// freshly created or singly linked log (`nlink == 1`) is provably disjoint
+/// from any file in the source tree; anything with `nlink > 1` is rejected
+/// before the writer thread starts so no audit record can corrupt a source
+/// file.
+fn refuse_aliased_target(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let links = file.metadata()?.nlink();
+    if links > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to open audit log '{}': it has {links} hard links, so a file inside \
+                 the source tree could be this same inode and would receive these appends; \
+                 only a singly linked target is proven disjoint from the source",
+                path.display(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl JsonlFileAuditSink {
-    /// Open the audit log at `config.path` and spawn the background writer.
+    /// Open the audit log at `config.path` via [`open_audit_log`] and spawn
+    /// the background writer.
     pub fn new(config: AuditConfig) -> std::io::Result<Self> {
         let capacity = if config.queue_capacity == 0 {
             DEFAULT_AUDIT_QUEUE_CAPACITY
@@ -382,10 +547,7 @@ impl JsonlFileAuditSink {
             config.queue_capacity
         };
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.path)?;
+        let file = open_audit_log(&config.path)?;
 
         let (tx, rx) = sync_channel::<SkillEvent>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -953,5 +1115,439 @@ mod tests {
             msg.contains(&inside.display().to_string()),
             "missing audit log in: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_audit_path_outside_source_rejects_dangling_symlink_into_source() {
+        let source = tempfile::tempdir().unwrap();
+        let source_canonical = source.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let planted = source.path().join("planted-audit.jsonl");
+        let link = outside.path().join("audit-link.jsonl");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        assert!(
+            !planted.exists(),
+            "precondition: symlink target is dangling"
+        );
+
+        let cfg = AuditRuntimeConfig::enabled(&link);
+        let err = cfg
+            .validate_audit_path_outside_source(&source_canonical)
+            .expect_err("dangling symlink targeting source must be rejected");
+        match err {
+            AuditPathError::InsideSource {
+                audit_log,
+                source_canonical: src,
+                audit_canonical,
+            } => {
+                assert_eq!(audit_log, link);
+                assert_eq!(src, source_canonical);
+                assert_eq!(
+                    audit_canonical,
+                    source_canonical.join("planted-audit.jsonl")
+                );
+            }
+        }
+
+        // Chained dangling symlinks (hop1 -> hop2 -> source/nested/audit.jsonl)
+        // must also resolve into source and be rejected.
+        let nested = source.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let nested_target = nested.join("chained-audit.jsonl");
+        let hop2 = outside.path().join("hop2.jsonl");
+        let hop1 = outside.path().join("hop1.jsonl");
+        std::os::unix::fs::symlink(&nested_target, &hop2).unwrap();
+        std::os::unix::fs::symlink("hop2.jsonl", &hop1).unwrap();
+
+        let err = AuditRuntimeConfig::enabled(&hop1)
+            .validate_audit_path_outside_source(&source_canonical)
+            .expect_err("chained dangling symlinks targeting source must be rejected");
+        match err {
+            AuditPathError::InsideSource {
+                audit_canonical, ..
+            } => {
+                assert_eq!(
+                    audit_canonical,
+                    source_canonical.join("nested").join("chained-audit.jsonl")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_audit_path_outside_source_handles_bare_relative_filename() {
+        let bare = Path::new("relative-audit.jsonl");
+        let resolved =
+            resolve_audit_path(bare).expect("bare relative audit path must resolve via cwd");
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("relative-audit.jsonl"));
+
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let cfg = AuditRuntimeConfig::enabled(bare);
+        let err = cfg
+            .validate_audit_path_outside_source(&cwd)
+            .expect_err("bare relative audit log inside cwd/source must be rejected");
+        assert!(matches!(err, AuditPathError::InsideSource { .. }));
+
+        let disjoint_source = tempfile::tempdir().unwrap();
+        let disjoint_canonical = disjoint_source.path().canonicalize().unwrap();
+        let approved = cfg
+            .resolve_audit_path_outside_source(&disjoint_canonical)
+            .expect("bare relative audit log outside source must pass")
+            .expect("bare relative audit log must yield canonical path");
+        assert_eq!(approved, resolved);
+    }
+
+    #[test]
+    fn jsonl_file_sink_rejects_dangling_symlink_leaf() {
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let planted = source.path().join("dangling-target.jsonl");
+        let link = outside.path().join("audit-link.jsonl");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+
+        let err = match JsonlFileAuditSink::new(AuditConfig::new(&link)) {
+            Ok(_) => panic!("dangling symlink leaf must be refused at open time"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP for symlink leaf, got {err:?}"
+        );
+        assert!(
+            !planted.exists(),
+            "refused dangling symlink must not create target inside source"
+        );
+    }
+
+    #[test]
+    fn jsonl_file_sink_rejects_existing_symlink_leaf() {
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let manifest = source.path().join("SKILL.md");
+        std::fs::write(&manifest, "# trusted manifest\n").unwrap();
+        let link = outside.path().join("audit-link.jsonl");
+        std::os::unix::fs::symlink(&manifest, &link).unwrap();
+
+        let err = match JsonlFileAuditSink::new(AuditConfig::new(&link)) {
+            Ok(_) => panic!("existing symlink leaf must be refused at open time"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP for symlink leaf, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            b"# trusted manifest\n",
+            "refused symlink target must remain unmodified"
+        );
+    }
+
+    #[test]
+    fn jsonl_file_sink_rejects_symlinked_parent_swapped_after_validation() {
+        let source = tempfile::tempdir().unwrap();
+        let source_canonical = source.path().canonicalize().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap();
+        let log_dir = outside.join("audit-dir");
+        std::fs::create_dir(&log_dir).unwrap();
+        let log = log_dir.join("audit.jsonl");
+
+        let cfg = AuditRuntimeConfig::enabled(&log);
+        cfg.validate_audit_path_outside_source(&source_canonical)
+            .expect("external audit directory must pass validation");
+
+        // Swap the validated parent directory for a symlink into source.
+        let displaced = outside.join("audit-dir-moved");
+        std::fs::rename(&log_dir, &displaced).unwrap();
+        std::os::unix::fs::symlink(source.path(), &log_dir).unwrap();
+
+        let err = match cfg.build_sink() {
+            Ok(_) => panic!("parent replaced by symlink into source must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+            "expected ELOOP/ENOTDIR for symlinked parent, got {err:?}"
+        );
+        assert!(
+            !source.path().join("audit.jsonl").exists(),
+            "audit log must not be created inside source"
+        );
+        assert!(
+            !displaced.join("audit.jsonl").exists(),
+            "open must fail closed rather than write through displaced directory"
+        );
+    }
+
+    #[test]
+    fn jsonl_file_sink_rejects_hard_link_to_source_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let source_canonical = source.path().canonicalize().unwrap();
+        let manifest = source.path().join("SKILL.md");
+        std::fs::write(&manifest, "# trusted manifest\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join("audit.jsonl");
+        std::fs::hard_link(&manifest, &link).expect("create external hard link");
+        assert_eq!(std::fs::metadata(&manifest).unwrap().nlink(), 2);
+
+        let cfg = AuditRuntimeConfig::enabled(&link);
+        cfg.validate_audit_path_outside_source(&source_canonical)
+            .expect("external hard-link path itself lies outside source");
+
+        let err = match cfg.build_sink() {
+            Ok(_) => panic!("hard-linked audit log aliasing another inode must be refused"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("hard links"),
+            "expected hard-link refusal message, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            b"# trusted manifest\n",
+            "refused hard link target must not be modified"
+        );
+    }
+
+    #[test]
+    fn jsonl_file_sink_creates_new_and_appends_to_existing_audit_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let log_dir = base.join("write-only");
+        std::fs::create_dir(&log_dir).unwrap();
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let log = log_dir.join("audit.jsonl");
+
+        // First open creates the non-existent file even under a 0300 parent.
+        {
+            let sink = JsonlFileAuditSink::new(AuditConfig::new(&log))
+                .expect("creating new audit log under write-only parent must succeed");
+            sink.emit(&SkillEvent::new(SkillEventKind::Open).with_skill_name("alpha"));
+            drop(sink);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::fs::read_to_string(&log)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+                < 1
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for first event"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        // Second open appends to the existing singly-linked file without truncating.
+        {
+            let sink = JsonlFileAuditSink::new(AuditConfig::new(&log))
+                .expect("reopening existing audit log must succeed");
+            sink.emit(&SkillEvent::new(SkillEventKind::Write).with_skill_name("beta"));
+            drop(sink);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::fs::read_to_string(&log)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+                < 2
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for second event"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        let body = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 appended lines, got: {body:?}");
+        assert_eq!(parse_line(lines[0])["skill"], "alpha");
+        assert_eq!(parse_line(lines[1])["skill"], "beta");
+
+        // Restore listability so tempdir cleanup succeeds.
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn resolve_and_open_reject_symlink_loop_with_eloop() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let err = resolve_audit_path(&a).expect_err("symlink loop must fail resolution");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+        let open_err = match JsonlFileAuditSink::new(AuditConfig::new(&a)) {
+            Ok(_) => panic!("symlink loop must be refused at open time"),
+            Err(err) => err,
+        };
+        assert_eq!(open_err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn jsonl_file_sink_rejects_relative_and_non_canonical_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let sub = base.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        let raw_rel_err = match JsonlFileAuditSink::new(AuditConfig::new("relative-audit.jsonl")) {
+            Ok(_) => panic!("raw relative path must be rejected at open time"),
+            Err(err) => err,
+        };
+        assert_eq!(raw_rel_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let with_dotdot = sub.join("..").join("audit.jsonl");
+        let err = match JsonlFileAuditSink::new(AuditConfig::new(&with_dotdot)) {
+            Ok(_) => panic!("parent-dir component must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let rel_cur_err = match JsonlFileAuditSink::new(AuditConfig::new("./rel-audit.jsonl")) {
+            Ok(_) => panic!("relative ./ path must be rejected at open time"),
+            Err(err) => err,
+        };
+        assert_eq!(rel_cur_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let trailing_dot = PathBuf::from(format!("{}/.", base.join("audit.jsonl").display()));
+        let dot_err = match JsonlFileAuditSink::new(AuditConfig::new(&trailing_dot)) {
+            Ok(_) => panic!("trailing /. must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(dot_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let trailing_slash = PathBuf::from(format!("{}/", base.join("audit.jsonl").display()));
+        let slash_err = match JsonlFileAuditSink::new(AuditConfig::new(&trailing_slash)) {
+            Ok(_) => panic!("trailing slash must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(slash_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let dir_err = match JsonlFileAuditSink::new(AuditConfig::new(&sub)) {
+            Ok(_) => panic!("directory target must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            dir_err.kind() == std::io::ErrorKind::IsADirectory
+                || dir_err.raw_os_error() == Some(libc::EISDIR),
+            "expected EISDIR for directory target, got {dir_err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_outside_source_allows_dotdot_and_external_symlink_parent_then_builds_sink() {
+        let source = tempfile::tempdir().unwrap();
+        let source_canonical = source.path().canonicalize().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap();
+
+        // 1. Disabled and unresolvable configs return Ok(None).
+        assert_eq!(
+            AuditRuntimeConfig::disabled()
+                .resolve_audit_path_outside_source(&source_canonical)
+                .unwrap(),
+            None
+        );
+        let missing_cfg = AuditRuntimeConfig::enabled("/nonexistent/skillfs-audit/audit.jsonl");
+        assert_eq!(
+            missing_cfg
+                .resolve_audit_path_outside_source(&source_canonical)
+                .unwrap(),
+            None
+        );
+        assert!(missing_cfg.build_sink().is_err());
+
+        // 2. Path with `..` resolving outside source works end-to-end.
+        let sub = outside.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let dotdot_path = sub.join("..").join("dotdot-audit.jsonl");
+        let mut cfg = AuditRuntimeConfig::enabled(&dotdot_path);
+        let resolved = cfg
+            .resolve_audit_path_outside_source(&source_canonical)
+            .expect("valid .. path outside source must resolve")
+            .expect("must return canonical path");
+        assert_eq!(resolved, outside.join("dotdot-audit.jsonl"));
+        cfg.path = Some(resolved.clone());
+        let sink = cfg
+            .build_sink()
+            .expect("resolved .. path must open cleanly")
+            .expect("sink");
+        sink.emit(&SkillEvent::new(SkillEventKind::Open).with_skill_name("dotdot"));
+        drop(sink);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&resolved)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+            < 1
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // 3. Valid external symlinked parent (like Linux /var/run -> /run)
+        // resolves once to its canonical directory and opens cleanly.
+        let real_run = outside.join("real-run");
+        std::fs::create_dir(&real_run).unwrap();
+        let var_run = outside.join("var-run");
+        std::os::unix::fs::symlink(&real_run, &var_run).unwrap();
+        let symlinked_parent_log = var_run.join("audit.jsonl");
+        let mut sym_cfg = AuditRuntimeConfig::enabled(&symlinked_parent_log);
+        let sym_resolved = sym_cfg
+            .resolve_audit_path_outside_source(&source_canonical)
+            .expect("external symlinked parent must resolve")
+            .expect("must return canonical path");
+        assert_eq!(sym_resolved, real_run.join("audit.jsonl"));
+        sym_cfg.path = Some(sym_resolved.clone());
+        let sink = sym_cfg
+            .build_sink()
+            .expect("resolved path under external symlinked parent must open")
+            .expect("sink");
+        sink.emit(&SkillEvent::new(SkillEventKind::Write).with_skill_name("varrun"));
+        drop(sink);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&sym_resolved)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+            < 1
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // 4. External symlink leaf swapped into source after validation cannot
+        // redirect the sink once the resolved path is kept.
+        let approved = outside.join("approved.jsonl");
+        let leaf_link = outside.join("leaf-link.jsonl");
+        std::os::unix::fs::symlink(&approved, &leaf_link).unwrap();
+        let mut leaf_cfg = AuditRuntimeConfig::enabled(&leaf_link);
+        let leaf_resolved = leaf_cfg
+            .resolve_audit_path_outside_source(&source_canonical)
+            .expect("external symlink leaf must resolve")
+            .expect("must return canonical path");
+        assert_eq!(leaf_resolved, approved);
+        let planted = source.path().join("planted-after-validate.jsonl");
+        std::fs::remove_file(&leaf_link).unwrap();
+        std::os::unix::fs::symlink(&planted, &leaf_link).unwrap();
+        leaf_cfg.path = Some(leaf_resolved);
+        let sink = leaf_cfg
+            .build_sink()
+            .expect("opening approved canonical path must ignore later link swap")
+            .expect("sink");
+        drop(sink);
+        assert!(approved.exists());
+        assert!(!planted.exists());
     }
 }

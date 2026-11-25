@@ -1560,7 +1560,7 @@ async fn cmd_mount(
     // present but the file cannot be opened, surface a startup error and
     // refuse to mount rather than silently downgrading — operators who ask
     // for audit logging must not be left without it.
-    let audit_runtime = AuditRuntimeConfig {
+    let mut audit_runtime = AuditRuntimeConfig {
         path: audit_log.clone(),
         queue_capacity: audit_queue_capacity,
     };
@@ -1571,10 +1571,14 @@ async fn cmd_mount(
     // corrupting the manifest SkillFS is meant to protect. The check is
     // ordered before `build_sink` so a rejected configuration never
     // creates the audit log file on disk. Disabled audit configs always
-    // pass.
-    audit_runtime
-        .validate_audit_path_outside_source(source_roots.physical_source_root())
-        .map_err(|e| format!("{}", e))?;
+    // pass. Keep the resolved canonical path so `build_sink` opens the
+    // exact target this guard approved instead of re-resolving the raw flag.
+    if let Some(resolved) = audit_runtime
+        .resolve_audit_path_outside_source(source_roots.physical_source_root())
+        .map_err(|e| format!("{}", e))?
+    {
+        audit_runtime.path = Some(resolved);
+    }
     // N3 source-tree guard: reject --activation-events-log inside source,
     // same rationale as audit. Ordered before the file is opened so a
     // rejected path never creates the log file on disk.

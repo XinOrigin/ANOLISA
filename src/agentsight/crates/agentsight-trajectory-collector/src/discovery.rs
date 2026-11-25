@@ -446,7 +446,7 @@ fn discover_in_flat_dir_recursive(
             continue;
         }
         let stem = name.trim_end_matches(".jsonl");
-        if stem.is_empty() {
+        if stem.is_empty() || !path.is_file() {
             continue;
         }
         sessions.push(DiscoveredSession {
@@ -576,7 +576,7 @@ fn discover_in_chats_project(chats: &Path, project: &str, source: &str) -> Vec<D
         else {
             continue;
         };
-        if stem.is_empty() {
+        if stem.is_empty() || !path.is_file() {
             continue;
         }
         sessions.push(DiscoveredSession {
@@ -621,8 +621,12 @@ fn discover_chats_subagents(
         if stem.is_empty() {
             continue;
         }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
         sessions.push(DiscoveredSession {
-            path: entry.path(),
+            path,
             project: project.to_string(),
             session_id: format!("{parent}:subagent:{stem}"),
             is_subagent: true,
@@ -673,7 +677,7 @@ fn discover_in_project_dir(
         if !is_dir && name.ends_with(".jsonl") {
             let stem = name.trim_end_matches(".jsonl");
             // Skip agent-* files (sub-agents are stored under subagents/)
-            if stem.starts_with("agent-") || !is_valid_session_id(stem) {
+            if stem.starts_with("agent-") || !is_valid_session_id(stem) || !path.is_file() {
                 continue;
             }
             sessions.push(DiscoveredSession {
@@ -705,9 +709,10 @@ fn discover_in_project_dir(
                 let sub_stem = sub_name
                     .trim_end_matches(".jsonl")
                     .trim_start_matches("agent-");
-                if is_valid_subagent_stem(sub_stem) {
+                let sub_path = sub_entry.path();
+                if is_valid_subagent_stem(sub_stem) && sub_path.is_file() {
                     sessions.push(DiscoveredSession {
-                        path: sub_entry.path(),
+                        path: sub_path,
                         project: project.to_string(),
                         session_id: format!("{name}:subagent:{sub_stem}"),
                         is_subagent: true,
@@ -978,6 +983,154 @@ mod tests {
         assert_eq!(sessions.len(), 1, "normalized root: {sessions:?}");
         assert_eq!(sessions[0].source, "gemini-cli");
         assert_eq!(sessions[0].session_id, "session-x");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_discover_skips_directories_with_session_suffixes() {
+        // PerProject: directories named <uuid>.jsonl/ and agent-*.jsonl/ must be skipped.
+        let projects = tmp_projects_dir("skip-dir-per-project");
+        let proj = projects.join("-data-myapp");
+        let sub = proj.join(UUID_A).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(proj.join(format!("{UUID_A}.jsonl")), "{}\n").unwrap();
+        std::fs::create_dir_all(proj.join(format!("{UUID_B}.jsonl"))).unwrap();
+        std::fs::write(sub.join(format!("agent-{UUID_B}.jsonl")), "{}\n").unwrap();
+        std::fs::create_dir_all(sub.join("agent-x.jsonl")).unwrap();
+        std::fs::create_dir_all(sub.join("agent-aExplore-deadbeef.jsonl")).unwrap();
+
+        let per_project_sessions = discover_sessions(Some(std::slice::from_ref(&projects)));
+        assert_eq!(
+            per_project_sessions.len(),
+            2,
+            "only real main + subagent files should be discovered: {per_project_sessions:?}"
+        );
+        assert!(per_project_sessions
+            .iter()
+            .any(|s| !s.is_subagent && s.session_id == UUID_A));
+        assert!(per_project_sessions
+            .iter()
+            .any(|s| s.is_subagent && s.session_id == format!("{UUID_A}:subagent:{UUID_B}")));
+        let _ = std::fs::remove_dir_all(&projects);
+
+        // Gemini Chats: directories named *.jsonl/ and *.json/ under chats/<parent>/ must be skipped.
+        let gemini_base = tmp_projects_dir("skip-dir-gemini");
+        let gemini_root = gemini_base.join(".gemini").join("tmp");
+        let chats = gemini_root.join("demo-slug").join("chats");
+        let parent = "b7c9ed01-1234-4abc-9def-aabbccddeeff";
+        let sub_dir = chats.join(parent);
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(chats.join("session-main.jsonl"), "{}\n").unwrap();
+        std::fs::write(chats.join("session-legacy.json"), "{}\n").unwrap();
+        std::fs::write(sub_dir.join("sub-real.jsonl"), "{}\n").unwrap();
+        std::fs::write(sub_dir.join("sub-legacy.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(sub_dir.join("sub.jsonl")).unwrap();
+        std::fs::create_dir_all(sub_dir.join("sub.json")).unwrap();
+
+        let gemini_sessions = discover_sessions(Some(std::slice::from_ref(&gemini_root)));
+        assert_eq!(
+            gemini_sessions.len(),
+            4,
+            "only real chats + subagent files should be discovered: {gemini_sessions:?}"
+        );
+        assert!(gemini_sessions.iter().all(|s| s.path.is_file()));
+        assert!(gemini_sessions
+            .iter()
+            .any(|s| s.is_subagent && s.session_id == format!("{parent}:subagent:sub-real")));
+        assert!(gemini_sessions
+            .iter()
+            .any(|s| s.is_subagent && s.session_id == format!("{parent}:subagent:sub-legacy")));
+        let _ = std::fs::remove_dir_all(&gemini_base);
+
+        // Flat: directory with .jsonl suffix is traversed, never emitted as a session.
+        let flat_base = tmp_projects_dir("skip-dir-flat");
+        let flat_root = flat_base.join(".codex").join("sessions");
+        let dir_with_suffix = flat_root.join("2026").join("nested.jsonl");
+        std::fs::create_dir_all(&dir_with_suffix).unwrap();
+        std::fs::write(dir_with_suffix.join("rollout-real.jsonl"), "{}\n").unwrap();
+
+        let flat_sessions = discover_sessions(Some(std::slice::from_ref(&flat_root)));
+        assert_eq!(
+            flat_sessions.len(),
+            1,
+            "flat layout should emit only the real file: {flat_sessions:?}"
+        );
+        assert_eq!(flat_sessions[0].session_id, "rollout-real");
+        assert!(flat_sessions[0].path.is_file());
+        let _ = std::fs::remove_dir_all(&flat_base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_skips_symlinked_dirs_and_keeps_symlinked_files() {
+        let base = tmp_projects_dir("symlink-session-entries");
+        let targets = base.join("targets");
+        let target_dir = targets.join("a-dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target_file = targets.join("real.jsonl");
+        std::fs::write(&target_file, "{}\n").unwrap();
+
+        // PerProject: symlink to file kept, symlink to dir skipped (main + subagent).
+        let projects = base.join("projects");
+        let proj = projects.join("-data-myapp");
+        let sub = proj.join(UUID_A).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::os::unix::fs::symlink(&target_file, proj.join(format!("{UUID_A}.jsonl"))).unwrap();
+        std::os::unix::fs::symlink(&target_dir, proj.join(format!("{UUID_B}.jsonl"))).unwrap();
+        std::os::unix::fs::symlink(&target_file, sub.join("agent-linkfile.jsonl")).unwrap();
+        std::os::unix::fs::symlink(&target_dir, sub.join("agent-linkdir.jsonl")).unwrap();
+
+        let per_project_sessions = discover_sessions(Some(std::slice::from_ref(&projects)));
+        assert_eq!(
+            per_project_sessions.len(),
+            2,
+            "per-project symlinked files kept, symlinked dirs skipped: {per_project_sessions:?}"
+        );
+        assert!(per_project_sessions
+            .iter()
+            .any(|s| !s.is_subagent && s.session_id == UUID_A));
+        assert!(per_project_sessions
+            .iter()
+            .any(|s| s.is_subagent && s.session_id == format!("{UUID_A}:subagent:linkfile")));
+
+        // Gemini Chats: symlink to file kept, symlink to dir skipped (chats + subagent).
+        let gemini_root = base.join(".gemini").join("tmp");
+        let chats = gemini_root.join("demo-slug").join("chats");
+        let parent = "parent-session";
+        let sub_dir = chats.join(parent);
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::os::unix::fs::symlink(&target_file, chats.join("link-main.jsonl")).unwrap();
+        std::os::unix::fs::symlink(&target_dir, chats.join("link-dir.json")).unwrap();
+        std::os::unix::fs::symlink(&target_file, sub_dir.join("link-sub.json")).unwrap();
+        std::os::unix::fs::symlink(&target_dir, sub_dir.join("link-subdir.jsonl")).unwrap();
+
+        let gemini_sessions = discover_sessions(Some(std::slice::from_ref(&gemini_root)));
+        assert_eq!(
+            gemini_sessions.len(),
+            2,
+            "gemini symlinked files kept, symlinked dirs skipped: {gemini_sessions:?}"
+        );
+        assert!(gemini_sessions
+            .iter()
+            .any(|s| !s.is_subagent && s.session_id == "link-main"));
+        assert!(gemini_sessions
+            .iter()
+            .any(|s| s.is_subagent && s.session_id == format!("{parent}:subagent:link-sub")));
+
+        // Flat: symlink to file kept, symlink to dir skipped.
+        let flat_root = base.join(".codex").join("sessions");
+        std::fs::create_dir_all(&flat_root).unwrap();
+        std::os::unix::fs::symlink(&target_file, flat_root.join("rollout-link.jsonl")).unwrap();
+        std::os::unix::fs::symlink(&target_dir, flat_root.join("rollout-dir.jsonl")).unwrap();
+
+        let flat_sessions = discover_sessions(Some(std::slice::from_ref(&flat_root)));
+        assert_eq!(
+            flat_sessions.len(),
+            1,
+            "flat symlinked file kept, symlinked dir skipped: {flat_sessions:?}"
+        );
+        assert_eq!(flat_sessions[0].session_id, "rollout-link");
 
         let _ = std::fs::remove_dir_all(&base);
     }

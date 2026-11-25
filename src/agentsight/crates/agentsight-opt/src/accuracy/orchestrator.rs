@@ -148,7 +148,12 @@ fn raw_to_acc_issue(raw: RawIssue, inv: &TraceInventory) -> AccIssue {
     // Recovery requires the same recorded file target, not only its preview.
     let (evidence, at, recovered) = match raw.tool_call_id.as_deref() {
         Some(id) => {
-            if let Some(rec) = inv.tool_calls.iter().find(|c| c.call_id == id) {
+            if let Some((idx, rec)) = inv
+                .tool_calls
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.call_id == id)
+            {
                 let ev = format!(
                     "{} {}{}",
                     rec.name,
@@ -156,7 +161,7 @@ fn raw_to_acc_issue(raw: RawIssue, inv: &TraceInventory) -> AccIssue {
                     if rec.err { " ✗" } else { "" }
                 );
                 let at_str = format!("@{}s", rec.start.round() as i64);
-                let rec_later = rec.err && recovered_later(&inv.tool_calls, rec);
+                let rec_later = rec.err && recovered_later(&inv.tool_calls, idx);
                 (ev, at_str, rec_later)
             } else {
                 (String::new(), String::new(), false)
@@ -194,16 +199,26 @@ fn raw_to_acc_issue(raw: RawIssue, inv: &TraceInventory) -> AccIssue {
 }
 
 /// Whether an errored call was later followed by a successful matching call.
-fn recovered_later(
-    calls: &[crate::types::ToolCallRecord],
-    errored: &crate::types::ToolCallRecord,
-) -> bool {
+fn recovered_later(calls: &[crate::types::ToolCallRecord], errored_idx: usize) -> bool {
+    let Some(errored) = calls.get(errored_idx) else {
+        return false;
+    };
+    let Some(later_calls) = errored_idx
+        .checked_add(1)
+        .and_then(|next| calls.get(next..))
+    else {
+        return false;
+    };
     // `cmd` is a ~50-character display preview. Two Bash commands that share
     // that prefix are not the same command, and Bash records no separate
     // target, so recovery must compare complete execution evidence when the
     // record carries it. Legacy records without it keep the preview fallback.
+    //
+    // Require both a later slice position and a non-decreasing timestamp so
+    // untimed traces (all `start == 0.0`) and same-second retries count as
+    // recovered while earlier calls and reversed timestamps do not.
     let errored_command = errored.execution_command();
-    calls.iter().any(|c| {
+    later_calls.iter().any(|c| {
         let same_command = match (c.execution_command(), &errored_command) {
             (Some(candidate), Some(errored)) => candidate == *errored,
             _ => c.cmd == errored.cmd,
@@ -211,7 +226,7 @@ fn recovered_later(
         c.name == errored.name
             && same_command
             && c.target == errored.target
-            && c.start > errored.start
+            && c.start >= errored.start
             && !c.err
     })
 }
@@ -326,13 +341,13 @@ mod tests {
             make_call("Bash", "git clone url1", 10.0, true),
             make_call("Bash", "git clone url2", 20.0, false), // different cmd → NOT recovered
         ];
-        assert!(!recovered_later(&calls, &calls[0]));
+        assert!(!recovered_later(&calls, 0));
 
         let calls2 = vec![
             make_call("Bash", "git clone url1", 10.0, true),
             make_call("Bash", "git clone url1", 20.0, false), // same cmd → recovered
         ];
-        assert!(recovered_later(&calls2, &calls2[0]));
+        assert!(recovered_later(&calls2, 0));
     }
 
     /// `cmd` is a ~50-character preview; Bash has no separate `target`, so
@@ -347,13 +362,13 @@ mod tests {
         different.command = Some("cargo test --workspace --all-features --test beta".to_string());
 
         assert!(
-            !recovered_later(&[failed.clone(), different.clone()], &failed),
+            !recovered_later(&[failed.clone(), different.clone()], 0),
             "a different command sharing the preview must not count as recovery"
         );
 
         let mut same = different;
         same.command = failed.command.clone();
-        assert!(recovered_later(&[failed.clone(), same], &failed));
+        assert!(recovered_later(&[failed.clone(), same], 0));
     }
 
     fn recorded_file_issue(first_target: &str, second_target: &str) -> AccIssue {
@@ -422,6 +437,125 @@ mod tests {
         let issue = recorded_file_issue(target, target);
         assert!(issue.recovered);
         assert_eq!(issue.tier, "internal-lead");
+    }
+
+    fn untimed_read_issue(first_err: bool, second_err: bool, anchor_call_id: &str) -> AccIssue {
+        let target = "/fixture/config.toml";
+        let doc = serde_json::json!({
+            "schema_version":"ATIF-v1.7", "session_id":"untimed-session",
+            "agent":{"name":"fixture-agent","version":"1"},
+            "steps":[
+                {"step_id":1,"source":"agent","message":"first read", "tool_calls":[
+                    {"tool_call_id":"call-1","function_name":"Read","arguments":{"file_path":target}}
+                ], "observation":{"results":[
+                    {"source_call_id":"call-1","content":"step 1","extra":{"is_error":first_err}}
+                ]}},
+                {"step_id":2,"source":"agent","message":"second read", "tool_calls":[
+                    {"tool_call_id":"call-2","function_name":"Read","arguments":{"file_path":target}}
+                ], "observation":{"results":[
+                    {"source_call_id":"call-2","content":"step 2","extra":{"is_error":second_err}}
+                ]}}
+            ]
+        });
+        let trajectory = crate::atif::AtifTrajectory::from_json(&doc.to_string()).unwrap();
+        let inv = crate::trace::build_inventory(&trajectory);
+        assert_eq!(inv.tool_calls.len(), 2);
+        assert_eq!(inv.tool_calls[0].start, 0.0);
+        assert_eq!(inv.tool_calls[1].start, 0.0);
+        raw_to_acc_issue(
+            RawIssue {
+                symptom: "untimed read failed".into(),
+                defect_type: DefectType::Workflow,
+                primary_object: RootObject::Skill,
+                evidence_tier: EvidenceTier::L1,
+                tool_call_id: Some(anchor_call_id.into()),
+                detail: String::new(),
+                verify: String::new(),
+                fix: String::new(),
+            },
+            &inv,
+        )
+    }
+
+    #[test]
+    fn untimed_atif_retry_counts_as_recovered() {
+        let issue = untimed_read_issue(true, false, "call-1");
+        assert!(
+            issue.recovered,
+            "later successful retry on untimed ATIF trace must recover earlier error"
+        );
+        assert_eq!(issue.tier, "internal-lead");
+    }
+
+    #[test]
+    fn untimed_atif_earlier_success_does_not_recover_later_error() {
+        let issue = untimed_read_issue(false, true, "call-2");
+        assert!(
+            !issue.recovered,
+            "earlier success on untimed ATIF trace must not recover later error"
+        );
+        assert_eq!(issue.tier, "user-failure");
+    }
+
+    fn issue_for_calls(calls: Vec<ToolCallRecord>, anchor_id: &str) -> AccIssue {
+        let inv = make_inv(calls);
+        raw_to_acc_issue(
+            RawIssue {
+                symptom: "bash failed".into(),
+                defect_type: DefectType::Workflow,
+                primary_object: RootObject::Skill,
+                evidence_tier: EvidenceTier::L1,
+                tool_call_id: Some(anchor_id.into()),
+                detail: String::new(),
+                verify: String::new(),
+                fix: String::new(),
+            },
+            &inv,
+        )
+    }
+
+    #[test]
+    fn same_timestamp_retry_counts_as_recovered_and_respects_order() {
+        let mut fail = make_call("Bash", "cargo test", 10.0, true);
+        fail.call_id = "call-1".into();
+        let mut ok = make_call("Bash", "cargo test", 10.0, false);
+        ok.call_id = "call-2".into();
+
+        let retry_issue = issue_for_calls(vec![fail.clone(), ok.clone()], "call-1");
+        assert!(
+            retry_issue.recovered,
+            "same-second later retry must count as recovered"
+        );
+        assert_eq!(retry_issue.tier, "internal-lead");
+
+        let earlier_ok_issue = issue_for_calls(vec![ok, fail], "call-1");
+        assert!(
+            !earlier_ok_issue.recovered,
+            "same-second earlier success must not recover later error"
+        );
+        assert_eq!(earlier_ok_issue.tier, "user-failure");
+    }
+
+    #[test]
+    fn negative_and_reversed_timestamps_preserve_recovery_order() {
+        // Negative timestamps in chronological order still count as recovered.
+        let mut neg_fail = make_call("Bash", "cargo test", -5.0, true);
+        neg_fail.call_id = "neg-1".into();
+        let mut neg_ok = make_call("Bash", "cargo test", -1.0, false);
+        neg_ok.call_id = "neg-2".into();
+        assert!(issue_for_calls(vec![neg_fail, neg_ok], "neg-1").recovered);
+
+        // Later slice entry with an earlier timestamp does not recover.
+        let mut late_fail = make_call("Bash", "cargo test", 20.0, true);
+        late_fail.call_id = "rev-1".into();
+        let mut early_ok = make_call("Bash", "cargo test", 10.0, false);
+        early_ok.call_id = "rev-2".into();
+        assert!(!issue_for_calls(vec![late_fail.clone(), early_ok.clone()], "rev-1").recovered);
+
+        // Earlier slice entry with a later timestamp does not recover.
+        let mut late_ok = make_call("Bash", "cargo test", 30.0, false);
+        late_ok.call_id = "rev-3".into();
+        assert!(!issue_for_calls(vec![late_ok, late_fail], "rev-1").recovered);
     }
 
     #[test]

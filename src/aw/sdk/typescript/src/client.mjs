@@ -150,8 +150,10 @@ export class Instance {
         this.pending = undefined;
         return false;
       }
-      if (result.state === "failed")
+      if (result.state === "failed") {
+        this.pending = undefined;
         throw new AwError(result.error ?? "registration_failed");
+      }
       if (!["pending_ready", "ready"].includes(result.state))
         throw new AwError("registration_unavailable");
       this.pending.handle = result.handle;

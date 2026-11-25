@@ -174,6 +174,56 @@ class Transport(unittest.IsolatedAsyncioTestCase):
         finally:
             await instance.close()
 
+    async def test_failed_registration_query_clears_pending_key_for_retry(self) -> None:
+        attempts = 0
+
+        async def handler(operation: dict) -> tuple:
+            nonlocal attempts
+            if operation["method"] == "status":
+                return {"sdk_protocol": CONTRACT["sdk_protocol"]}, None
+            action = operation["command"]["action"]
+            if action == "register_sdk":
+                attempts += 1
+                if attempts == 1:
+                    raise ConnectionResetError()
+                return {
+                    "state": "pending_ready",
+                    "handle": {"binding": {"instance_id": "instance"}},
+                    "policy_revision": "revision",
+                    "routes": {"events": {}, "hooks": []},
+                }, None
+            if action == "query":
+                return {"state": "failed", "error": "registration_cancelled"}, None
+            return {"state": "ready" if action == "ready" else "released"}, None
+
+        self.handler = handler
+        instance = Instance(
+            endpoint=self.endpoint,
+            target="app",
+            capabilities={},
+            availability="native_fallback",
+            install=lambda _: True,
+        )
+        try:
+            self.assertFalse(await instance.connect())
+            with self.assertRaises(AwError) as raised:
+                await instance.connect()
+            self.assertEqual(raised.exception.code, "registration_cancelled")
+            self.assertTrue(await instance.connect())
+            commands = [
+                row["command"] for row in self.requests if row["method"] == "registration"
+            ]
+            self.assertEqual(
+                [cmd["action"] for cmd in commands],
+                ["register_sdk", "query", "register_sdk", "ready"],
+            )
+            self.assertEqual(commands[0]["key"]["request_id"], commands[1]["key"]["request_id"])
+            self.assertNotEqual(
+                commands[0]["key"]["request_id"], commands[2]["key"]["request_id"]
+            )
+        finally:
+            await instance.close()
+
     async def test_timeout_late_reply_and_user_cancellation_do_not_replay(self) -> None:
         async def handler(_: dict) -> tuple:
             await asyncio.sleep(0.1)

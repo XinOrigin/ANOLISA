@@ -166,6 +166,54 @@ test("lost registration response is recovered by query without a second registra
   }
 });
 
+test("failed registration query clears pending key so the next connect mints a fresh registration", async () => {
+  const commands = [];
+  let attempts = 0;
+  const handle = { binding: { instance_id: "test-instance" } };
+  const peer = await server((operation, reply, socket) => {
+    if (operation.method === "status")
+      return reply({ sdk_protocol: contract.sdk_protocol });
+    const { command } = operation;
+    commands.push(command);
+    if (command.action === "register_sdk") {
+      if (++attempts === 1) return socket.destroy();
+      return reply({
+        state: "pending_ready",
+        handle,
+        policy_revision: "r",
+        routes: { events: {}, hooks: [] },
+      });
+    }
+    if (command.action === "query")
+      return reply({ state: "failed", error: "registration_cancelled" });
+    reply({ state: command.action === "ready" ? "ready" : "released" });
+  });
+  const instance = new Instance({
+    endpoint: peer.endpoint,
+    target: "app",
+    capabilities: {},
+    availability: "native_fallback",
+    install: () => true,
+  });
+  try {
+    assert.equal(await instance.connect(), false);
+    await assert.rejects(
+      instance.connect(),
+      (error) => error.code === "registration_cancelled",
+    );
+    assert.equal(await instance.connect(), true);
+    assert.deepEqual(
+      commands.map((command) => command.action),
+      ["register_sdk", "query", "register_sdk", "ready"],
+    );
+    assert.equal(commands[0].key.request_id, commands[1].key.request_id);
+    assert.notEqual(commands[0].key.request_id, commands[2].key.request_id);
+  } finally {
+    await instance.close();
+    await peer.close();
+  }
+});
+
 test("timeout sends once and ignores late replies; cancellation remains cancellation", async () => {
   let requests = 0;
   const timers = [];

@@ -154,6 +154,7 @@ class Instance:
                 self.pending = None
                 return False
             if state == "failed":
+                self.pending = None
                 raise AwError(result.get("error") or "registration_failed")
             if state not in {"pending_ready", "ready"}:
                 raise AwError("registration_unavailable")

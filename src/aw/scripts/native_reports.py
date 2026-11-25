@@ -86,16 +86,25 @@ def verify_case(case: dict, output: str, directory: Path | None = None) -> None:
                 raise ValueError(f"{case['name']}: invalid {result['file']}: {error}") from error
         return
     if case["report"] == "unittest":
-        found = re.search(r"^Ran (\d+) tests? in ", output, re.MULTILINE)
+        runs = re.findall(r"^Ran (\d+) tests? in ", output, re.MULTILINE)
+        summary = re.search(
+            r"^Ran \d+ tests? in [^\r\n]+\r?\n(?:\r?\n)?OK\r?$",
+            output,
+            re.MULTILINE,
+        )
         passed = (
-            found and int(found[1]) == case["tests"] and re.search(r"^OK$", output, re.MULTILINE)
+            runs == [str(case["tests"])]
+            and summary is not None
+            and re.search(r"^(?:FAILED\b|OK \()", output[summary.end() :], re.MULTILINE) is None
         )
     else:
-        counts = dict(
-            re.findall(r"^# (tests|pass|fail|cancelled|skipped|todo) (\d+)$", output, re.MULTILINE)
+        entries = re.findall(
+            r"^# (tests|pass|fail|cancelled|skipped|todo) (\d+)\r?$", output, re.MULTILINE
         )
+        counts = dict(entries)
         passed = (
-            counts.get("tests") == str(case["tests"])
+            len(entries) == len(counts)
+            and counts.get("tests") == str(case["tests"])
             and counts.get("pass") == str(case["tests"])
             and all(counts.get(key) == "0" for key in ("fail", "cancelled", "skipped", "todo"))
         )

@@ -1334,51 +1334,22 @@ impl SkillFs {
 
         // I4/H3: reject setattr mutations on hidden skills unless
         // the path matches the post-publish grace whitelist.
-        if has_mutation {
-            let reject = match &path_type {
-                PathType::Passthrough {
-                    skill_name,
-                    relative_path,
-                } => self.should_reject_hidden_write(skill_name, Some(relative_path)),
-                PathType::SkillMd { skill_name } => {
-                    self.should_reject_hidden_write(skill_name, Some(Path::new("SKILL.md")))
-                }
-                PathType::NestedPassthrough {
-                    category,
-                    skill_name,
-                    relative_path,
-                } => self.should_reject_hermes_nested_hidden_write(
-                    category,
-                    skill_name,
-                    Some(relative_path),
-                ),
-                PathType::NestedSkillMd {
-                    category,
-                    skill_name,
-                } => self.should_reject_hermes_nested_hidden_write(
-                    category,
-                    skill_name,
-                    Some(Path::new("SKILL.md")),
-                ),
-                _ => false,
-            };
-            if reject {
-                // Audit the rejection with the `hidden_skill` class the
-                // xattr gate established (#5183) so a hidden skill's
-                // chmod/chown/truncate/utimens probes leave a trace — the
-                // same convention the other mutating callbacks follow.
-                self.emit_op_event_with_detail(
-                    req,
-                    &path_type,
-                    SkillEventKind::Metadata,
-                    SkillEventAction::Rejected,
-                    Some(libc::ENOENT),
-                    None,
-                    Some("class=hidden_skill".to_string()),
-                );
-                reply.error(libc::ENOENT);
-                return;
-            }
+        if has_mutation && self.should_reject_hidden_setattr(&path_type) {
+            // Audit the rejection with the `hidden_skill` class the
+            // xattr gate established (#5183) so a hidden skill's
+            // chmod/chown/truncate/utimens probes leave a trace — the
+            // same convention the other mutating callbacks follow.
+            self.emit_op_event_with_detail(
+                req,
+                &path_type,
+                SkillEventKind::Metadata,
+                SkillEventAction::Rejected,
+                Some(libc::ENOENT),
+                None,
+                Some("class=hidden_skill".to_string()),
+            );
+            reply.error(libc::ENOENT);
+            return;
         }
 
         // Physical path handling
@@ -1710,11 +1681,289 @@ impl SkillFs {
             }
         }
     }
+
+    /// I4/H3: hidden-skill write gate for physical `setattr` mutations.
+    ///
+    /// Mirrors `reject_hidden_xattr_write` across every skill-scoped path
+    /// that reaches the shared physical `setattr` path, including Hermes
+    /// `NestedSkillDir` so a cached directory inode for a ledger-hidden
+    /// nested skill cannot mutate mode, ownership, or timestamps. Flat
+    /// `SkillDir` enforces the equivalent check earlier in its virtual
+    /// directory branch before `EISDIR` and ownership checks.
+    fn should_reject_hidden_setattr(&self, path_type: &PathType) -> bool {
+        match path_type {
+            PathType::Passthrough {
+                skill_name,
+                relative_path,
+            } => self.should_reject_hidden_write(skill_name, Some(relative_path)),
+            PathType::SkillMd { skill_name } => {
+                self.should_reject_hidden_write(skill_name, Some(Path::new("SKILL.md")))
+            }
+            PathType::NestedSkillDir {
+                category,
+                skill_name,
+            } => self.should_reject_hermes_nested_hidden_write(category, skill_name, None),
+            PathType::NestedPassthrough {
+                category,
+                skill_name,
+                relative_path,
+            } => self.should_reject_hermes_nested_hidden_write(
+                category,
+                skill_name,
+                Some(relative_path),
+            ),
+            PathType::NestedSkillMd {
+                category,
+                skill_name,
+            } => self.should_reject_hermes_nested_hidden_write(
+                category,
+                skill_name,
+                Some(Path::new("SKILL.md")),
+            ),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use parking_lot::RwLock;
+    use skillfs_core::store::SkillStore;
+    use skillfs_core::transform::TransformPipeline;
+
     use super::*;
+    use crate::path::SkillLayout;
+    use crate::security::{
+        ActiveSkillResolver, ActiveTarget, InMemoryNotifyClient, NotifyController,
+        PendingInstallController, PostPublishGraceController, PostPublishSessionKind,
+        PostPublishWritePattern, StagingConfig, StagingMatcher, StagingPattern,
+    };
+
+    fn hermes_fs_with_resolver(source: &Path, resolver: Arc<ActiveSkillResolver>) -> SkillFs {
+        SkillFs::new_with_pipeline(
+            source.join("mount"),
+            source.to_path_buf(),
+            Arc::new(RwLock::new(SkillStore::new())),
+            false,
+            TransformPipeline::empty(),
+        )
+        .with_skill_layout(SkillLayout::Hermes)
+        .with_active_resolver(resolver)
+    }
+
+    fn write_nested_skill(source: &Path, category: &str, skill_name: &str) -> PathBuf {
+        let dir = source.join(category).join(skill_name);
+        std::fs::create_dir_all(&dir).expect("create nested skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {skill_name}\ndescription: test\n---\nbody\n"),
+        )
+        .expect("write nested SKILL.md");
+        dir
+    }
+
+    #[test]
+    fn hidden_hermes_nested_skill_dir_setattr_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_nested_skill(tmp.path(), "apple", "apple-notes");
+        let resolver = Arc::new(ActiveSkillResolver::new(tmp.path()));
+        let fs = hermes_fs_with_resolver(tmp.path(), resolver.clone());
+
+        let parsed = fs.parse_fuse_path(Path::new("/skills/apple/apple-notes"));
+        assert_eq!(
+            parsed,
+            PathType::NestedSkillDir {
+                category: "apple".to_string(),
+                skill_name: "apple-notes".to_string(),
+            }
+        );
+
+        // Uncertified (absent from resolver) defaults to Hidden and must be rejected.
+        assert!(
+            fs.should_reject_hidden_setattr(&parsed),
+            "absent/uncertified Hermes NestedSkillDir must reject setattr"
+        );
+
+        // Explicit Hidden target must also be rejected, matching NestedSkillMd and NestedPassthrough.
+        resolver.set(
+            "apple/apple-notes",
+            ActiveTarget::Hidden {
+                reason: "quarantined".to_string(),
+            },
+        );
+        assert!(
+            fs.should_reject_hidden_setattr(&parsed),
+            "explicitly hidden Hermes NestedSkillDir must reject setattr"
+        );
+        assert!(fs.should_reject_hidden_setattr(&PathType::NestedSkillMd {
+            category: "apple".to_string(),
+            skill_name: "apple-notes".to_string(),
+        }));
+        assert!(
+            fs.should_reject_hidden_setattr(&PathType::NestedPassthrough {
+                category: "apple".to_string(),
+                skill_name: "apple-notes".to_string(),
+                relative_path: PathBuf::from("scripts/run.sh"),
+            })
+        );
+    }
+
+    #[test]
+    fn current_and_snapshot_hermes_nested_skill_dir_setattr_are_allowed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = write_nested_skill(tmp.path(), "apple", "apple-notes");
+        let resolver = Arc::new(ActiveSkillResolver::new(tmp.path()));
+        let fs = hermes_fs_with_resolver(tmp.path(), resolver.clone());
+        let nested_dir = PathType::NestedSkillDir {
+            category: "apple".to_string(),
+            skill_name: "apple-notes".to_string(),
+        };
+
+        resolver.set(
+            "apple/apple-notes",
+            ActiveTarget::Current {
+                source_dir: skill_dir.clone(),
+            },
+        );
+        assert!(
+            !fs.should_reject_hidden_setattr(&nested_dir),
+            "Current Hermes NestedSkillDir must allow setattr"
+        );
+
+        resolver.set(
+            "apple/apple-notes",
+            ActiveTarget::Snapshot {
+                snapshot_dir: skill_dir.join(".skill-meta/versions/v1"),
+                version: "v1".to_string(),
+            },
+        );
+        assert!(
+            !fs.should_reject_hidden_setattr(&nested_dir),
+            "Snapshot Hermes NestedSkillDir must allow setattr"
+        );
+    }
+
+    #[test]
+    fn non_skill_hermes_category_subdir_setattr_is_allowed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let docs_dir = tmp.path().join("apple/docs");
+        std::fs::create_dir_all(&docs_dir).expect("create non-skill category subdir");
+        std::fs::write(docs_dir.join("readme.txt"), "notes\n").expect("write readme");
+
+        let resolver = Arc::new(ActiveSkillResolver::new(tmp.path()));
+        let fs = hermes_fs_with_resolver(tmp.path(), resolver);
+
+        let parsed = fs.parse_fuse_path(Path::new("/skills/apple/docs"));
+        assert_eq!(
+            parsed,
+            PathType::NestedSkillDir {
+                category: "apple".to_string(),
+                skill_name: "docs".to_string(),
+            }
+        );
+        assert!(
+            !fs.should_reject_hidden_setattr(&parsed),
+            "non-skill category directory without SKILL.md must not be rejected"
+        );
+    }
+
+    #[test]
+    fn staging_pending_and_grace_hermes_nested_skill_dir_setattr_are_allowed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_nested_skill(tmp.path(), ".pip-staging", "apple-notes");
+        write_nested_skill(tmp.path(), "apple", "pending-notes");
+        write_nested_skill(tmp.path(), "apple", "grace-notes");
+
+        let resolver = Arc::new(ActiveSkillResolver::new(tmp.path()));
+        let staging = Arc::new(StagingMatcher::new(StagingConfig {
+            patterns: vec![StagingPattern::Exact(".pip-staging".to_string())],
+            ..StagingConfig::default()
+        }));
+        let notify_client = Arc::new(InMemoryNotifyClient::new());
+        let notify_ctrl = NotifyController::new(
+            notify_client,
+            tmp.path().to_path_buf(),
+            Duration::from_secs(60),
+            5000,
+        );
+        let pending_ctrl = PendingInstallController::new(
+            notify_ctrl.clone(),
+            Duration::from_secs(60),
+            tmp.path().to_path_buf(),
+        );
+        assert!(pending_ctrl.observe_mutation(
+            "apple/pending-notes",
+            Some(Path::new("SKILL.md")),
+            MutationKind::Create,
+        ));
+        let grace_ctrl = PostPublishGraceController::new(
+            Duration::from_secs(60),
+            vec![PostPublishWritePattern::PrefixRecursive(
+                ".clawhub".to_string(),
+            )],
+        );
+
+        let fs = hermes_fs_with_resolver(tmp.path(), resolver.clone())
+            .with_staging_matcher(staging)
+            .with_pending_install_controller(pending_ctrl.clone())
+            .with_post_publish_controller(grace_ctrl.clone());
+
+        // 1. Staging NestedSkillDir is allowed.
+        let staging_dir = PathType::NestedSkillDir {
+            category: ".pip-staging".to_string(),
+            skill_name: "apple-notes".to_string(),
+        };
+        assert!(
+            !fs.should_reject_hidden_setattr(&staging_dir),
+            "staging Hermes NestedSkillDir must allow setattr"
+        );
+
+        // 2. Pending-install NestedSkillDir is allowed until activated/hidden in resolver.
+        let pending_dir = PathType::NestedSkillDir {
+            category: "apple".to_string(),
+            skill_name: "pending-notes".to_string(),
+        };
+        assert!(
+            !fs.should_reject_hidden_setattr(&pending_dir),
+            "pending-install Hermes NestedSkillDir must allow setattr"
+        );
+        resolver.set(
+            "apple/pending-notes",
+            ActiveTarget::Hidden {
+                reason: "rejected".to_string(),
+            },
+        );
+        assert!(
+            fs.should_reject_hidden_setattr(&pending_dir),
+            "once resolver hides skill, pending-install exemption must clear"
+        );
+
+        // 3. Post-publish grace NestedSkillDir is rejected before session, allowed during session.
+        let grace_dir = PathType::NestedSkillDir {
+            category: "apple".to_string(),
+            skill_name: "grace-notes".to_string(),
+        };
+        assert!(
+            fs.should_reject_hidden_setattr(&grace_dir),
+            "without active grace session, unactivated NestedSkillDir must reject setattr"
+        );
+        grace_ctrl.start_session("apple/grace-notes", PostPublishSessionKind::StagingRename);
+        assert!(
+            !fs.should_reject_hidden_setattr(&grace_dir),
+            "active post-publish grace session must allow NestedSkillDir setattr"
+        );
+        grace_ctrl.shutdown();
+        assert!(
+            fs.should_reject_hidden_setattr(&grace_dir),
+            "after grace session ends, hidden NestedSkillDir must reject setattr again"
+        );
+
+        pending_ctrl.shutdown();
+        notify_ctrl.shutdown();
+    }
 
     /// A fd that cannot be duplicated must surface its own errno from the
     /// setattr fd lookup, not be swallowed into the ENOENT "no handle"

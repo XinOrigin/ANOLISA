@@ -1038,6 +1038,7 @@ pub enum AncestorError {
     NoHead,
     BrokenChain { depth: usize },
     NotFound { at_id: String },
+    CycleDetected { at_id: String },
 }
 
 impl std::fmt::Display for AncestorError {
@@ -1057,6 +1058,9 @@ impl std::fmt::Display for AncestorError {
             Self::NotFound { at_id } => {
                 write!(f, "parent snapshot '{at_id}' not found in index")
             }
+            Self::CycleDetected { at_id } => {
+                write!(f, "lineage cycle detected at snapshot '{at_id}'")
+            }
         }
     }
 }
@@ -1069,17 +1073,26 @@ impl SnapshotIndex {
         }
         let head_id = self.head.as_ref().ok_or(AncestorError::NoHead)?;
         let mut current_id = head_id;
-        for depth in 1..n {
-            let meta = self
-                .snapshots
-                .get(current_id)
-                .ok_or_else(|| AncestorError::NotFound {
-                    at_id: current_id.clone(),
-                })?;
-            current_id = meta
-                .parent_id
-                .as_ref()
-                .ok_or(AncestorError::BrokenChain { depth })?;
+        if n > 1 {
+            let mut visited: HashSet<&str> = HashSet::new();
+            visited.insert(current_id.as_str());
+            for depth in 1..n {
+                let meta =
+                    self.snapshots
+                        .get(current_id)
+                        .ok_or_else(|| AncestorError::NotFound {
+                            at_id: current_id.clone(),
+                        })?;
+                current_id = meta
+                    .parent_id
+                    .as_ref()
+                    .ok_or(AncestorError::BrokenChain { depth })?;
+                if !visited.insert(current_id.as_str()) {
+                    return Err(AncestorError::CycleDetected {
+                        at_id: current_id.clone(),
+                    });
+                }
+            }
         }
         let meta = self
             .snapshots
@@ -2518,6 +2531,169 @@ mod tests {
         idx.head = Some("child".to_string());
         let err = idx.ancestor(3).unwrap_err();
         assert_eq!(err, AncestorError::BrokenChain { depth: 2 });
+    }
+
+    #[test]
+    fn ancestor_self_loop_returns_cycle_detected() {
+        let mut idx = SnapshotIndex::new(PathBuf::from("/ws"));
+        idx.snapshots
+            .insert("snap-a".into(), meta(Some("snap-a"), vec![LIVE_CHILD]));
+        idx.head = Some("snap-a".into());
+
+        let (id, _) = idx.ancestor(1).unwrap();
+        assert_eq!(id, "snap-a");
+
+        let err = idx.ancestor(2).unwrap_err();
+        assert_eq!(
+            err,
+            AncestorError::CycleDetected {
+                at_id: "snap-a".to_string(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "lineage cycle detected at snapshot 'snap-a'"
+        );
+
+        // Large n must abort immediately at the cycle instead of spinning.
+        assert_eq!(
+            idx.ancestor(usize::MAX).unwrap_err(),
+            AncestorError::CycleDetected {
+                at_id: "snap-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn ancestor_two_node_cycle_returns_cycle_detected() {
+        let mut idx = SnapshotIndex::new(PathBuf::from("/ws"));
+        idx.snapshots
+            .insert("snap-a".into(), meta(Some("snap-b"), vec!["snap-b"]));
+        idx.snapshots.insert(
+            "snap-b".into(),
+            meta(Some("snap-a"), vec!["snap-a", LIVE_CHILD]),
+        );
+        idx.head = Some("snap-b".into());
+
+        assert_eq!(idx.ancestor(1).unwrap().0, "snap-b");
+        assert_eq!(idx.ancestor(2).unwrap().0, "snap-a");
+        assert_eq!(
+            idx.ancestor(3).unwrap_err(),
+            AncestorError::CycleDetected {
+                at_id: "snap-b".to_string(),
+            }
+        );
+        assert_eq!(
+            idx.ancestor(usize::MAX).unwrap_err(),
+            AncestorError::CycleDetected {
+                at_id: "snap-b".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn ancestor_stem_into_cycle_returns_cycle_detected() {
+        // snap-c -> snap-b -> snap-a -> snap-b
+        let mut idx = SnapshotIndex::new(PathBuf::from("/ws"));
+        idx.snapshots
+            .insert("snap-a".into(), meta(Some("snap-b"), vec!["snap-b"]));
+        idx.snapshots
+            .insert("snap-b".into(), meta(Some("snap-a"), vec!["snap-c"]));
+        idx.snapshots
+            .insert("snap-c".into(), meta(Some("snap-b"), vec![LIVE_CHILD]));
+        idx.head = Some("snap-c".into());
+
+        assert_eq!(idx.ancestor(1).unwrap().0, "snap-c");
+        assert_eq!(idx.ancestor(2).unwrap().0, "snap-b");
+        assert_eq!(idx.ancestor(3).unwrap().0, "snap-a");
+        assert_eq!(
+            idx.ancestor(4).unwrap_err(),
+            AncestorError::CycleDetected {
+                at_id: "snap-b".to_string(),
+            }
+        );
+        assert_eq!(
+            idx.ancestor(usize::MAX).unwrap_err(),
+            AncestorError::CycleDetected {
+                at_id: "snap-b".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn ancestor_deep_valid_chain_succeeds() {
+        let mut idx = SnapshotIndex::new(PathBuf::from("/ws"));
+        let depth = 200;
+        for i in 0..depth {
+            let id = format!("snap-{i}");
+            let parent = if i == 0 {
+                None
+            } else {
+                Some(format!("snap-{}", i - 1))
+            };
+            let children = if i + 1 == depth {
+                vec![LIVE_CHILD.to_string()]
+            } else {
+                vec![format!("snap-{}", i + 1)]
+            };
+            idx.snapshots.insert(
+                id,
+                SnapshotMeta {
+                    message: None,
+                    metadata: None,
+                    pinned: false,
+                    created_at: chrono::Utc::now(),
+                    missing: false,
+                    parent_id: parent,
+                    child_ids: children,
+                },
+            );
+        }
+        idx.head = Some(format!("snap-{}", depth - 1));
+
+        assert_eq!(idx.ancestor(1).unwrap().0, "snap-199");
+        assert_eq!(idx.ancestor(depth).unwrap().0, "snap-0");
+        assert_eq!(
+            idx.ancestor(depth + 1).unwrap_err(),
+            AncestorError::BrokenChain { depth }
+        );
+    }
+
+    #[test]
+    fn ancestor_not_found_preserved() {
+        let mut missing_head = SnapshotIndex::new(PathBuf::from("/ws"));
+        missing_head.head = Some("missing-head".into());
+        assert_eq!(
+            missing_head.ancestor(1).unwrap_err(),
+            AncestorError::NotFound {
+                at_id: "missing-head".to_string(),
+            }
+        );
+        assert_eq!(
+            missing_head.ancestor(2).unwrap_err(),
+            AncestorError::NotFound {
+                at_id: "missing-head".to_string(),
+            }
+        );
+
+        let mut missing_parent = SnapshotIndex::new(PathBuf::from("/ws"));
+        missing_parent.snapshots.insert(
+            "child".into(),
+            meta(Some("missing-parent"), vec![LIVE_CHILD]),
+        );
+        missing_parent.head = Some("child".into());
+        assert_eq!(
+            missing_parent.ancestor(2).unwrap_err(),
+            AncestorError::NotFound {
+                at_id: "missing-parent".to_string(),
+            }
+        );
+        assert_eq!(
+            missing_parent.ancestor(3).unwrap_err(),
+            AncestorError::NotFound {
+                at_id: "missing-parent".to_string(),
+            }
+        );
     }
 
     // ── DaemonConfig::default() tests ──

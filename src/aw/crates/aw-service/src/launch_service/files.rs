@@ -3,11 +3,11 @@
 use super::{process, ServicePaths};
 use crate::{rejected, Result};
 use std::{
-    fs::{self, DirBuilder, File, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions, Permissions},
     io::{self, Read, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     thread,
@@ -92,24 +92,29 @@ pub(super) fn lock(state: &Path, deadline: Instant) -> Result<File> {
 }
 
 pub(super) fn snapshot(paths: &ServicePaths, bytes: &[u8]) -> Result<PathBuf> {
+    snapshot_using(paths, bytes, |file| file.write_all(bytes))
+}
+
+pub(super) fn snapshot_using<F>(paths: &ServicePaths, bytes: &[u8], write: F) -> Result<PathBuf>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
     let path = paths
         .state_dir
         .join(format!("config-{}.yaml", paths.config_revision));
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            File::open(&paths.state_dir)?.sync_all()?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+    let mut temporary = tempfile::NamedTempFile::new_in(&paths.state_dir)?;
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .as_file()
+        .set_permissions(Permissions::from_mode(0o400))?;
+    match temporary.persist_noclobber(&path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.error.into()),
     }
+    // Persist both the installed snapshot and removal of its temporary link.
+    File::open(&paths.state_dir)?.sync_all()?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)

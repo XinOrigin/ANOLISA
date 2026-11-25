@@ -3,7 +3,10 @@
 use super::*;
 use serde_json::json;
 use std::{
+    io::Write,
     os::unix::fs::{symlink, PermissionsExt},
+    sync::{Arc, Barrier},
+    thread,
     time::Duration,
 };
 
@@ -142,7 +145,66 @@ fn snapshots_keep_original_bytes_and_reject_existing_content_changes() {
     fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(&snapshot, b"different").unwrap();
     fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o400)).unwrap();
-    assert!(files::snapshot(&paths, &document).is_err());
+    assert!(
+        matches!(files::snapshot(&paths, &document), Err(crate::Error::Rejected(code)) if code == "service_snapshot_mismatch")
+    );
+    assert_eq!(fs::read_dir(&paths.state_dir).unwrap().count(), 1);
+}
+
+#[test]
+fn snapshot_mid_write_enospc_leaves_no_partial_file_and_recovers() {
+    let fixture = Fixture::new();
+    let mut value = config();
+    value["spec"]["daemon"]["state_dir"] = json!(fixture.0);
+    let document = bytes(&value);
+    let paths = resolve(&document, None).unwrap();
+    let failed = files::snapshot_using(&paths, &document, |file| {
+        file.write_all(&document[..4])?;
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    });
+    assert!(
+        matches!(failed, Err(crate::Error::Io(ref error)) if error.raw_os_error() == Some(libc::ENOSPC))
+    );
+    assert_eq!(fs::read_dir(&paths.state_dir).unwrap().count(), 0);
+
+    let snapshot = files::snapshot(&paths, &document).unwrap();
+    assert_eq!(fs::read(&snapshot).unwrap(), document);
+    assert_eq!(fs::metadata(&snapshot).unwrap().mode() & 0o7777, 0o400);
+    assert_eq!(fs::read_dir(&paths.state_dir).unwrap().count(), 1);
+}
+
+#[test]
+fn concurrent_snapshots_accept_existing_valid_file_without_leftovers() {
+    let fixture = Fixture::new();
+    let mut value = config();
+    value["spec"]["daemon"]["state_dir"] = json!(fixture.0);
+    let document = bytes(&value);
+    let paths = resolve(&document, None).unwrap();
+    let gate = Arc::new(Barrier::new(8));
+    let snapshots = thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let paths = &paths;
+                let document = &document;
+                scope.spawn(move || {
+                    gate.wait();
+                    files::snapshot(paths, document).unwrap()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let expected = paths
+        .state_dir
+        .join(format!("config-{}.yaml", paths.config_revision));
+    assert!(snapshots.iter().all(|path| path == &expected));
+    assert_eq!(fs::read(&expected).unwrap(), document);
+    assert_eq!(fs::metadata(&expected).unwrap().mode() & 0o7777, 0o400);
+    assert_eq!(fs::read_dir(&paths.state_dir).unwrap().count(), 1);
 }
 
 #[test]

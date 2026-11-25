@@ -60,13 +60,23 @@ def observes_mock_server(config_path: Path) -> bool:
     if not config_path.is_file():
         return False
     config = read_json(config_path)
-    allow = config.get("cmdline", {}).get("allow", [])
-    return any(
-        "mock_llm_server.py" in str(pattern)
-        for entry in allow
-        if isinstance(entry, dict)
-        for pattern in entry.get("rule", [])
-    )
+    cmdline = config.get("cmdline")
+    if not isinstance(cmdline, dict):
+        return False
+    allow = cmdline.get("allow")
+    if not isinstance(allow, list):
+        return False
+    for entry in allow:
+        if not isinstance(entry, dict):
+            continue
+        rule = entry.get("rule")
+        if not isinstance(rule, list) or not all(
+            isinstance(pattern, str) for pattern in rule
+        ):
+            continue
+        if any("mock_llm_server.py" in pattern for pattern in rule):
+            return True
+    return False
 
 
 def command_version(command: list[str]) -> str | None:

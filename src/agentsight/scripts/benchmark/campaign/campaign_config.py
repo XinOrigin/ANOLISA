@@ -39,6 +39,11 @@ def finite_number(value: Any) -> bool:
         return False
 
 
+def _is_positive_int(value: Any) -> bool:
+    """Whether value is a strictly positive integer (excluding booleans)."""
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
 def safety_settings(campaign: dict[str, Any]) -> dict[str, int]:
     """Return explicit safety limits, retaining compatibility with old campaigns."""
     configured = campaign.get("safety", {})
@@ -51,9 +56,15 @@ def safety_settings(campaign: dict[str, Any]) -> dict[str, int]:
 
 def validate_campaign(campaign: dict[str, Any]) -> None:
     """Reject incomplete, unsafe, or internally inconsistent campaign inputs."""
-    if campaign.get("schema_version") != 1:
+    schema_version = campaign.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
         raise ValueError("campaign schema_version must be 1")
-    if campaign.get("comparison_mode", "ab_comparison") not in {
+    comparison_mode = campaign.get("comparison_mode", "ab_comparison")
+    if not isinstance(comparison_mode, str) or comparison_mode not in {
         "ab_comparison",
         "aa_calibration",
     }:
@@ -98,11 +109,12 @@ def validate_campaign(campaign: dict[str, Any]) -> None:
     capacity = campaign.get("capacity", {})
     if not isinstance(capacity, dict):
         raise TypeError("capacity must be an object")
-    if capacity.get("qps_start", 0) <= 0 or capacity.get("qps_resolution", 0) <= 0:
-        raise ValueError("capacity qps_start and qps_resolution must be positive")
-    if capacity.get("qps_safety_max", 0) < capacity["qps_start"]:
+    for field in ("qps_start", "qps_resolution", "qps_safety_max"):
+        if not _is_positive_int(capacity.get(field)):
+            raise ValueError(f"capacity.{field} must be a positive integer")
+    if capacity["qps_safety_max"] < capacity["qps_start"]:
         raise ValueError("capacity qps_safety_max must be at least qps_start")
-    if capacity.get("qps_safety_max", 0) < capacity.get("qps_resolution", 0):
+    if capacity["qps_safety_max"] < capacity["qps_resolution"]:
         raise ValueError("capacity qps_safety_max must be at least qps_resolution")
     search_start_ratio = capacity.get("search_start_ratio")
     if not finite_number(search_start_ratio) or search_start_ratio != 0.8:
@@ -113,19 +125,13 @@ def validate_campaign(campaign: dict[str, Any]) -> None:
     matrix_qps = matrix.get("qps", [])
     if not isinstance(matrix_qps, list):
         raise ValueError("matrix.qps must be a list")
-    if matrix_qps and any(
-        isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        for value in matrix_qps
-    ):
+    if matrix_qps and any(not _is_positive_int(value) for value in matrix_qps):
         raise ValueError("matrix.qps values must be positive integers")
     if matrix_qps and (len(matrix_qps) != 5 or len(set(matrix_qps)) != 5):
         raise ValueError("matrix.qps must be empty or contain five unique values")
     positive_fields = {
         "smoke": ("qps", "duration_seconds"),
         "capacity": (
-            "qps_start",
-            "qps_resolution",
-            "qps_safety_max",
             "pretest_duration_seconds",
             "probe_duration_seconds",
             "confirm_duration_seconds",
@@ -147,8 +153,7 @@ def validate_campaign(campaign: dict[str, Any]) -> None:
         if not isinstance(settings, dict):
             raise TypeError(f"{section} must be an object")
         for field in fields:
-            value = settings.get(field)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            if not _is_positive_int(settings.get(field)):
                 raise ValueError(f"{section}.{field} must be a positive integer")
     for section, field in (
         ("capacity", "pretest_warmup_seconds"),
@@ -162,15 +167,15 @@ def validate_campaign(campaign: dict[str, Any]) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{section}.{field} must be a non-negative integer")
     load = campaign.get("load")
-    if not isinstance(load, dict) or load.get("protocol") not in {"sse", "json"}:
+    protocol = load.get("protocol") if isinstance(load, dict) else None
+    if not isinstance(protocol, str) or protocol not in {"sse", "json"}:
         raise ValueError("load.protocol must be sse or json for a formal campaign")
     for field in ("payload_kb", "chunks", "chunk_bytes"):
-        value = load.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        if not _is_positive_int(load.get(field)):
             raise ValueError(f"load.{field} must be a positive integer")
     safety = safety_settings(campaign)
     for field, value in safety.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        if not _is_positive_int(value):
             raise ValueError(f"safety.{field} must be a positive integer")
     if safety["max_agentsight_rss_mb"] < thresholds["max_rss_mb"]:
         raise ValueError(
@@ -178,11 +183,7 @@ def validate_campaign(campaign: dict[str, Any]) -> None:
         )
     recovery = campaign["recovery"]
     tolerance = recovery.get("tolerance_ratio")
-    if (
-        isinstance(tolerance, bool)
-        or not isinstance(tolerance, (int, float))
-        or not 0 <= tolerance < 1
-    ):
+    if not finite_number(tolerance) or not 0 <= tolerance < 1:
         raise ValueError("recovery.tolerance_ratio must be in [0, 1)")
     if recovery["recovery_window_seconds"] > recovery["recover_seconds"]:
         raise ValueError("recovery window cannot exceed the recovery phase")

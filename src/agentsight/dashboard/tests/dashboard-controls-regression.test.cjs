@@ -179,6 +179,87 @@ for (const cached of [{ summary: 'older cached evaluation' }, null]) {
   });
 }
 
+function loadDateTimePicker() {
+  const code = transpile('src/components/DateTimePicker.tsx');
+  const module = { exports: {} };
+  const reactStub = {
+    __esModule: true,
+    default: {
+      createElement: (type, props, ...children) => ({ type, props, children }),
+      useId: () => 'datetime-picker-id',
+    },
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useId: () => 'datetime-picker-id',
+  };
+  const fn = new Function('require', 'module', 'exports', code);
+  fn((name) => {
+    if (name === 'react') return reactStub;
+    throw new Error(`unexpected require from DateTimePicker.tsx: ${name}`);
+  }, module, module.exports);
+  return module.exports.DateTimePicker;
+}
+
+test('datetime picker pads sub-1000 years to 4 digits and guards invalid timestamps', () => {
+  const DateTimePicker = loadDateTimePicker();
+  const renderValue = (ms) => {
+    const el = DateTimePicker({ value: ms, onChange: () => {} });
+    return collectElements(el, (node) => node.type === 'input')[0].props.value;
+  };
+
+  assert.equal(renderValue(new Date(2026, 4, 1, 9, 5).getTime()), '2026-05-01T09:05');
+
+  const y999 = new Date(0);
+  y999.setFullYear(999, 4, 1);
+  y999.setHours(9, 5, 0, 0);
+  assert.equal(renderValue(y999.getTime()), '0999-05-01T09:05');
+
+  const y50 = new Date(0);
+  y50.setFullYear(50, 4, 1);
+  y50.setHours(9, 5, 0, 0);
+  assert.equal(renderValue(y50.getTime()), '0050-05-01T09:05');
+
+  const zeroYear = new Date(0);
+  zeroYear.setFullYear(0, 4, 1);
+  zeroYear.setHours(9, 5, 0, 0);
+  assert.equal(renderValue(zeroYear.getTime()), '');
+
+  const negativeYear = new Date(0);
+  negativeYear.setFullYear(-5, 4, 1);
+  negativeYear.setHours(9, 5, 0, 0);
+  assert.equal(renderValue(negativeYear.getTime()), '');
+
+  for (const invalid of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1e20]) {
+    assert.equal(renderValue(invalid), '', `invalid timestamp ${invalid} must render empty string`);
+  }
+});
+
+test('datetime picker ignores invalid input strings and forwards valid timestamps', () => {
+  const DateTimePicker = loadDateTimePicker();
+  const received = [];
+  const el = DateTimePicker({ value: Date.now(), onChange: (ms) => received.push(ms) });
+  const input = collectElements(el, (node) => node.type === 'input')[0];
+
+  for (const bad of ['', 'not-a-date', '2026-02-30', '0000-05-01T09:05', '2026-13-01T00:00', '2026-02-30T12:00']) {
+    input.props.onChange({ target: { value: bad } });
+  }
+  assert.deepEqual(received, [], 'invalid datetime-local strings must not emit NaN or rolled-over dates');
+
+  input.props.onChange({ target: { value: '2026-05-01T09:05' } });
+  input.props.onChange({ target: { value: '0999-05-01T09:05' } });
+  input.props.onChange({ target: { value: '0050-05-01T09:05' } });
+  const expected999 = new Date(0);
+  expected999.setFullYear(999, 4, 1);
+  expected999.setHours(9, 5, 0, 0);
+  const expected50 = new Date(0);
+  expected50.setFullYear(50, 4, 1);
+  expected50.setHours(9, 5, 0, 0);
+  assert.deepEqual(received, [
+    new Date(2026, 4, 1, 9, 5).getTime(),
+    expected999.getTime(),
+    expected50.getTime(),
+  ]);
+});
+
 // Mirrors the shared helper's contract: the evidence link may only name a case
 // belonging to a visible (agent-filtered) violation row. The real derivation is
 // covered against the compiled module in apiClient-regression.

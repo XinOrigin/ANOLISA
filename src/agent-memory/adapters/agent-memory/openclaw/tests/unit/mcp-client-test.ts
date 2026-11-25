@@ -337,4 +337,262 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       await client.stop();
     }
   });
+
+  it("clears partial stdout buffer across crash and stop so the next initialize succeeds", {
+    timeout: 20_000,
+  }, async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "memory-buffer-poison-"));
+    const binaryPath = join(directory, "mcp-server");
+    const pidPath = join(directory, "pids");
+    let pids: number[] = [];
+    context.after(async () => {
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (error) {
+          assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+        }
+      }
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    await writeFile(binaryPath, `#!${process.execPath}
+const fs = require("node:fs");
+const readline = require("node:readline");
+const pidPath = ${JSON.stringify(pidPath)};
+const counterPath = pidPath + ".n";
+const attempt = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, "utf8") : 0) + 1;
+fs.writeFileSync(counterPath, String(attempt));
+fs.appendFileSync(pidPath, process.pid + "\\n");
+setInterval(() => {}, 1000);
+process.on("SIGTERM", () => {
+  if (attempt === 2) {
+    // Emit a trailing partial JSON-RPC fragment right before exiting on stop().
+    process.stdout.write('{"jsonrpc":"2.0","id":999');
+  }
+  process.exit(0);
+});
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  if (request.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+    return;
+  }
+  if (attempt === 1) {
+    // Write a partial JSON fragment without newline, then crash before replying.
+    process.stdout.write('{"jsonrpc":"2.0","id":');
+    setTimeout(() => process.exit(1), 20);
+    return;
+  }
+  process.stdout.write(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { content: [{ type: "text", text: "worker-" + attempt }] },
+    }) + "\\n",
+  );
+});
+`, { mode: 0o700 });
+
+    const client = new McpStdioClient({ ...cfg, binaryPath });
+    try {
+      await assert.rejects(
+        () => client.callTool("memory_get_context", {}),
+        /exited \(code=1/,
+      );
+
+      // Worker 2 must initialize cleanly without inheriting worker 1's partial fragment.
+      assert.equal(await client.callTool("memory_get_context", {}), "worker-2");
+
+      // Stopping worker 2 after a partial stdout fragment must also leave a clean buffer.
+      await client.stop();
+      assert.equal(await client.callTool("memory_get_context", {}), "worker-3");
+
+      pids = (await readFile(pidPath, "utf8")).split("\n").filter(Boolean).map(Number);
+      assert.equal(pids.length, 3);
+    } finally {
+      await client.stop();
+    }
+  });
+
+  it("serializes stop() with concurrent callTool() without clobbering the new worker", {
+    timeout: 20_000,
+  }, async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "memory-stop-race-"));
+    const binaryPath = join(directory, "mcp-server");
+    const eventsPath = join(directory, "events.jsonl");
+    const readEvents = async (): Promise<Array<{ event: string; attempt: number; pid: number }>> => {
+      try {
+        const raw = await readFile(eventsPath, "utf8");
+        return raw.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      }
+    };
+    context.after(async () => {
+      const pids = (await readEvents())
+        .filter((entry) => entry.event === "spawn")
+        .map((entry) => entry.pid);
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (error) {
+          assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+        }
+      }
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    await writeFile(binaryPath, `#!${process.execPath}
+const fs = require("node:fs");
+const readline = require("node:readline");
+const eventsPath = ${JSON.stringify(eventsPath)};
+const counterPath = eventsPath + ".n";
+const attempt = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, "utf8") : 0) + 1;
+fs.writeFileSync(counterPath, String(attempt));
+const log = (event) =>
+  fs.appendFileSync(eventsPath, JSON.stringify({ event, attempt, pid: process.pid }) + "\\n");
+log("spawn");
+setInterval(() => {}, 1000);
+process.on("SIGTERM", () => {
+  log("sigterm");
+  // Delay exit on worker 1 so concurrent callTool() overlaps with in-flight stop().
+  setTimeout(() => process.exit(0), attempt === 1 ? 250 : 20);
+});
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  if (request.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+    return;
+  }
+  process.stdout.write(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { content: [{ type: "text", text: "worker-" + attempt + ":" + process.pid }] },
+    }) + "\\n",
+  );
+});
+`, { mode: 0o700 });
+
+    const client = new McpStdioClient({ ...cfg, binaryPath });
+    try {
+      const first = await client.callTool("memory_get_context", {});
+      assert.match(first, /^worker-1:\d+$/);
+
+      const stopPromise = client.stop();
+      // Wait until worker 1 has received SIGTERM so stop() is genuinely mid-await.
+      const deadline = Date.now() + 5_000;
+      while (!(await readEvents()).some((e) => e.event === "sigterm" && e.attempt === 1)) {
+        assert.ok(Date.now() < deadline, "timed out waiting for worker 1 SIGTERM");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const concurrentCall = client.callTool("memory_get_context", {});
+      const [, second] = await Promise.all([stopPromise, concurrentCall]);
+      assert.match(second, /^worker-2:\d+$/);
+
+      // Worker 2 must still be alive and tracked as the active client (not clobbered by stop()).
+      const third = await client.callTool("memory_get_context", {});
+      assert.equal(third, second);
+
+      const spawns = (await readEvents()).filter((entry) => entry.event === "spawn");
+      assert.equal(spawns.length, 2);
+
+      await Promise.all([client.stop(), client.stop()]);
+      for (const entry of spawns) {
+        assert.throws(() => process.kill(entry.pid, 0), { code: "ESRCH" });
+      }
+    } finally {
+      await client.stop();
+    }
+  });
+
+  it("serializes stop() during slow initialize with a concurrent callTool() retry", {
+    timeout: 20_000,
+  }, async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "memory-stop-init-race-"));
+    const binaryPath = join(directory, "mcp-server");
+    const eventsPath = join(directory, "events.jsonl");
+    const readEvents = async (): Promise<Array<{ event: string; attempt: number; pid: number }>> => {
+      try {
+        const raw = await readFile(eventsPath, "utf8");
+        return raw.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      }
+    };
+    context.after(async () => {
+      const pids = (await readEvents())
+        .filter((entry) => entry.event === "spawn")
+        .map((entry) => entry.pid);
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (error) {
+          assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+        }
+      }
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    await writeFile(binaryPath, `#!${process.execPath}
+const fs = require("node:fs");
+const readline = require("node:readline");
+const eventsPath = ${JSON.stringify(eventsPath)};
+const counterPath = eventsPath + ".n";
+const attempt = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, "utf8") : 0) + 1;
+fs.writeFileSync(counterPath, String(attempt));
+const log = (event) =>
+  fs.appendFileSync(eventsPath, JSON.stringify({ event, attempt, pid: process.pid }) + "\\n");
+log("spawn");
+setInterval(() => {}, 1000);
+process.on("SIGTERM", () => {
+  log("sigterm");
+  setTimeout(() => process.exit(0), attempt === 1 ? 150 : 20);
+});
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  if (request.method === "initialize") {
+    if (attempt === 1) {
+      log("init-received");
+      return;
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+    return;
+  }
+  process.stdout.write(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { content: [{ type: "text", text: "worker-" + attempt }] },
+    }) + "\\n",
+  );
+});
+`, { mode: 0o700 });
+
+    const client = new McpStdioClient({ ...cfg, binaryPath });
+    try {
+      const firstCall = client.callTool("memory_get_context", {});
+      const deadline = Date.now() + 5_000;
+      while (!(await readEvents()).some((e) => e.event === "init-received" && e.attempt === 1)) {
+        assert.ok(Date.now() < deadline, "timed out waiting for worker 1 initialize");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const stopPromise = client.stop();
+      const secondCall = client.callTool("memory_get_context", {});
+
+      await assert.rejects(firstCall, /exited/);
+      const [, secondResult] = await Promise.all([stopPromise, secondCall]);
+      assert.equal(secondResult, "worker-2");
+    } finally {
+      await client.stop();
+    }
+  });
 });

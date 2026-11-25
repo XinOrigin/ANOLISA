@@ -136,6 +136,9 @@ export class McpStdioClient {
   private respawnAttempts = 0;
   private giveUp = false;
   private startingPromise: Promise<void> | null = null;
+  private startingStopSeq = 0;
+  private stoppingPromise: Promise<void> | null = null;
+  private stopSeq = 0;
   private readonly config: AgentMemoryConfig;
   // Bounded ring buffer for child stderr so a chatty/looping subprocess
   // can't blow up the gateway's log volume.
@@ -149,6 +152,16 @@ export class McpStdioClient {
 
   /** Lazy-start: spawn + initialize on first use. */
   private async ensureStarted(): Promise<void> {
+    while (
+      this.stoppingPromise ||
+      (this.startingPromise && this.startingStopSeq !== this.stopSeq)
+    ) {
+      if (this.stoppingPromise) {
+        await this.stoppingPromise;
+      } else if (this.startingPromise) {
+        await this.startingPromise.catch(() => {});
+      }
+    }
     if (this.disposed) {
       throw new Error("agent-memory client is disposed");
     }
@@ -163,16 +176,21 @@ export class McpStdioClient {
     if (this.startingPromise) {
       return this.startingPromise;
     }
-    this.startingPromise = this.doStart();
+    const startSeq = this.stopSeq;
+    const startPromise = this.doStart();
+    this.startingStopSeq = startSeq;
+    this.startingPromise = startPromise;
     try {
-      await this.startingPromise;
+      await startPromise;
     } finally {
-      this.startingPromise = null;
+      if (this.startingPromise === startPromise) {
+        this.startingPromise = null;
+      }
     }
   }
 
   private async doStart(): Promise<void> {
-    this.spawnProcess();
+    const child = this.spawnProcess();
 
     try {
       // Send MCP initialize handshake.
@@ -192,6 +210,10 @@ export class McpStdioClient {
       // Send initialized notification (no response expected).
       this.sendNotification("notifications/initialized");
 
+      if (this.proc !== child || this.stoppingPromise || this.disposed) {
+        throw new Error("agent-memory process stopped during initialization");
+      }
+
       this.initialized = true;
       // Successful init: reset the respawn counter so the next crash
       // gets a full quota of retries again.
@@ -204,7 +226,7 @@ export class McpStdioClient {
       // this worker where `stop()` can never reach it and leaving its
       // exit handler behind to skew the crash counter later. Release it
       // first, then surface the original handshake error untouched.
-      await this.releaseWorker();
+      await this.releaseWorker(child);
       throw err;
     }
   }
@@ -222,18 +244,20 @@ export class McpStdioClient {
    * caller is about to receive. The handle is dropped either way so the
    * next start cannot inherit a worker we no longer track.
    */
-  private async releaseWorker(): Promise<void> {
-    if (!this.proc) {
+  private async releaseWorker(child: ChildProcess): Promise<void> {
+    if (this.proc !== child && !this.stoppingPromise) {
       return;
     }
     try {
       await this.stop();
     } catch (err) {
-      const orphan = this.proc;
-      this.proc = null;
-      this.initialized = false;
-      this.pending.clear();
-      orphan?.kill("SIGKILL");
+      if (this.proc === child) {
+        this.proc = null;
+        this.initialized = false;
+        this.buffer = "";
+        this.rejectPending("agent-memory worker release failed");
+      }
+      child.kill("SIGKILL");
       console.error(
         `[agent-memory] failed to release worker after initialization failure: ${
           (err as Error).message
@@ -242,7 +266,7 @@ export class McpStdioClient {
     }
   }
 
-  private spawnProcess(): void {
+  private spawnProcess(): ChildProcess {
     const pluginEnv: Record<string, string> = {
       MEMORY_PROFILE: this.config.profile,
       MEMORY_MAX_READ_BYTES: String(this.config.maxReadBytes),
@@ -263,11 +287,13 @@ export class McpStdioClient {
 
     const env = buildChildEnv(process.env, pluginEnv);
 
-    this.proc = spawn(this.config.binaryPath, ["serve"], {
+    this.buffer = "";
+    const child = spawn(this.config.binaryPath, ["serve"], {
       stdio: ["pipe", "pipe", "pipe"],
       env,
       detached: false,
     });
+    this.proc = child;
 
     // Decode both child streams through the stream's own incremental UTF-8
     // decoder. A pipe can split one JSON-RPC reply anywhere, including inside
@@ -277,23 +303,31 @@ export class McpStdioClient {
     // setEncoding("utf8") keeps a trailing partial code point buffered until
     // its remaining bytes arrive; the newline framing in handleData is
     // unchanged, and each spawn gets a fresh stream decoder.
-    this.proc.stdout?.setEncoding("utf8");
-    this.proc.stdout?.on("data", (chunk: string) => {
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      if (this.proc !== child) {
+        return;
+      }
       this.handleData(chunk);
     });
 
-    this.proc.stderr?.setEncoding("utf8");
-    this.proc.stderr?.on("data", (chunk: string) => {
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      if (this.proc !== child) {
+        return;
+      }
       this.appendStderr(chunk);
     });
 
-    this.proc.on("exit", (code, signal) => {
-      this.handleExit(code, signal);
+    child.on("exit", (code, signal) => {
+      this.handleExit(child, code, signal);
     });
 
-    this.proc.on("error", (err) => {
-      this.handleError(err);
+    child.on("error", (err) => {
+      this.handleError(child, err);
     });
+
+    return child;
   }
 
   /** Call an MCP tool by OpenClaw contract name (auto-mapped). */
@@ -475,22 +509,32 @@ export class McpStdioClient {
     this.stderrRing = [];
   }
 
+  private rejectPending(message: string): void {
+    for (const [id, pending] of this.pending) {
+      this.pending.delete(id);
+      pending.reject(new Error(message));
+    }
+  }
+
   /** Handle child process exit: reject all pending calls. The next
    * `ensureStarted()` will respawn unless we've crossed the cap. */
-  private handleExit(code: number | null, signal: string | null): void {
+  private handleExit(
+    child: ChildProcess,
+    code: number | null,
+    signal: string | null,
+  ): void {
+    if (this.proc !== child) {
+      return;
+    }
     this.initialized = false;
     this.proc = null;
+    this.buffer = "";
     this.flushStderr();
 
     // Reject all pending calls so awaiters don't hang forever.
-    for (const [id, pending] of this.pending) {
-      this.pending.delete(id);
-      pending.reject(
-        new Error(
-          `agent-memory process exited (code=${code ?? "unknown"}, signal=${signal ?? "none"})`,
-        ),
-      );
-    }
+    this.rejectPending(
+      `agent-memory process exited (code=${code ?? "unknown"}, signal=${signal ?? "none"})`,
+    );
 
     // Count this as a crash if the exit was unexpected. SIGTERM /
     // SIGKILL from `stop()` are deliberate and don't count.
@@ -510,15 +554,16 @@ export class McpStdioClient {
     this.deliberateStop = false;
   }
 
-  private handleError(err: Error): void {
+  private handleError(child: ChildProcess, err: Error): void {
+    if (this.proc !== child) {
+      return;
+    }
     this.initialized = false;
     this.proc = null;
+    this.buffer = "";
     this.flushStderr();
 
-    for (const [id, pending] of this.pending) {
-      this.pending.delete(id);
-      pending.reject(new Error(`agent-memory process error: ${err.message}`));
-    }
+    this.rejectPending(`agent-memory process error: ${err.message}`);
   }
 
   private deliberateStop = false;
@@ -533,45 +578,73 @@ export class McpStdioClient {
 
   /** Gracefully shut down the worker, allowing a later startup retry. */
   async stop(): Promise<void> {
+    if (this.stoppingPromise) {
+      return this.stoppingPromise;
+    }
     const child = this.proc;
     if (!child) {
+      this.buffer = "";
       return;
     }
+    this.stopSeq++;
+    const stopPromise = this.doStop(child);
+    this.stoppingPromise = stopPromise;
+    try {
+      await stopPromise;
+    } finally {
+      if (this.stoppingPromise === stopPromise) {
+        this.stoppingPromise = null;
+      }
+    }
+  }
+
+  private async doStop(child: ChildProcess): Promise<void> {
     this.initialized = false;
     this.deliberateStop = true;
 
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill("SIGKILL");
-        }
-      }, 2000);
-      timeout.unref();
+    try {
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              child.kill("SIGKILL");
+            }
+          }, 2000);
+          timeout.unref();
 
-      const onExit = () => {
-        clearTimeout(timeout);
-        child.removeListener("error", onError);
-        resolve();
-      };
-      const onError = (error: Error) => {
-        clearTimeout(timeout);
-        child.removeListener("exit", onExit);
-        reject(error);
-      };
-      child.once("exit", onExit);
-      child.once("error", onError);
-      child.kill("SIGTERM");
-      child.stdin?.end();
-    });
-
-    this.proc = null;
-    this.pending.clear();
-    // flushStderr writes once more, but we also need to cancel the
-    // pending flush timer so no extra summary line fires after stop().
-    this.flushStderr();
-    if (this.stderrFlushTimer) {
-      clearTimeout(this.stderrFlushTimer);
-      this.stderrFlushTimer = null;
+          const onExit = () => {
+            clearTimeout(timeout);
+            child.removeListener("error", onError);
+            resolve();
+          };
+          const onError = (error: Error) => {
+            clearTimeout(timeout);
+            child.removeListener("exit", onExit);
+            reject(error);
+          };
+          child.once("exit", onExit);
+          child.once("error", onError);
+          child.kill("SIGTERM");
+          child.stdin?.end();
+        });
+      }
+    } finally {
+      if (this.proc === child) {
+        this.proc = null;
+        this.initialized = false;
+        this.buffer = "";
+        this.rejectPending("agent-memory process stopped");
+      } else if (!this.proc) {
+        this.buffer = "";
+      }
+      this.deliberateStop = false;
+      // flushStderr writes once more, but we also need to cancel the
+      // pending flush timer so no extra summary line fires after stop().
+      this.flushStderr();
+      if (this.stderrFlushTimer) {
+        clearTimeout(this.stderrFlushTimer);
+        this.stderrFlushTimer = null;
+      }
     }
   }
 }

@@ -5,6 +5,7 @@ const { runInNewContext } = require('node:vm');
 const test = require('node:test');
 const { nextSavingsSort, sortSavingsSessions } = require(process.env.AGENTSIGHT_SAVINGS_SORT_BUILD);
 const { serializeSavingsCsv } = require(process.env.AGENTSIGHT_SAVINGS_CSV_BUILD);
+const { fillTokenBuckets, fillModelBuckets } = require(process.env.AGENTSIGHT_TIMESERIES_BUCKETS_BUILD);
 
 const session = (id, input, output, saved, rate) => ({
   session_id: id, agent_name: 'Agent', request_count: 1,
@@ -180,4 +181,91 @@ test('selected CSV keeps the displayed sort order without fetching new evidence'
   assert.deepEqual(page.order(), ['b', 'c', 'a']);
   assert.deepEqual(ids(page.exportSelected()), ['b', 'a']);
   assert.equal(page.requests(), 1);
+});
+
+test('fillTokenBuckets accumulates colliding rows in the same bucket slot without mutating frozen inputs', () => {
+  const startNs = 1_000_000;
+  const endNs = 4_000_000; // 3 buckets of 1_000_000 ns each
+  const firstSlot0 = Object.freeze({
+    bucket_start_ns: 1_000_000,
+    input_tokens: 120,
+    output_tokens: 30,
+    total_tokens: 150,
+  });
+  const secondSlot0 = Object.freeze({
+    // Within rounding wobble of slot 0
+    bucket_start_ns: 1_000_100,
+    input_tokens: 80,
+    output_tokens: 20,
+    total_tokens: 100,
+  });
+  const thirdSlot0 = Object.freeze({
+    bucket_start_ns: 1_000_000,
+    input_tokens: 5,
+    output_tokens: 15,
+    total_tokens: 20,
+  });
+  const slot2 = Object.freeze({
+    bucket_start_ns: 3_000_000,
+    input_tokens: 40,
+    output_tokens: 10,
+    total_tokens: 50,
+  });
+
+  const filled = fillTokenBuckets(
+    [firstSlot0, secondSlot0, thirdSlot0, slot2],
+    startNs,
+    endNs,
+    3,
+  );
+
+  assert.equal(filled.length, 3);
+  assert.deepEqual(filled[0], {
+    bucket_start_ns: 1_000_000,
+    input_tokens: 205,
+    output_tokens: 65,
+    total_tokens: 270,
+  });
+  assert.deepEqual(filled[1], {
+    bucket_start_ns: 2_000_000,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+  });
+  assert.deepEqual(filled[2], {
+    bucket_start_ns: 3_000_000,
+    input_tokens: 40,
+    output_tokens: 10,
+    total_tokens: 50,
+  });
+  assert.notEqual(filled[0], firstSlot0);
+  assert.notEqual(filled[2], slot2);
+  assert.equal(firstSlot0.total_tokens, 150);
+  assert.equal(secondSlot0.total_tokens, 100);
+});
+
+test('fillModelBuckets accumulates colliding rows for the same bucket index and model', () => {
+  const startNs = 10_000;
+  const endNs = 30_000; // 2 buckets of 10_000 ns each
+  const rows = [
+    // Exact collision on (idx=0, model='GPT-4o'), e.g. after case-normalization in ModelTimeseriesChart
+    Object.freeze({ bucket_start_ns: 10_000, model: 'GPT-4o', total_tokens: 37 }),
+    Object.freeze({ bucket_start_ns: 10_000, model: 'GPT-4o', total_tokens: 12 }),
+    // Separate model in slot 0 remains distinct
+    Object.freeze({ bucket_start_ns: 10_000, model: 'claude-3-5-sonnet', total_tokens: 25 }),
+    // Rounding collision on (idx=1, model='GPT-4o')
+    Object.freeze({ bucket_start_ns: 20_000, model: 'GPT-4o', total_tokens: 100 }),
+    Object.freeze({ bucket_start_ns: 20_050, model: 'GPT-4o', total_tokens: 45 }),
+  ];
+
+  const filled = fillModelBuckets(rows, startNs, endNs, 2, ['GPT-4o', 'claude-3-5-sonnet']);
+
+  assert.deepEqual(filled, [
+    { bucket_start_ns: 10_000, model: 'GPT-4o', total_tokens: 49 },
+    { bucket_start_ns: 10_000, model: 'claude-3-5-sonnet', total_tokens: 25 },
+    { bucket_start_ns: 20_000, model: 'GPT-4o', total_tokens: 145 },
+    { bucket_start_ns: 20_000, model: 'claude-3-5-sonnet', total_tokens: 0 },
+  ]);
+  assert.equal(rows[0].total_tokens, 37);
+  assert.equal(rows[1].total_tokens, 12);
 });

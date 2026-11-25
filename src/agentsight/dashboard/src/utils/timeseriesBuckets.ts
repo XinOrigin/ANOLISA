@@ -39,7 +39,18 @@ export function fillTokenBuckets(
   if (bucketNs <= 0) return data;
   const byIdx = new Map<number, TimeseriesBucket>();
   for (const b of data) {
-    byIdx.set(bucketIndex(b.bucket_start_ns, startNs, bucketNs), b);
+    const idx = bucketIndex(b.bucket_start_ns, startNs, bucketNs);
+    const prev = byIdx.get(idx);
+    if (prev) {
+      byIdx.set(idx, {
+        ...prev,
+        input_tokens: prev.input_tokens + b.input_tokens,
+        output_tokens: prev.output_tokens + b.output_tokens,
+        total_tokens: prev.total_tokens + b.total_tokens,
+      });
+    } else {
+      byIdx.set(idx, { ...b });
+    }
   }
   const result: TimeseriesBucket[] = [];
   for (let i = 0; i < bucketCount; i++) {
@@ -69,8 +80,12 @@ export function fillModelBuckets(
   const byIdxModel = new Map<number, Map<string, number>>();
   for (const b of data) {
     const idx = bucketIndex(b.bucket_start_ns, startNs, bucketNs);
-    if (!byIdxModel.has(idx)) byIdxModel.set(idx, new Map());
-    byIdxModel.get(idx)!.set(b.model, b.total_tokens);
+    let modelMap = byIdxModel.get(idx);
+    if (!modelMap) {
+      modelMap = new Map();
+      byIdxModel.set(idx, modelMap);
+    }
+    modelMap.set(b.model, (modelMap.get(b.model) ?? 0) + b.total_tokens);
   }
   const result: ModelTimeseriesBucket[] = [];
   for (let i = 0; i < bucketCount; i++) {

@@ -581,4 +581,137 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "extension_sensitive_setting_type_invalid");
     }
+
+    fn v1_hook_manifest_with_command(command: &str) -> String {
+        json!({
+            "schemaVersion": 1,
+            "name": "example.ops",
+            "version": "1.0.0",
+            "compatibility": {"cosh": ">=0.12.0"},
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [{
+                        "type": "command",
+                        "name": "guard",
+                        "command": command
+                    }]
+                }]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn v1_rejects_workspace_path_escape_in_hook_command() {
+        let root = package_root();
+        for command in [
+            "${workspacePath}/../../usr/bin/id",
+            "${workspacePath}/../escape",
+            "${workspacePath}/subdir/../../escape",
+            "${workspacePath}/./script.sh",
+            "${workspacePath}//etc/passwd",
+            "${workspacePath}${/}..${/}..${/}usr${/}bin${/}id",
+            "${workspacePath}/subdir${/}..${/}..${/}escape",
+            "${extensionPath}/subdir${/}..${/}..${/}outside",
+            r"${workspacePath}\..\escape",
+            r"${workspacePath}/subdir\..\escape",
+            "${workspacePath}foo",
+            "${workspacePath}../escape",
+            "\"${extensionPath}\"/../../usr/bin/id",
+            "\"${workspacePath}\"/../../usr/bin/id",
+            "'${workspacePath}'/../../usr/bin/id",
+            "${workspacePath}''/../../usr/bin/id",
+            "\"${workspacePath}\"foo",
+            "\"${workspacePath}/subdir\"/../../escape",
+            "${workspacePath}/subdir\"\"/../../escape",
+            "${extensionPath}${workspacePath}",
+            "${workspacePath}${extensionPath}",
+            "${workspacePath}${workspacePath}",
+            "${extensionPath}${extensionPath}",
+        ] {
+            let error =
+                parse_manifest(&v1_hook_manifest_with_command(command), root.path()).unwrap_err();
+            assert_eq!(error.code(), "extension_path_invalid", "command={command}");
+        }
+    }
+
+    #[test]
+    fn v1_accepts_valid_workspace_path_references_in_hook_command() {
+        let root = package_root();
+        for command in [
+            "${workspacePath}",
+            "python3 '${workspacePath}'",
+            "python3 \"${workspacePath}/subdir/script.sh\" --verbose",
+            "python3 ${extensionPath}/hooks/guard --ws=${workspacePath}",
+            "python3 ${extensionPath}/hooks/guard ${workspacePath} --verbose",
+            "python3 ${extensionPath}/hooks/guard \"${workspacePath}\" --verbose",
+            "cd '${workspacePath}'; ${extensionPath}/hooks/guard",
+            "${workspacePath}/subdir/script.sh",
+            "${workspacePath}/.cache/state.json",
+            "${workspacePath}${/}subdir${/}script.sh",
+            "${extensionPath}${/}hooks${/}guard",
+        ] {
+            let parsed = parse_manifest(&v1_hook_manifest_with_command(command), root.path())
+                .unwrap_or_else(|error| panic!("command={command} failed: {error}"));
+            assert_eq!(parsed.capabilities, ["example.ops/hook/guard"]);
+        }
+    }
+
+    #[test]
+    fn v1_rejects_unsupported_variable_after_workspace_path() {
+        let root = package_root();
+        for command in [
+            "${workspacePath}/subdir/${unknownVar}",
+            "${workspacePath}${unknownVar}",
+        ] {
+            let error =
+                parse_manifest(&v1_hook_manifest_with_command(command), root.path()).unwrap_err();
+            assert_eq!(
+                error.code(),
+                "extension_variable_unsupported",
+                "command={command}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_rejects_workspace_path_and_unseparated_extension_suffix_in_mcp() {
+        let root = package_root();
+        fs::create_dir_all(root.path().join("bin")).unwrap();
+        fs::write(root.path().join("bin/server"), "fixture").unwrap();
+
+        let ws_error = parse_manifest(
+            r#"{
+                "schemaVersion":1,
+                "name":"example.ops",
+                "version":"1.0.0",
+                "compatibility":{"cosh":">=0.12.0"},
+                "mcpServers":{"inventory":{
+                    "transport":"stdio",
+                    "command":"${extensionPath}/bin/server",
+                    "args":["--ws=${workspacePath}/subdir"]
+                }}
+            }"#,
+            root.path(),
+        )
+        .unwrap_err();
+        assert_eq!(ws_error.code(), "extension_variable_unsupported");
+
+        let suffix_error = parse_manifest(
+            r#"{
+                "schemaVersion":1,
+                "name":"example.ops",
+                "version":"1.0.0",
+                "compatibility":{"cosh":">=0.12.0"},
+                "mcpServers":{"inventory":{
+                    "transport":"stdio",
+                    "command":"${extensionPath}/bin/server",
+                    "args":["${extensionPath}foo"]
+                }}
+            }"#,
+            root.path(),
+        )
+        .unwrap_err();
+        assert_eq!(suffix_error.code(), "extension_path_invalid");
+    }
 }

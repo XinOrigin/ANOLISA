@@ -478,10 +478,7 @@ fn hook_events(hooks: &ExtensionHooks) -> [(&'static str, &Vec<HookGroup>); 8] {
     ]
 }
 
-fn validate_relative_package_path(
-    package_root: &Path,
-    relative: &str,
-) -> Result<(), ManifestError> {
+fn validate_lexical_relative_path(relative: &str, scope: &str) -> Result<(), ManifestError> {
     if relative.is_empty()
         || relative.contains(['\0', '\\'])
         || Path::new(relative).is_absolute()
@@ -491,9 +488,17 @@ fn validate_relative_package_path(
     {
         return Err(ManifestError::new(
             "extension_path_invalid",
-            format!("invalid extension-relative path: {relative}"),
+            format!("invalid {scope}-relative path: {relative}"),
         ));
     }
+    Ok(())
+}
+
+fn validate_relative_package_path(
+    package_root: &Path,
+    relative: &str,
+) -> Result<(), ManifestError> {
+    validate_lexical_relative_path(relative, "extension")?;
     let candidate = package_root.join(relative);
     if candidate.exists() {
         let root = package_root.canonicalize().map_err(|error| {
@@ -516,6 +521,29 @@ fn validate_relative_package_path(
         }
     }
     Ok(())
+}
+
+fn is_shell_word_terminator(character: char) -> bool {
+    character.is_whitespace() || matches!(character, ';' | '|' | '&' | '>' | '<')
+}
+
+fn find_path_suffix_end(suffix: &str, allow_separator_marker: bool) -> usize {
+    const SEPARATOR_MARKER: &str = "${/}";
+    let mut index = 0;
+    while let Some(character) = suffix[index..].chars().next() {
+        if is_shell_word_terminator(character) || matches!(character, '\'' | '"') {
+            break;
+        }
+        if suffix[index..].starts_with("${") {
+            if allow_separator_marker && suffix[index..].starts_with(SEPARATOR_MARKER) {
+                index += SEPARATOR_MARKER.len();
+                continue;
+            }
+            break;
+        }
+        index += character.len_utf8();
+    }
+    index
 }
 
 fn validate_mcp_executable(package_root: &Path, command: &str) -> Result<(), ManifestError> {
@@ -553,41 +581,68 @@ fn validate_extension_path_references(
     let mut remainder = value;
     while let Some(index) = remainder.find("${") {
         let variable = &remainder[index..];
-        if allow_workspace && variable.starts_with(WORKSPACE_MARKER) {
-            remainder = &variable[WORKSPACE_MARKER.len()..];
-            continue;
-        }
         if allow_workspace && variable.starts_with(SEPARATOR_MARKER) {
             remainder = &variable[SEPARATOR_MARKER.len()..];
             continue;
         }
-        if !variable.starts_with(MARKER) {
+        let (marker, is_workspace) = if allow_workspace && variable.starts_with(WORKSPACE_MARKER) {
+            (WORKSPACE_MARKER, true)
+        } else if variable.starts_with(MARKER) {
+            (MARKER, false)
+        } else {
             return Err(ManifestError::new(
                 "extension_variable_unsupported",
                 "command and args only support ${extensionPath}",
             ));
+        };
+        let suffix = &variable[marker.len()..];
+        let path_end = find_path_suffix_end(suffix, allow_workspace);
+        if allow_workspace {
+            let trailing = &suffix[path_end..];
+            let mut trailing_chars = trailing.chars();
+            if matches!(trailing_chars.next(), Some('\'' | '"'))
+                && trailing_chars
+                    .next()
+                    .is_some_and(|next| !is_shell_word_terminator(next))
+            {
+                return Err(ManifestError::new(
+                    "extension_path_invalid",
+                    format!("{marker} quote must end the argument"),
+                ));
+            }
+            if trailing.starts_with(MARKER) || trailing.starts_with(WORKSPACE_MARKER) {
+                return Err(ManifestError::new(
+                    "extension_path_invalid",
+                    format!("{marker} must be followed by '/' or end the argument"),
+                ));
+            }
         }
-        let suffix = &variable[MARKER.len()..];
-        if !suffix.is_empty() && !suffix.starts_with('/') {
+        let raw_path_suffix = if allow_workspace {
+            &suffix[..path_end]
+        } else {
+            suffix
+        };
+        let normalized_suffix = if allow_workspace {
+            raw_path_suffix.replace(SEPARATOR_MARKER, "/")
+        } else {
+            raw_path_suffix.to_string()
+        };
+        if !normalized_suffix.is_empty() && !normalized_suffix.starts_with('/') {
             return Err(ManifestError::new(
                 "extension_path_invalid",
-                "${extensionPath} must be followed by '/' or end the argument",
+                format!("{marker} must be followed by '/' or end the argument"),
             ));
         }
-        let path_end = suffix
-            .find(|character: char| {
-                character.is_whitespace()
-                    || matches!(character, '\'' | '"' | ';' | '|' | '&' | '>' | '<')
-            })
-            .unwrap_or(suffix.len());
-        let relative = suffix[..path_end].strip_prefix('/').unwrap_or_default();
+        let relative = normalized_suffix.strip_prefix('/').unwrap_or_default();
         if relative.is_empty() {
-            if executable {
+            if !is_workspace && executable {
                 return Err(ManifestError::new(
                     "extension_command_invalid",
                     "MCP command must identify a file inside the extension package",
                 ));
             }
+        } else if is_workspace {
+            validate_lexical_relative_path(relative, "workspace")?;
         } else {
             validate_relative_package_path(package_root, relative)?;
             if executable && !package_root.join(relative).is_file() {
@@ -597,7 +652,7 @@ fn validate_extension_path_references(
                 ));
             }
         }
-        remainder = &variable[MARKER.len() + path_end..];
+        remainder = &variable[marker.len() + path_end..];
     }
     Ok(())
 }

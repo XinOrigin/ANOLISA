@@ -46,15 +46,25 @@ def selected_task_ids(run_dir):
     return None
 
 
+def glob_under(directory: str, pattern: str, *, recursive: bool = False) -> list[str]:
+    """Match a pattern below a literal directory path."""
+    if not directory:
+        return []
+    return glob.glob(
+        os.path.join(glob.escape(directory), pattern),
+        recursive=recursive,
+    )
+
+
 def unscored_cells(evals, runs, seen_runs):
     """保留没有评分报告的选定任务；尚未完成的尝试不能发布解决率。"""
-    roots = {runs or evals}
-    if runs is None and os.path.basename(os.path.normpath(evals)) == "eval":
+    roots = {evals if runs is None else runs}
+    if runs is None and evals and os.path.basename(os.path.normpath(evals)) == "eval":
         roots.add(os.path.dirname(os.path.normpath(evals)))
     manifests = set()
     for root in roots:
         manifests.update(
-            glob.glob(f"{root}/**/out/repeat-*/arm-*/selection.json", recursive=True)
+            glob_under(root, "**/out/repeat-*/arm-*/selection.json", recursive=True)
         )
     for path in sorted(manifests):
         arm_dir = os.path.dirname(path)
@@ -110,7 +120,7 @@ def load_reports(evals: str, runs: str | None = None, allow_legacy: bool = False
     out = []
     seen_runs = set()
     for path in sorted(
-        glob.glob(f"{evals}/**/repeat-*-arm-*/evaluate/*.json", recursive=True)
+        glob_under(evals, "**/repeat-*-arm-*/evaluate/*.json", recursive=True)
     ):
         if f"{os.sep}logs{os.sep}" in path:
             continue

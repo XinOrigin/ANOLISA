@@ -506,7 +506,10 @@ def build_tool_wrapper(
             tool_name, raw_input, call_id=call_id
         )
         session._require_open()
-        if snapshot_tool_input(input_extractor(*call_args, **call_kwargs)) != original_snapshot:
+        checked_input = snapshot_tool_input(input_extractor(*call_args, **call_kwargs))
+        if _serialize_input_projection(checked_input) != _serialize_input_projection(
+            original_snapshot
+        ):
             raise AwError("source_input_mutated")
         if "updated_input" in decision:
             call_args, call_kwargs = apply_tool_input(

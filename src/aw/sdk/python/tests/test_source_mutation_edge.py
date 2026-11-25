@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import IntEnum, StrEnum
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import unittest
 from aw_sdk.sources import LanguageSource, SourceDenied
 from aw_sdk.transport import AwError
 
+from source_fixture import fake_source
 from test_source_mutation import read_provider_log, start_aw_service, stop_service
 
 NATIVE_HOOK_SCRIPT = r"""import json, sys
@@ -497,6 +499,128 @@ class LanguageSourceEdgeTests(unittest.IsolatedAsyncioTestCase):
                         )
             finally:
                 stop_service(proc)
+
+
+class SourceInputProjectionEdgeTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _build_tool(kind: str, executed: list[int]) -> object:
+        def sync_tool(_args: dict[str, object]) -> str:
+            executed[0] += 1
+            return "ok"
+
+        async def async_tool(_args: dict[str, object]) -> str:
+            executed[0] += 1
+            return "ok"
+
+        async def stream_tool(_args: dict[str, object]):
+            executed[0] += 1
+            yield "ok"
+
+        return {"sync": sync_tool, "async": async_tool, "stream": stream_tool}[kind]
+
+    async def test_post_before_tool_projection_rejects_type_and_signed_zero_mutations(
+        self,
+    ) -> None:
+        mutations: tuple[tuple[object, object], ...] = (
+            (False, 0),
+            (0, False),
+            (True, 1),
+            (1, True),
+            (1, 1.0),
+            (1.0, 1),
+            (0.0, -0.0),
+            (-0.0, 0.0),
+        )
+        for kind in ("sync", "async", "stream"):
+            for before, after in mutations:
+                with self.subTest(kind=kind, before=before, after=after):
+                    state: dict[str, object] = {"value": before}
+                    executed = [0]
+
+                    async def handler(
+                        event: str, _payload: dict[str, object], target: object = after
+                    ) -> dict[str, str]:
+                        if event == "tool.before":
+                            state["value"] = target
+                        return {"decision": "continue", "coverage": "checked"}
+
+                    fn = self._build_tool(kind, executed)
+                    source, tasks = fake_source(handler)
+                    async with source.session(session_id="proj-mut") as session:
+                        wrapped = session.wrap_tool(
+                            fn,  # type: ignore[arg-type]
+                            name="check",
+                            extract_input=lambda _a, s=state: {
+                                "value": s["value"],
+                                "nested": [s["value"]],
+                            },
+                        )
+                        with self.assertRaises(AwError) as ctx:
+                            if kind == "stream":
+                                async for _ in wrapped({"k": "v"}):
+                                    pass
+                            else:
+                                await wrapped({"k": "v"})
+                    self.assertEqual(ctx.exception.code, "source_input_mutated")
+                    self.assertFalse(getattr(ctx.exception, "tool_executed", False))
+                    self.assertEqual(executed[0], 0)
+                    self.assertEqual([ev for ev, _ in tasks[0].events], ["tool.before"])
+
+    async def test_post_before_tool_projection_allows_unchanged_enums_and_key_order(
+        self,
+    ) -> None:
+        class Level(IntEnum):
+            ONE = 1
+
+        class Mode(StrEnum):
+            ENABLED = "enabled"
+
+        for kind in ("sync", "async", "stream"):
+            with self.subTest(kind=kind):
+                rechecked = False
+                executed = [0]
+
+                async def handler(event: str, _payload: dict[str, object]) -> dict[str, str]:
+                    nonlocal rechecked
+                    if event == "tool.before":
+                        rechecked = True
+                    return {"decision": "continue", "coverage": "checked"}
+
+                def extract_input(_args: dict[str, object]) -> dict[str, object]:
+                    if not rechecked:
+                        return {
+                            "neg_zero": -0.0,
+                            "zero": 0.0,
+                            "mode": "enabled",
+                            "level": 1,
+                            "flag_t": True,
+                            "flag_f": False,
+                        }
+                    return {
+                        "flag_f": False,
+                        "flag_t": True,
+                        "level": Level.ONE,
+                        "mode": Mode.ENABLED,
+                        "zero": 0.0,
+                        "neg_zero": -0.0,
+                    }
+
+                fn = self._build_tool(kind, executed)
+                source, tasks = fake_source(handler)
+                async with source.session(session_id="proj-ok") as session:
+                    wrapped = session.wrap_tool(
+                        fn,  # type: ignore[arg-type]
+                        name="check",
+                        extract_input=extract_input,
+                    )
+                    if kind == "stream":
+                        self.assertEqual([c async for c in wrapped({"k": "v"})], ["ok"])
+                    else:
+                        self.assertEqual(await wrapped({"k": "v"}), "ok")
+                self.assertEqual(executed[0], 1)
+                self.assertEqual(
+                    [ev for ev, _ in tasks[0].events], ["tool.before", "tool.after"]
+                )
 
 
 if __name__ == "__main__":

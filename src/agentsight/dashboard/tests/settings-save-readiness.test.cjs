@@ -161,3 +161,66 @@ test('storage: a rejected configuration write remains a failed save', async () =
   assert.equal(reads, 0);
   assert.match(form.text(), /configuration read-only/);
 });
+
+test('security utils: verdictTone, isPassVerdict, and badgeClasses classify negated/failure/pass/warning values', () => {
+  const s = require(process.env.AGENTSIGHT_SECURITY_UTILS_BUILD);
+  for (const v of [
+    'unsuccessful', 'disallowed', 'not_allowed', 'not-allowed', 'not allowed', 'policy_disallowed',
+    'block_succeeded', 'deny_success', 'access_denied', 'deny', 'blocked', 'failed', 'reject',
+    'rejected', 'non_pass', 'tampered', 'unsafe', 'success_with_errors',
+  ]) {
+    assert.deepEqual([s.verdictTone(v), s.isPassVerdict(v), s.verdictBadgeClasses(v)], ['risk', false, 'bg-red-100 text-red-700'], v);
+  }
+  for (const v of ['swallow', 'bypass', 'book', 'not_found', 'unknown', '-', '', null, undefined]) {
+    assert.deepEqual([s.verdictTone(v), s.isPassVerdict(v)], ['unknown', false], String(v));
+  }
+  for (const v of ['pass', 'passed', 'allow', 'allowed', 'success', 'succeeded', 'successful', 'safe', 'ok', 'clean', '  PASS  ', 'policy_allowed', 'check_succeeded']) {
+    assert.deepEqual([s.verdictTone(v), s.isPassVerdict(v), s.verdictBadgeClasses(v)], ['pass', true, 'bg-green-100 text-green-700'], v);
+  }
+  for (const v of ['drifted', 'unmanaged', 'warn', 'review', 'caution', 'suspicious', 'warn_succeeded', 'passed_with_warnings']) {
+    assert.deepEqual([s.verdictTone(v), s.isPassVerdict(v)], ['warning', false], v);
+  }
+  for (const v of ['unsuccessful', 'disallowed', 'not_allowed', 'not allowed', 'block_succeeded', 'deny_success', 'failed', 'rejected']) {
+    assert.equal(s.badgeClasses(v, 'result'), 'bg-red-100 text-red-700', v);
+  }
+  for (const v of ['pass', 'passed', 'allow', 'allowed', 'success', 'succeeded', 'safe', 'ok', 'clean']) {
+    assert.equal(s.badgeClasses(v, 'result'), 'bg-green-100 text-green-700', v);
+  }
+  for (const v of ['swallow', 'bypass', 'warn_succeeded', 'unknown', null]) {
+    assert.equal(s.badgeClasses(v, 'result'), 'bg-gray-100 text-gray-700', String(v));
+  }
+});
+
+test('security utils: findDetailValue, securityDetailRows, and securityEventVerdict honor priority and skip blanks', () => {
+  const s = require(process.env.AGENTSIGHT_SECURITY_UTILS_BUILD);
+  assert.equal(s.findDetailValue({ error_message: null, error: 'policy denied' }, ['error_message', 'error', 'message']), 'policy denied');
+  assert.equal(s.findDetailValue({ error_message: '   ', error: 'policy denied' }, ['error_message', 'error', 'message']), 'policy denied');
+  assert.equal(s.findDetailValue({ message: 'low', error: 'mid', error_message: 'high' }, ['error_message', 'error', 'message']), 'high');
+  assert.equal(s.findDetailValue({ verdict: null, result: { verdict: 'block' } }, ['verdict']), 'block');
+  assert.equal(s.findDetailValue({ verdict: '', result: { verdict: 'block' } }, ['verdict']), 'block');
+  assert.equal(s.findDetailValue({ verdict: false }, ['verdict']), false);
+  assert.equal(s.findDetailValue({ code: 0 }, ['code']), 0);
+  const rows = s.securityDetailRows({
+    verdict: null, error_message: null, error: 'policy denied', reason: '   ', policy_reason: 'disallowed_tool', result: { verdict: 'block' },
+  });
+  assert.deepEqual(rows.map((r) => [r.id, r.value]), [['verdict', 'block'], ['error', 'policy denied'], ['reason', 'disallowed_tool']]);
+  assert.equal(s.securityEventVerdict({ event_id: 'evt-1', verdict: null, details: { verdict: null, result: { verdict: 'block' } } }), 'block');
+  assert.equal(s.securityEventVerdict({ event_id: 'evt-2', verdict: '  ', details: { verdict: 'deny' } }), 'deny');
+});
+
+test('security utils: timestampToMs and fmtTime reject non-finite or out-of-range numbers and fall back cleanly', () => {
+  const s = require(process.env.AGENTSIGHT_SECURITY_UTILS_BUILD);
+  const { formatMsCompact } = require(process.env.AGENTSIGHT_DATETIME_BUILD);
+  for (const input of [{ timestamp_ns: NaN }, { timestamp_ns: Infinity }, { timestamp_epoch: -Infinity }, { started_at_ns: NaN, first_seen_epoch: Infinity }, { timestamp_epoch: 1e308 }, { timestamp_epoch: 1e15 }]) {
+    assert.equal(s.timestampToMs(input), null);
+  }
+  const iso = '2026-01-01T00:00:00Z';
+  assert.equal(s.timestampToMs({ timestamp_ns: NaN, timestamp_epoch: Infinity, timestamp: iso }), Date.parse(iso));
+  assert.equal(s.timestampToMs({ timestamp_ns: NaN, timestamp_epoch: 1_700_000_000 }), 1_700_000_000_000);
+  assert.equal(s.timestampToMs({ timestamp_epoch: 0 }), 0);
+  assert.equal(s.timestampToMs({ timestamp_ns: 1_700_000_000_000_000_000 }), 1_700_000_000_000);
+  assert.equal(s.fmtTime({ timestamp_ns: NaN }, 'en-US'), '-');
+  assert.equal(s.fmtTime({ timestamp_epoch: Infinity }, 'en-US'), '-');
+  assert.equal(s.fmtTime({ timestamp_epoch: 1e308 }, 'en-US'), '-');
+  assert.equal(s.fmtTime({ timestamp_ns: NaN, timestamp: iso }, 'en-US'), formatMsCompact(Date.parse(iso), 'en-US'));
+});

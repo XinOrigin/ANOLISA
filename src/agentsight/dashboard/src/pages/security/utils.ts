@@ -21,6 +21,12 @@ export function shortId(value: string | null | undefined, len = 14): string {
   return value.length > len ? `${value.slice(0, len)}...` : value;
 }
 
+const MAX_DATE_MS = 8.64e15;
+
+function validTimestampMs(ms: number): number | null {
+  return Number.isFinite(ms) && Math.abs(ms) <= MAX_DATE_MS ? ms : null;
+}
+
 export function timestampToMs(input: {
   timestamp_ns?: number | null;
   timestamp_epoch?: number | null;
@@ -30,15 +36,32 @@ export function timestampToMs(input: {
   first_seen_ns?: number | null;
   first_seen_epoch?: number | null;
 }): number | null {
-  if (typeof input.timestamp_ns === 'number') return input.timestamp_ns / 1_000_000;
-  if (typeof input.timestamp_epoch === 'number') return input.timestamp_epoch * 1_000;
-  if (typeof input.started_at_ns === 'number') return input.started_at_ns / 1_000_000;
-  if (typeof input.started_at_epoch === 'number') return input.started_at_epoch * 1_000;
-  if (typeof input.first_seen_ns === 'number') return input.first_seen_ns / 1_000_000;
-  if (typeof input.first_seen_epoch === 'number') return input.first_seen_epoch * 1_000;
+  const candidates: Array<number | null> = [
+    typeof input.timestamp_ns === 'number' && Number.isFinite(input.timestamp_ns)
+      ? validTimestampMs(input.timestamp_ns / 1_000_000)
+      : null,
+    typeof input.timestamp_epoch === 'number' && Number.isFinite(input.timestamp_epoch)
+      ? validTimestampMs(input.timestamp_epoch * 1_000)
+      : null,
+    typeof input.started_at_ns === 'number' && Number.isFinite(input.started_at_ns)
+      ? validTimestampMs(input.started_at_ns / 1_000_000)
+      : null,
+    typeof input.started_at_epoch === 'number' && Number.isFinite(input.started_at_epoch)
+      ? validTimestampMs(input.started_at_epoch * 1_000)
+      : null,
+    typeof input.first_seen_ns === 'number' && Number.isFinite(input.first_seen_ns)
+      ? validTimestampMs(input.first_seen_ns / 1_000_000)
+      : null,
+    typeof input.first_seen_epoch === 'number' && Number.isFinite(input.first_seen_epoch)
+      ? validTimestampMs(input.first_seen_epoch * 1_000)
+      : null,
+  ];
+  for (const ms of candidates) {
+    if (ms !== null) return ms;
+  }
   if (input.timestamp) {
     const parsed = Date.parse(input.timestamp);
-    return Number.isNaN(parsed) ? null : parsed;
+    return validTimestampMs(parsed);
   }
   return null;
 }
@@ -125,6 +148,12 @@ const SECURITY_DETAIL_FIELDS: Array<{ id: string; labelKey: MessageKey; keys: st
   { id: 'finding', labelKey: 'sec.detail.finding', keys: ['finding', 'findings'] },
 ];
 
+function isPresentDetailValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  return true;
+}
+
 export function findDetailValue(value: unknown, keys: string[], depth = 0): unknown {
   if (depth > 5 || value === null || value === undefined) return undefined;
   if (Array.isArray(value)) {
@@ -136,9 +165,14 @@ export function findDetailValue(value: unknown, keys: string[], depth = 0): unkn
   }
   if (!isRecord(value)) return undefined;
 
-  const wanted = new Set(keys.map((key) => key.toLowerCase()));
-  for (const [key, child] of Object.entries(value)) {
-    if (wanted.has(key.toLowerCase())) return child;
+  const entries = Object.entries(value);
+  for (const wantedKey of keys) {
+    const lower = wantedKey.toLowerCase();
+    for (const [key, child] of entries) {
+      if (key.toLowerCase() === lower && isPresentDetailValue(child)) {
+        return child;
+      }
+    }
   }
   for (const child of Object.values(value)) {
     const found = findDetailValue(child, keys, depth + 1);
@@ -164,7 +198,8 @@ export function securityDetailRows(
 }
 
 export function securityEventVerdict(event: SecurityEventRecord): string {
-  const value = event.verdict
+  const direct = isPresentDetailValue(event.verdict) ? event.verdict : undefined;
+  const value = direct
     ?? findDetailValue(event.details ?? event.details_preview, ['verdict']);
   return value === undefined || value === null ? '-' : recordPreview(value);
 }
@@ -175,40 +210,81 @@ export function normalizeVerdict(value: string | null | undefined): string {
   return (value ?? '').trim().toLowerCase();
 }
 
-export function verdictTone(value: string | null | undefined): VerdictTone {
-  const v = normalizeVerdict(value);
-  if (!v || v === '-') return 'unknown';
-  if (
-    v === 'pass'
-    || v === 'allow'
-    || v === 'allowed'
-    || v === 'ok'
-    || v === 'safe'
-    || v === 'clean'
-    || v.includes('success')
-  ) {
-    return 'pass';
-  }
-  if (
-    v === 'drifted'
-    || v === 'unmanaged'
-    || v.includes('warn')
-    || v.includes('review')
-    || v.includes('caution')
-    || v.includes('suspicious')
-  ) {
-    return 'warning';
-  }
+const PASS_VERDICT_TOKENS = new Set([
+  'pass',
+  'passed',
+  'allow',
+  'allowed',
+  'ok',
+  'safe',
+  'clean',
+  'success',
+  'succeeded',
+  'successful',
+]);
+
+const NEGATION_TOKENS = new Set([
+  'not',
+  'no',
+  'non',
+  'never',
+  'without',
+]);
+
+function verdictTokens(v: string): string[] {
+  return v.split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function hasRiskSignal(v: string, tokens: string[]): boolean {
   if (
     v === 'tampered'
+    || tokens.includes('tampered')
     || v.includes('deny')
+    || v.includes('denied')
     || v.includes('block')
     || v.includes('fail')
     || v.includes('error')
     || v.includes('risk')
     || v.includes('unsafe')
+    || v.includes('reject')
+    || v.includes('disallow')
+    || v.includes('unsuccess')
   ) {
+    return true;
+  }
+  return tokens.some((token) => NEGATION_TOKENS.has(token))
+    && tokens.some((token) => PASS_VERDICT_TOKENS.has(token));
+}
+
+function hasWarningSignal(v: string, tokens: string[]): boolean {
+  return (
+    v === 'drifted'
+    || v === 'unmanaged'
+    || tokens.includes('drifted')
+    || tokens.includes('unmanaged')
+    || v.includes('warn')
+    || v.includes('review')
+    || v.includes('caution')
+    || v.includes('suspicious')
+  );
+}
+
+function hasPassSignal(tokens: string[]): boolean {
+  return tokens.some((token) => PASS_VERDICT_TOKENS.has(token));
+}
+
+export function verdictTone(value: string | null | undefined): VerdictTone {
+  const v = normalizeVerdict(value);
+  if (!v || v === '-') return 'unknown';
+  const tokens = verdictTokens(v);
+  if (hasRiskSignal(v, tokens)) {
     return 'risk';
+  }
+  if (hasWarningSignal(v, tokens)) {
+    return 'warning';
+  }
+  if (hasPassSignal(tokens)) {
+    return 'pass';
   }
   return 'unknown';
 }
@@ -320,13 +396,14 @@ export function stateClasses(state: string): string {
 }
 
 export function badgeClasses(value: string | null | undefined, kind: 'category' | 'result' | 'kind'): string {
-  const v = (value ?? '').toLowerCase();
+  const v = normalizeVerdict(value);
   if (kind === 'result') {
-    if (v.includes('success') || v.includes('allow') || v === 'ok' || v === 'pass') {
-      return 'bg-green-100 text-green-700';
-    }
-    if (v.includes('fail') || v.includes('deny') || v.includes('block') || v.includes('error') || v.includes('risk')) {
+    const tokens = verdictTokens(v);
+    if (hasRiskSignal(v, tokens)) {
       return 'bg-red-100 text-red-700';
+    }
+    if (!hasWarningSignal(v, tokens) && hasPassSignal(tokens)) {
+      return 'bg-green-100 text-green-700';
     }
     return 'bg-gray-100 text-gray-700';
   }

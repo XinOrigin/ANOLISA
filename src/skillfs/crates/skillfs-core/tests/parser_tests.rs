@@ -210,3 +210,253 @@ fn test_limit_boundary_is_exclusive() {
         .expect("a file exactly at the limit must parse");
     assert_eq!(entry.metadata.name, "large-skill");
 }
+
+#[cfg(unix)]
+#[test]
+fn test_parse_fifo_fails_fast_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fifo_path = dir.path().join("SKILL.md");
+    let c_path = CString::new(fifo_path.as_os_str().as_bytes()).expect("fifo CString");
+    assert_eq!(
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) },
+        0,
+        "mkfifo failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let thread_path = fifo_path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = parser::parse_skill_file_with_limit(&thread_path, 1024);
+        let _ = tx.send(res);
+    });
+
+    let res = match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(res) => res,
+        Err(err) => {
+            // Unblock a pre-fix blocking reader so the test process exits cleanly.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo_path);
+            panic!("parse_skill_file_with_limit stalled on a FIFO: {err}");
+        }
+    };
+
+    match res {
+        Err(parser::ParseError::IoError(err)) => {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "FIFO must be rejected as InvalidInput, got {err:?}"
+            );
+        }
+        other => panic!("expected IoError(InvalidInput) for FIFO, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_parse_symlink_to_fifo_fails_fast_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{OpenOptionsExt, symlink};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fifo_path = dir.path().join("pipe");
+    let link_path = dir.path().join("SKILL.md");
+    let c_path = CString::new(fifo_path.as_os_str().as_bytes()).expect("fifo CString");
+    assert_eq!(
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) },
+        0,
+        "mkfifo failed: {}",
+        std::io::Error::last_os_error()
+    );
+    symlink(&fifo_path, &link_path).expect("symlink to fifo");
+
+    let thread_path = link_path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = parser::parse_skill_file_with_limit(&thread_path, 1024);
+        let _ = tx.send(res);
+    });
+
+    let res = match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(res) => res,
+        Err(err) => {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo_path);
+            panic!("parse_skill_file_with_limit stalled on a symlinked FIFO: {err}");
+        }
+    };
+
+    match res {
+        Err(parser::ParseError::IoError(err)) => {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "symlinked FIFO must be rejected as InvalidInput, got {err:?}"
+            );
+        }
+        other => panic!("expected IoError(InvalidInput) for symlinked FIFO, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_parse_character_device_is_rejected() {
+    let err = parser::parse_skill_file_with_limit(std::path::Path::new("/dev/null"), 64)
+        .expect_err("/dev/null must be rejected as non-regular file");
+    match err {
+        parser::ParseError::IoError(io_err) => {
+            assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "character device must be rejected as InvalidInput, got {io_err:?}"
+            );
+        }
+        other => panic!("expected IoError(InvalidInput) for /dev/null, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_parse_dev_zero_is_rejected_without_reading() {
+    use std::time::Duration;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = parser::parse_skill_file_with_limit(std::path::Path::new("/dev/zero"), 64);
+        let _ = tx.send(res);
+    });
+
+    let res = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("parse_skill_file_with_limit stalled reading /dev/zero");
+    match res {
+        Err(parser::ParseError::IoError(io_err)) => {
+            assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "/dev/zero must be rejected as InvalidInput, got {io_err:?}"
+            );
+        }
+        other => panic!("expected IoError(InvalidInput) for /dev/zero, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_directory_is_rejected_as_invalid_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let err = parser::parse_skill_file_with_limit(dir.path(), 1024)
+        .expect_err("directory must be rejected as non-regular file");
+    match err {
+        parser::ParseError::IoError(io_err) => {
+            assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "directory must be rejected as InvalidInput, got {io_err:?}"
+            );
+        }
+        other => panic!("expected IoError(InvalidInput) for directory, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_parse_valid_symlink_follows_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target_dir = dir.path().join("real-skill");
+    let link_dir = dir.path().join("linked-skill");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+    std::fs::create_dir_all(&link_dir).expect("create link dir");
+
+    let target_path = target_dir.join("SKILL.md");
+    let link_path = link_dir.join("SKILL.md");
+    std::fs::write(
+        &target_path,
+        "---\nname: linked-skill\ndescription: Follows valid symlink\n---\n\nBody.\n",
+    )
+    .expect("write target skill");
+    symlink(&target_path, &link_path).expect("create symlink");
+
+    let entry = parser::parse_skill_file_with_limit(&link_path, 1024)
+        .expect("valid symlink to regular SKILL.md must be followed");
+    assert_eq!(entry.metadata.name, "linked-skill");
+    assert_eq!(entry.metadata.description, "Follows valid symlink");
+    assert!(entry.parse_status.is_ok());
+    assert_eq!(entry.source_path, link_path);
+}
+
+#[test]
+fn test_parse_exact_limit_multibyte_and_usize_max() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("SKILL.md");
+    let content = "---\nname: exact-skill\ndescription: Caf\u{00e9}\n---\n\nBody.\n";
+    std::fs::write(&path, content).expect("write skill");
+    let exact = content.len();
+
+    let entry = parser::parse_skill_file_with_limit(&path, exact)
+        .expect("file exactly at max_size must parse");
+    assert_eq!(entry.metadata.name, "exact-skill");
+    assert_eq!(entry.metadata.description, "Caf\u{00e9}");
+
+    let err = parser::parse_skill_file_with_limit(&path, exact - 1)
+        .expect_err("file 1 byte over max_size must fail");
+    assert!(
+        matches!(
+            err,
+            parser::ParseError::FileTooLarge { size, max }
+                if size == exact && max == exact - 1
+        ),
+        "expected FileTooLarge {{ size: {exact}, max: {} }}, got {err:?}",
+        exact - 1
+    );
+
+    let entry_max = parser::parse_skill_file_with_limit(&path, usize::MAX)
+        .expect("usize::MAX limit must not overflow read cap");
+    assert_eq!(entry_max.metadata.name, "exact-skill");
+}
+
+#[test]
+fn test_parse_invalid_utf8_within_limit_returns_invalid_data() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("SKILL.md");
+    std::fs::write(&path, [0xff, 0xfe, b'a', b'b']).expect("write invalid utf8");
+
+    let err = parser::parse_skill_file_with_limit(&path, 64)
+        .expect_err("invalid UTF-8 within limit must return IoError");
+    match err {
+        parser::ParseError::IoError(io_err) => {
+            assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "invalid UTF-8 must map to InvalidData, got {io_err:?}"
+            );
+        }
+        other => panic!("expected IoError(InvalidData), got {other:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_parse_proc_virtual_file_bounded_by_stream_cap() {
+    // On Linux, `/proc/self/status` reports S_IFREG with st_size == 0 while
+    // yielding hundreds of bytes on read, exercising the post-fstat read cap.
+    let err = parser::parse_skill_file_with_limit(std::path::Path::new("/proc/self/status"), 16)
+        .expect_err("zero-size /proc file exceeding cap must return FileTooLarge");
+    assert!(
+        matches!(err, parser::ParseError::FileTooLarge { size: 17, max: 16 }),
+        "expected FileTooLarge {{ size: 17, max: 16 }}, got {err:?}"
+    );
+}

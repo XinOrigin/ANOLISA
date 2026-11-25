@@ -88,17 +88,38 @@ pub fn parse_skill_file(path: &Path) -> Result<SkillEntry, ParseError> {
 }
 
 /// Parse from file with explicit size limit.
+///
+/// Opens the path non-blockingly on Unix so a FIFO or special file cannot stall
+/// the caller before `fstat` verifies it is a regular file, and caps the read
+/// to `max_size + 1` bytes so a file that grows after `fstat` (or reports size
+/// `0` like a virtual file) cannot bypass the limit.
 pub fn parse_skill_file_with_limit(path: &Path, max_size: usize) -> Result<SkillEntry, ParseError> {
-    let file_meta = std::fs::metadata(path)?;
-    let size = file_meta.len() as usize;
-    if size > max_size {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+
+    let file_meta = file.metadata()?;
+    if !file_meta.is_file() {
+        return Err(ParseError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        )));
+    }
+
+    let meta_len = file_meta.len();
+    if meta_len > max_size as u64 {
         return Err(ParseError::FileTooLarge {
-            size,
+            size: usize::try_from(meta_len).unwrap_or(usize::MAX),
             max: max_size,
         });
     }
 
-    let content = std::fs::read_to_string(path)?;
+    let content = read_bounded_utf8(file, max_size)?;
     let dir_name = path
         .parent()
         .and_then(|p| p.file_name())
@@ -112,6 +133,29 @@ pub fn parse_skill_file_with_limit(path: &Path, max_size: usize) -> Result<Skill
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
     Ok(entry)
+}
+
+/// Read at most `max_size` UTF-8 bytes from `reader`, returning
+/// [`ParseError::FileTooLarge`] when more than `max_size` bytes are present.
+fn read_bounded_utf8<R: std::io::Read>(reader: R, max_size: usize) -> Result<String, ParseError> {
+    use std::io::Read;
+
+    // Buffer bytes first and enforce the ceiling before UTF-8 decoding: the
+    // `max_size + 1` cut can split a multi-byte character, and an oversized
+    // stream must answer FileTooLarge rather than InvalidData.
+    let mut raw = Vec::new();
+    let read_limit = (max_size as u64).saturating_add(1);
+    reader.take(read_limit).read_to_end(&mut raw)?;
+    if raw.len() > max_size {
+        return Err(ParseError::FileTooLarge {
+            size: raw.len(),
+            max: max_size,
+        });
+    }
+
+    String::from_utf8(raw).map_err(|err| {
+        ParseError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +578,69 @@ fn parse_typed_list(section: &str, issues: &mut Vec<String>) -> Vec<Parameter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Bounded Stream Read Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_bounded_utf8_caps_unbounded_or_growing_stream() {
+        let err = read_bounded_utf8(std::io::repeat(b'a'), 64)
+            .expect_err("unbounded stream must stop at max_size + 1");
+        assert!(
+            matches!(err, ParseError::FileTooLarge { size: 65, max: 64 }),
+            "expected FileTooLarge {{ size: 65, max: 64 }}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_utf8_split_multibyte_over_limit_reports_file_too_large() {
+        // `a€` is 4 bytes (`[0x61, 0xe2, 0x82, 0xac]`). Reading max_size + 1 = 3
+        // bytes slices `€` mid-sequence; size must be checked before UTF-8 decode.
+        let err = read_bounded_utf8(std::io::Cursor::new("a\u{20ac}".as_bytes()), 2)
+            .expect_err("oversized multi-byte stream must report FileTooLarge");
+        assert!(
+            matches!(err, ParseError::FileTooLarge { size: 3, max: 2 }),
+            "expected FileTooLarge {{ size: 3, max: 2 }}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_utf8_exact_and_zero_boundaries() {
+        let exact = read_bounded_utf8(std::io::Cursor::new("a\u{20ac}".as_bytes()), 4)
+            .expect("stream at exact max_size must succeed");
+        assert_eq!(exact, "a\u{20ac}");
+
+        let empty = read_bounded_utf8(std::io::Cursor::new(b"".as_slice()), 0)
+            .expect("empty stream at max_size = 0 must succeed");
+        assert!(empty.is_empty());
+
+        let err = read_bounded_utf8(std::io::Cursor::new(b"x".as_slice()), 0)
+            .expect_err("1-byte stream at max_size = 0 must fail");
+        assert!(
+            matches!(err, ParseError::FileTooLarge { size: 1, max: 0 }),
+            "expected FileTooLarge {{ size: 1, max: 0 }}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_utf8_invalid_utf8_within_limit_maps_to_invalid_data() {
+        let err = read_bounded_utf8(std::io::Cursor::new([0xff, 0xfe]), 4)
+            .expect_err("invalid UTF-8 within limit must fail");
+        match err {
+            ParseError::IoError(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected IoError(InvalidData), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_read_bounded_utf8_usize_max_does_not_overflow() {
+        let content = read_bounded_utf8(std::io::Cursor::new(b"ok".as_slice()), usize::MAX)
+            .expect("usize::MAX limit must not overflow take()");
+        assert_eq!(content, "ok");
+    }
 
     // -----------------------------------------------------------------------
     // Basic Parsing Tests

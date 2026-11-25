@@ -338,7 +338,10 @@ fn timestamp(text: &str) -> Option<DateTime<Utc>> {
 fn load(data: &AppState, kind: &str, id: &str) -> anyhow::Result<AtifTrajectory> {
     anyhow::ensure!(
         matches!(kind, "session" | "conversation" | "trajectory"),
-        "invalid trajectory source"
+        Rejected {
+            status: StatusCode::BAD_REQUEST,
+            message: "invalid trajectory source",
+        }
     );
     if kind != "trajectory" {
         if let Some(store) = &data.genai_store {
@@ -365,7 +368,11 @@ fn load(data: &AppState, kind: &str, id: &str) -> anyhow::Result<AtifTrajectory>
             }
         }
     }
-    anyhow::bail!("trajectory not found")
+    Err(Rejected {
+        status: StatusCode::NOT_FOUND,
+        message: "trajectory not found",
+    }
+    .into())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -559,18 +566,27 @@ struct Rejected {
 #[error("restore refused; refresh changes and confirm again: {0}")]
 struct RestoreNoEffect(String);
 
+fn decode_cursor(raw: &str) -> Result<Cursor, Rejected> {
+    let invalid = || Rejected {
+        status: StatusCode::BAD_REQUEST,
+        message: "invalid cursor",
+    };
+    let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| invalid())?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
+}
+
 async fn blocking(job: impl FnOnce() -> anyhow::Result<Value> + Send + 'static) -> HttpResponse {
     match web::block(job).await {
         Ok(Ok(value)) => HttpResponse::Ok().json(value),
         Ok(Err(error)) if error.is::<RestoreNoEffect>() => HttpResponse::BadGateway()
             .json(json!({"error": error.to_string(), "effect": "known_no_effect"})),
-        Ok(Err(error)) => HttpResponse::build(
-            error
-                .downcast_ref::<Rejected>()
-                .map(|e| e.status)
-                .unwrap_or(StatusCode::BAD_GATEWAY),
-        )
-        .json(json!({"error": error.to_string()})),
+        Ok(Err(error)) => {
+            if let Some(rejected) = error.downcast_ref::<Rejected>() {
+                HttpResponse::build(rejected.status).json(json!({"error": rejected.message}))
+            } else {
+                HttpResponse::BadGateway().json(json!({"error": error.to_string()}))
+            }
+        }
         Err(_) => {
             HttpResponse::InternalServerError().json(json!({"error": "snapshot worker failed"}))
         }
@@ -615,8 +631,9 @@ pub(super) async fn get_snapshots(
     let cursor = query.into_inner().cursor;
     blocking(move || {
         let now = Utc::now();
-        let cfg = config(&data)?;
         let doc = load(&data, &kind, &id)?;
+        let cursor = cursor.as_deref().map(decode_cursor).transpose()?;
+        let cfg = config(&data)?;
         let Some(selector) = workspace(&doc, &cfg)? else {
             return Ok(json!({"trajectory": doc, "scope": null, "reason": "workspace_unresolved", "step_snapshots": {}}));
         };
@@ -633,7 +650,6 @@ pub(super) async fn get_snapshots(
         let boundaries: Vec<_> = doc.steps.iter().map(|step| (step.step_id, &step.source, &step.timestamp)).collect();
         let checkpoints = hermes_checkpoint_steps(&doc, &scope.path, ws);
         let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&(kind, id, boundaries, ws, &scope.path, cfg.socket(), &checkpoints))?));
-        let cursor: Option<Cursor> = cursor.map(|raw| -> anyhow::Result<_> { Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(raw)?)?) }).transpose()?;
         if let Some(cursor) = &cursor {
             anyhow::ensure!(&cursor.workspace == ws && cursor.revision == revision && cursor.as_of <= now, Rejected { status: StatusCode::CONFLICT, message: "snapshot page changed; reload from the first page" });
         }

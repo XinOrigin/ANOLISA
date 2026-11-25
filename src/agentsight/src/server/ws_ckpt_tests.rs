@@ -703,6 +703,94 @@ async fn api_joins_cli_pages_and_rejects_mixed_revisions() {
 }
 
 #[actix_web::test]
+async fn api_maps_snapshot_client_errors_and_preserves_backend_502() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = fixture_cli(dir.path(), false);
+    fixture_trajectory(dir.path(), &data);
+    let app = awtest::init_service(
+        App::new()
+            .app_data(data)
+            .service(get_snapshots)
+            .service(snapshot_availability),
+    )
+    .await;
+
+    for kind in ["trajectory", "session", "conversation"] {
+        let uri = format!("/ws-ckpt/{kind}/missing/snapshots");
+        let head = awtest::call_service(
+            &app,
+            awtest::TestRequest::default()
+                .method(actix_web::http::Method::HEAD)
+                .uri(&uri)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::NOT_FOUND, "HEAD {uri}");
+        assert!(awtest::read_body(head).await.is_empty());
+
+        let get =
+            awtest::call_service(&app, awtest::TestRequest::get().uri(&uri).to_request()).await;
+        assert_eq!(get.status(), StatusCode::NOT_FOUND, "GET {uri}");
+        let body: Value = awtest::read_body_json(get).await;
+        assert_eq!(body, json!({"error": "trajectory not found"}));
+    }
+
+    let bogus_head = awtest::call_service(
+        &app,
+        awtest::TestRequest::default()
+            .method(actix_web::http::Method::HEAD)
+            .uri("/ws-ckpt/bogus/fixture-session/snapshots")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(bogus_head.status(), StatusCode::NOT_FOUND);
+    assert!(awtest::read_body(bogus_head).await.is_empty());
+
+    let bogus = awtest::call_service(
+        &app,
+        awtest::TestRequest::get()
+            .uri("/ws-ckpt/bogus/fixture-session/snapshots")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(bogus.status(), StatusCode::BAD_REQUEST);
+    let body: Value = awtest::read_body_json(bogus).await;
+    assert_eq!(body, json!({"error": "invalid trajectory source"}));
+
+    for bad_cursor in ["not-base64", "e30", "bm90LWpzb24", ""] {
+        let uri = format!("/ws-ckpt/trajectory/fixture-session/snapshots?cursor={bad_cursor}");
+        let response =
+            awtest::call_service(&app, awtest::TestRequest::get().uri(&uri).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body: Value = awtest::read_body_json(response).await;
+        assert_eq!(body, json!({"error": "invalid cursor"}), "{uri}");
+    }
+
+    assert!(!dir.path().join("calls").exists());
+
+    // Without first.json, `ws-ckpt list` exits non-zero to exercise a real backend failure.
+    let backend_failure = awtest::call_service(
+        &app,
+        awtest::TestRequest::get()
+            .uri("/ws-ckpt/trajectory/fixture-session/snapshots")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(backend_failure.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = awtest::read_body_json(backend_failure).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("ws-ckpt query failed"))
+    );
+    assert!(
+        fixture_calls(dir.path())
+            .lines()
+            .any(|line| line.starts_with("list "))
+    );
+}
+
+#[actix_web::test]
 async fn incompatible_cli_hides_workspace_snapshots_and_restore() {
     for failure in [
         "--guarded",

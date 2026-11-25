@@ -1600,9 +1600,22 @@ struct LifecycleLock {
 /// Acquire the lifecycle lock for `socket_path` without blocking.
 ///
 /// Returns an error if another instance already holds the lock (the
-/// endpoint is live) or the lock file cannot be created.
+/// endpoint is live), the lock path is not a regular file owned by the
+/// current effective uid (for example a symlink, FIFO, or foreign-owned
+/// file), or the lock file cannot be created.
 fn acquire_lifecycle_lock(socket_path: &Path) -> Result<LifecycleLock, Box<dyn std::error::Error>> {
-    use std::os::unix::fs::OpenOptionsExt;
+    let expected_uid = unsafe { libc::geteuid() };
+    acquire_lifecycle_lock_for_uid(socket_path, expected_uid)
+}
+
+/// Inner implementation of [`acquire_lifecycle_lock`] parameterized by
+/// `expected_uid` so the foreign-owner rejection can be unit-tested
+/// deterministically without a second uid.
+fn acquire_lifecycle_lock_for_uid(
+    socket_path: &Path,
+    expected_uid: u32,
+) -> Result<LifecycleLock, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
 
     let lock_path = lifecycle_lock_path(socket_path);
@@ -1612,6 +1625,7 @@ fn acquire_lifecycle_lock(socket_path: &Path) -> Result<LifecycleLock, Box<dyn s
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&lock_path)
         .map_err(|e| {
             format!(
@@ -1619,6 +1633,31 @@ fn acquire_lifecycle_lock(socket_path: &Path) -> Result<LifecycleLock, Box<dyn s
                 lock_path.display()
             )
         })?;
+
+    // Inspect the opened file descriptor via fstat before taking flock so
+    // non-regular files (e.g. FIFOs) and foreign-owned files fail closed
+    // without locking an untrusted object.
+    let meta = file.metadata().map_err(|e| {
+        format!(
+            "failed to stat lifecycle lock '{}': {e}",
+            lock_path.display()
+        )
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "lifecycle lock '{}' is not a regular file",
+            lock_path.display()
+        )
+        .into());
+    }
+    if meta.uid() != expected_uid {
+        return Err(format!(
+            "lifecycle lock '{}' is owned by uid {} (expected {expected_uid})",
+            lock_path.display(),
+            meta.uid()
+        )
+        .into());
+    }
 
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
@@ -3766,6 +3805,163 @@ mod tests {
         assert!(result.is_accepted());
     }
 
+    // ── Lifecycle lock hardening ─────────────────────────────────────────
+
+    #[test]
+    fn lifecycle_lock_rejects_live_symlink_and_leaves_target_untouched() {
+        let dir = private_tempdir();
+        let target = dir.path().join("outside-target");
+        std::fs::write(&target, "sentinel").unwrap();
+        let socket_path = dir.path().join("test.sock");
+        let lock_path = lifecycle_lock_path(&socket_path);
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+
+        let err = acquire_lifecycle_lock(&socket_path)
+            .err()
+            .expect("live symlink at lock path must be rejected");
+        assert!(
+            err.to_string().contains("failed to open lifecycle lock"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink at lock path must not be removed or replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "sentinel",
+            "symlink target must remain untouched"
+        );
+    }
+
+    #[test]
+    fn lifecycle_lock_rejects_dangling_symlink_without_creating_target() {
+        let dir = private_tempdir();
+        let target = dir.path().join("must-not-be-created");
+        let socket_path = dir.path().join("test.sock");
+        let lock_path = lifecycle_lock_path(&socket_path);
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+
+        let err = acquire_lifecycle_lock(&socket_path)
+            .err()
+            .expect("dangling symlink at lock path must be rejected");
+        assert!(
+            err.to_string().contains("failed to open lifecycle lock"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "dangling symlink target must not be created"
+        );
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "dangling symlink must not be removed or replaced"
+        );
+    }
+
+    #[test]
+    fn lifecycle_lock_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = private_tempdir();
+        let socket_path = dir.path().join("test.sock");
+        let lock_path = lifecycle_lock_path(&socket_path);
+        let c_path = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path and mode is valid.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let start = std::time::Instant::now();
+        let err = acquire_lifecycle_lock(&socket_path)
+            .err()
+            .expect("FIFO at lock path must be rejected");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "FIFO rejection must not block, took {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "FIFO at lock path must not be removed or replaced"
+        );
+    }
+
+    #[test]
+    fn lifecycle_lock_rejects_foreign_owner() {
+        let dir = private_tempdir();
+        let socket_path = dir.path().join("test.sock");
+        let lock_path = lifecycle_lock_path(&socket_path);
+        std::fs::write(&lock_path, "").unwrap();
+
+        let current_uid = unsafe { libc::geteuid() };
+        let expected_uid = current_uid.wrapping_add(1);
+        let err = acquire_lifecycle_lock_for_uid(&socket_path, expected_uid)
+            .err()
+            .expect("foreign-owned lock file must be rejected");
+        assert!(
+            err.to_string().contains("owned by uid"),
+            "unexpected error: {err}"
+        );
+
+        let held = acquire_lifecycle_lock_for_uid(&socket_path, current_uid)
+            .expect("matching owner must acquire the lock");
+        // Owner validation must run before flock so a held foreign-owned
+        // file still fails on ownership rather than EWOULDBLOCK.
+        let err_while_held = acquire_lifecycle_lock_for_uid(&socket_path, expected_uid)
+            .err()
+            .expect("foreign-owned lock file must be rejected even while held");
+        assert!(
+            err_while_held.to_string().contains("owned by uid"),
+            "unexpected error while held: {err_while_held}"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn lifecycle_lock_acquires_regular_file_and_detects_contention() {
+        let dir = private_tempdir();
+        let socket_path = dir.path().join("test.sock");
+        let lock_path = lifecycle_lock_path(&socket_path);
+
+        let lock1 =
+            acquire_lifecycle_lock(&socket_path).expect("initial lock acquisition must succeed");
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "lock path must be a regular file"
+        );
+
+        let err = acquire_lifecycle_lock(&socket_path)
+            .err()
+            .expect("second holder must fail with EWOULDBLOCK contention");
+        assert!(
+            err.to_string()
+                .contains("already owns the control socket endpoint"),
+            "unexpected contention error: {err}"
+        );
+
+        drop(lock1);
+        let _lock2 = acquire_lifecycle_lock(&socket_path)
+            .expect("lock must be acquirable again after release");
+    }
+
     // ── Server integration (Linux only) ──────────────────────────────────
 
     #[cfg(target_os = "linux")]
@@ -5260,6 +5456,39 @@ mod tests {
                     .file_type()
                     .is_symlink(),
                 "symlink must not be deleted"
+            );
+        }
+
+        #[test]
+        fn start_refuses_symlink_at_lock_path() {
+            let dir = private_tempdir();
+            let target = dir.path().join("lock-target");
+            std::fs::write(&target, "untouched").unwrap();
+            let socket_path = dir.path().join("test.sock");
+            let lock_path = lifecycle_lock_path(&socket_path);
+            std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+
+            let result = ControlSocketServer::new(ControlSocketConfig {
+                socket_path: socket_path.clone(),
+                trusted_peer: self_exe_config(),
+            })
+            .start();
+            assert!(result.is_err(), "symlink at lock path must fail closed");
+            assert!(
+                !socket_path.exists(),
+                "socket must not be bound when lock path is a symlink"
+            );
+            assert!(
+                std::fs::symlink_metadata(&lock_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "lock symlink must not be deleted"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "untouched",
+                "lock symlink target must remain untouched"
             );
         }
 

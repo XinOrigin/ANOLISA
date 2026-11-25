@@ -101,8 +101,8 @@ pub fn extract_private_metadata(
 
 /// Return `true` when a Claude-style user event only carries tool results:
 /// a `message.content` array with at least one `tool_result` block and no
-/// `text` block. This mirrors the discrimination the ATIF converter in
-/// `atif.rs` applies when classifying such events as observations instead
+/// non-blank `text` block. This mirrors the discrimination the ATIF converter
+/// in `atif.rs` applies when classifying such events as observations instead
 /// of user turns.
 fn carries_only_tool_results(message: Option<&serde_json::Value>) -> bool {
     let Some(content) = message.and_then(|m| m.get("content")) else {
@@ -114,10 +114,7 @@ fn carries_only_tool_results(message: Option<&serde_json::Value>) -> bool {
     let has_tool_result = blocks
         .iter()
         .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
-    let has_text = blocks
-        .iter()
-        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"));
-    has_tool_result && !has_text
+    has_tool_result && !crate::atif::has_text_block(content)
 }
 
 #[cfg(test)]
@@ -221,5 +218,58 @@ mod tests {
         let events = load_jsonl_events(content);
         let extra = extract_private_metadata(&events, "myapp");
         assert_eq!(extra["user_message_count"], 3);
+    }
+
+    #[test]
+    fn test_extract_private_metadata_ignores_blank_text_in_tool_result_carriers() {
+        use agentsight_atif::StepSource;
+
+        let content = concat!(
+            "{\"type\":\"user\",\"cwd\":\"/data/myapp\",\"message\":{\"role\":\"user\",\"content\":\"run checks\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"exec\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"},{\"type\":\"text\",\"text\":\"\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"exec\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t2\",\"content\":\"ok\"},{\"type\":\"text\",\"text\":\"   \\n\\t  \"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"exec\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t3\",\"content\":\"ok\"},{\"type\":\"text\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t4\",\"name\":\"exec\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t4\",\"content\":\"ok\"},{\"type\":\"text\",\"text\":null}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t5\",\"name\":\"exec\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t5\",\"content\":\"ok\"},{\"type\":\"text\",\"text\":123}]}}\n",
+        );
+        let events = load_jsonl_events(content);
+        let extra = extract_private_metadata(&events, "myapp");
+        let trajectory = crate::atif::convert_qoder_events(&events, "qoder").unwrap();
+        let user_steps = trajectory
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::User)
+            .count();
+
+        assert_eq!(extra["user_message_count"], 1);
+        assert_eq!(extra["assistant_message_count"], 5);
+        assert_eq!(extra["user_message_count"], user_steps as i64);
+    }
+
+    #[test]
+    fn test_extract_private_metadata_counts_mixed_tool_result_with_blank_and_non_blank_text() {
+        use agentsight_atif::StepSource;
+
+        let content = concat!(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"start\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"exec\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"},{\"type\":\"text\",\"text\":\"   \"},{\"type\":\"text\",\"text\":\"  follow up  \"}]}}\n",
+        );
+        let events = load_jsonl_events(content);
+        let extra = extract_private_metadata(&events, "myapp");
+        let trajectory = crate::atif::convert_qoder_events(&events, "qoder").unwrap();
+        let user_steps = trajectory
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::User)
+            .count();
+
+        assert_eq!(user_steps, 2);
+        assert_eq!(extra["user_message_count"], 2);
     }
 }

@@ -538,18 +538,18 @@ fn extract_tool_results(content: &serde_json::Value) -> Vec<ExtractedToolResult>
     results
 }
 
-/// Return `true` if a content array contains any `text`-type block.
-fn has_text_block(content: &serde_json::Value) -> bool {
-    if let Some(arr) = content.as_array() {
+/// Return `true` if a content array contains any non-blank `text`-type block.
+pub(crate) fn has_text_block(content: &serde_json::Value) -> bool {
+    content.as_array().is_some_and(|arr| {
         arr.iter().any(|b| {
-            b.as_object()
-                .and_then(|o| o.get("type"))
-                .and_then(|t| t.as_str())
-                == Some("text")
+            b.as_object().is_some_and(|o| {
+                o.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && o.get("text")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| !t.trim().is_empty())
+            })
         })
-    } else {
-        false
-    }
+    })
 }
 
 /// Merge tool results into the observation of the agent step owning the calls.
@@ -986,5 +986,94 @@ mod tests {
             Some(&serde_json::Value::String(String::new())),
             "a null tool result records no text"
         );
+    }
+
+    #[test]
+    fn test_has_text_block_ignores_blank_missing_and_non_string_text() {
+        assert!(!has_text_block(&serde_json::json!("plain string")));
+        assert!(!has_text_block(&serde_json::json!(null)));
+        assert!(!has_text_block(&serde_json::json!([])));
+        assert!(!has_text_block(&serde_json::json!(["not-an-object", null])));
+        assert!(!has_text_block(&serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            {"type": "text"},
+            {"type": "text", "text": null},
+            {"type": "text", "text": 123},
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "   \n\t\u{00a0}  "},
+        ])));
+        assert!(has_text_block(&serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            {"type": "text", "text": "   "},
+            {"type": "text", "text": "  keep going  "},
+        ])));
+    }
+
+    #[test]
+    fn test_convert_tool_result_with_blank_text_block_emits_no_user_step() {
+        let content = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-25T10:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[",
+            "{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}},",
+            "{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"bash\",\"input\":{}},",
+            "{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"bash\",\"input\":{}},",
+            "{\"type\":\"tool_use\",\"id\":\"t4\",\"name\":\"bash\",\"input\":{}},",
+            "{\"type\":\"tool_use\",\"id\":\"t5\",\"name\":\"bash\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-25T10:00:02Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"r1\"},{\"type\":\"text\",\"text\":\"\"}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-25T10:00:03Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t2\",\"content\":\"r2\"},{\"type\":\"text\",\"text\":\"   \\n\\t  \"}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-25T10:00:04Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t3\",\"content\":\"r3\"},{\"type\":\"text\"}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-25T10:00:05Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t4\",\"content\":\"r4\"},{\"type\":\"text\",\"text\":null}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-25T10:00:06Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t5\",\"content\":\"r5\"},{\"type\":\"text\",\"text\":42}]}}\n",
+        );
+        let events = load_jsonl_events(content);
+        let traj = convert_qoder_events(&events, "qoder").unwrap();
+        traj.validate_step_ids().unwrap();
+
+        assert_eq!(
+            traj.steps.len(),
+            1,
+            "blank text blocks on tool_result carriers must not emit phantom user steps, got {:#?}",
+            traj.steps
+        );
+        assert_eq!(traj.steps[0].source, StepSource::Agent);
+        let obs = traj.steps[0]
+            .observation
+            .as_ref()
+            .expect("all tool results must still attach to the owning agent step");
+        assert_eq!(obs.results.len(), 5);
+    }
+
+    #[test]
+    fn test_convert_unmatched_tool_result_with_blank_text_records_extra_not_user_step() {
+        let content = "{\"type\":\"user\",\"timestamp\":\"2026-07-25T10:00:02Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t-orphan\",\"content\":\"orphan\"},{\"type\":\"text\",\"text\":\"   \"}]}}\n";
+        let events = load_jsonl_events(content);
+        let traj = convert_qoder_events(&events, "qoder").unwrap();
+
+        assert!(
+            traj.steps.is_empty(),
+            "orphan tool_result with blank text must not invent a user step, got {:#?}",
+            traj.steps
+        );
+        let extra = traj
+            .extra
+            .as_ref()
+            .expect("unmatched tool result must be preserved in extra");
+        assert!(extra.contains_key("unmatched_tool_results"));
+    }
+
+    #[test]
+    fn test_convert_tool_result_with_blank_and_non_blank_text_keeps_user_turn() {
+        let content = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-25T10:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-25T10:00:02Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"},{\"type\":\"text\",\"text\":\"  \"},{\"type\":\"text\",\"text\":\"  also run tests  \"}]}}\n",
+        );
+        let events = load_jsonl_events(content);
+        let traj = convert_qoder_events(&events, "qoder").unwrap();
+        traj.validate_step_ids().unwrap();
+
+        assert_eq!(traj.steps.len(), 2);
+        assert_eq!(traj.steps[0].source, StepSource::Agent);
+        assert!(traj.steps[0].observation.is_some());
+        assert_eq!(traj.steps[1].source, StepSource::User);
+        assert!(traj.steps[1].message.contains("also run tests"));
     }
 }

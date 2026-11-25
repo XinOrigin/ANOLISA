@@ -11,7 +11,7 @@ use super::super::SkillFs;
 use super::super::read_resolution::ReadResolution;
 use crate::handles::open_options_from_flags;
 use crate::path::{PathType, hermes_nested_sync_eligible, is_skill_discover_path};
-use crate::security::{SkillEventAction, SkillEventKind};
+use crate::security::{MutationKind, SkillEventAction, SkillEventKind};
 use crate::sync::SyncEvent;
 use crate::sys::{errno, openat_leaf};
 
@@ -978,25 +978,7 @@ impl SkillFs {
                 reply.error(err);
                 return;
             }
-            match &path_type {
-                PathType::Passthrough {
-                    skill_name,
-                    relative_path,
-                } => self.observe_mutation(
-                    skill_name,
-                    Some(relative_path.as_path()),
-                    crate::security::MutationKind::SetattrTruncate,
-                ),
-                PathType::InboxPassthrough {
-                    skill_name,
-                    relative_path,
-                } => self.inbox_observe_install_complete(
-                    skill_name,
-                    relative_path.as_path(),
-                    crate::security::MutationKind::SetattrTruncate,
-                ),
-                _ => {}
-            }
+            self.observe_open_truncate(&path_type);
         }
 
         // Then open with the requested access mode (open_options_from_flags handles non-RDONLY truncate)
@@ -1016,25 +998,7 @@ impl SkillFs {
             Ok(file) => {
                 let fh = self.handles.allocate(ino, flags, Some(file), pinned_target);
                 if is_trunc && access_mode != libc::O_RDONLY {
-                    match &path_type {
-                        PathType::Passthrough {
-                            skill_name,
-                            relative_path,
-                        } => self.observe_mutation(
-                            skill_name,
-                            Some(relative_path.as_path()),
-                            crate::security::MutationKind::SetattrTruncate,
-                        ),
-                        PathType::InboxPassthrough {
-                            skill_name,
-                            relative_path,
-                        } => self.inbox_observe_install_complete(
-                            skill_name,
-                            relative_path.as_path(),
-                            crate::security::MutationKind::SetattrTruncate,
-                        ),
-                        _ => {}
-                    }
+                    self.observe_open_truncate(&path_type);
                 }
                 self.emit_op_event(
                     req,
@@ -1061,6 +1025,42 @@ impl SkillFs {
             }
         }
     }
+    /// Dispatch a `SetattrTruncate` mutation observation for passthrough
+    /// `open(..., O_TRUNC)` calls across flat, inbox, and Hermes nested paths.
+    fn observe_open_truncate(&self, path_type: &PathType) {
+        match path_type {
+            PathType::Passthrough {
+                skill_name,
+                relative_path,
+            } => self.observe_mutation(
+                skill_name,
+                Some(relative_path.as_path()),
+                MutationKind::SetattrTruncate,
+            ),
+            PathType::InboxPassthrough {
+                skill_name,
+                relative_path,
+            } => self.inbox_observe_install_complete(
+                skill_name,
+                relative_path.as_path(),
+                MutationKind::SetattrTruncate,
+            ),
+            PathType::NestedPassthrough {
+                category,
+                skill_name,
+                relative_path,
+            } => {
+                let nested_id = Self::hermes_skill_id(category, skill_name);
+                self.observe_mutation(
+                    &nested_id,
+                    Some(relative_path.as_path()),
+                    MutationKind::SetattrTruncate,
+                );
+            }
+            _ => {}
+        }
+    }
+
     pub(in crate::fs) fn release_impl(
         &mut self,
         _req: &Request,
@@ -1113,5 +1113,183 @@ impl SkillFs {
             Some(Err(e)) => reply.error(errno(&e)),
             None => reply.error(libc::EBADF),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use parking_lot::RwLock;
+    use skillfs_core::store::SkillStore;
+
+    use super::*;
+    use crate::security::{
+        ActiveSkillResolver, ActiveTarget, InMemoryNotifyClient, NotifyController,
+        PendingInstallController,
+    };
+
+    fn make_notify_fs(
+        source: &std::path::Path,
+    ) -> (SkillFs, Arc<InMemoryNotifyClient>, Arc<NotifyController>) {
+        let client = Arc::new(InMemoryNotifyClient::new());
+        // Long debounce keeps the background worker idle so flush_for_testing
+        // drives dispatch deterministically without a timer race.
+        let notify_ctrl =
+            NotifyController::new(client.clone(), source, Duration::from_secs(60), 5000);
+        let store = Arc::new(RwLock::new(SkillStore::new()));
+        let fs = SkillFs::new(source.join("mount"), source.to_path_buf(), store, false)
+            .with_notify_controller(notify_ctrl.clone());
+        (fs, client, notify_ctrl)
+    }
+
+    #[test]
+    fn observe_open_truncate_emits_for_nested_passthrough() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        let (fs, client, notify_ctrl) = make_notify_fs(source.path());
+
+        let path_type = PathType::NestedPassthrough {
+            category: "apple".to_string(),
+            skill_name: "apple-notes".to_string(),
+            relative_path: PathBuf::from("scripts/run.sh"),
+        };
+        fs.observe_open_truncate(&path_type);
+        notify_ctrl.flush_for_testing();
+
+        let events = client.events();
+        assert_eq!(events.len(), 1, "expected 1 notify event, got {events:?}");
+        assert_eq!(events[0].skill_id, "apple/apple-notes");
+        assert_eq!(events[0].event_kind, "truncate");
+        assert_eq!(events[0].paths, vec!["scripts/run.sh".to_string()]);
+
+        notify_ctrl.shutdown();
+    }
+
+    #[test]
+    fn observe_open_truncate_keeps_passthrough_and_inbox_passthrough_emitting() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        let (fs, client, notify_ctrl) = make_notify_fs(source.path());
+
+        fs.observe_open_truncate(&PathType::Passthrough {
+            skill_name: "demo".to_string(),
+            relative_path: PathBuf::from("scripts/run.sh"),
+        });
+        fs.observe_open_truncate(&PathType::InboxPassthrough {
+            skill_name: "demo-inbox".to_string(),
+            relative_path: PathBuf::from(".install-complete"),
+        });
+        fs.observe_open_truncate(&PathType::InboxPassthrough {
+            skill_name: "demo-inbox-ignored".to_string(),
+            relative_path: PathBuf::from("scripts/run.sh"),
+        });
+        notify_ctrl.flush_for_testing();
+
+        let events = client.events();
+        assert_eq!(events.len(), 2, "expected 2 notify events, got {events:?}");
+
+        let flat = events
+            .iter()
+            .find(|e| e.skill_id == "demo")
+            .expect("flat passthrough event");
+        assert_eq!(flat.event_kind, "truncate");
+        assert_eq!(flat.paths, vec!["scripts/run.sh".to_string()]);
+
+        let inbox = events
+            .iter()
+            .find(|e| e.skill_id == "demo-inbox")
+            .expect("inbox passthrough sentinel event");
+        assert_eq!(inbox.event_kind, "truncate");
+        assert_eq!(inbox.paths, vec![".install-complete".to_string()]);
+
+        notify_ctrl.shutdown();
+    }
+
+    #[test]
+    fn observe_open_truncate_filters_skill_meta_inside_nested_passthrough() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        let (fs, client, notify_ctrl) = make_notify_fs(source.path());
+
+        fs.observe_open_truncate(&PathType::NestedPassthrough {
+            category: "apple".to_string(),
+            skill_name: "apple-notes".to_string(),
+            relative_path: PathBuf::from(".skill-meta/state.json"),
+        });
+        fs.observe_open_truncate(&PathType::NestedPassthrough {
+            category: "apple".to_string(),
+            skill_name: "apple-notes".to_string(),
+            relative_path: PathBuf::from(".skill-meta/versions/v1/SKILL.md"),
+        });
+        notify_ctrl.flush_for_testing();
+
+        assert_eq!(notify_ctrl.pending_len(), 0);
+        assert!(
+            client.events().is_empty(),
+            ".skill-meta/** inside NestedPassthrough must stay filtered, got {:?}",
+            client.events()
+        );
+
+        notify_ctrl.shutdown();
+    }
+
+    #[test]
+    fn observe_open_truncate_respects_pending_install_gate_for_nested_passthrough() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        let client = Arc::new(InMemoryNotifyClient::new());
+        let notify_ctrl =
+            NotifyController::new(client.clone(), source.path(), Duration::from_secs(60), 5000);
+        let pending_ctrl = PendingInstallController::new(
+            notify_ctrl.clone(),
+            Duration::from_secs(60),
+            source.path().to_path_buf(),
+        );
+        let resolver = Arc::new(ActiveSkillResolver::new(source.path()));
+        let store = Arc::new(RwLock::new(SkillStore::new()));
+        let fs = SkillFs::new(
+            source.path().join("mount"),
+            source.path().to_path_buf(),
+            store,
+            false,
+        )
+        .with_notify_controller(notify_ctrl.clone())
+        .with_pending_install_controller(pending_ctrl.clone())
+        .with_active_resolver(resolver.clone());
+
+        let path_type = PathType::NestedPassthrough {
+            category: "apple".to_string(),
+            skill_name: "apple-notes".to_string(),
+            relative_path: PathBuf::from("scripts/run.sh"),
+        };
+
+        // Unactivated nested skill is held by PendingInstallController.
+        fs.observe_open_truncate(&path_type);
+        notify_ctrl.flush_for_testing();
+        assert!(pending_ctrl.is_pending("apple/apple-notes"));
+        assert!(
+            client.events().is_empty(),
+            "pending nested skill must not emit before activation, got {:?}",
+            client.events()
+        );
+
+        // Once activated, truncating a nested passthrough file clears pending
+        // and emits the truncate notification.
+        resolver.set(
+            "apple/apple-notes",
+            ActiveTarget::Current {
+                source_dir: source.path().join("apple/apple-notes"),
+            },
+        );
+        fs.observe_open_truncate(&path_type);
+        notify_ctrl.flush_for_testing();
+        assert!(!pending_ctrl.is_pending("apple/apple-notes"));
+        let events = client.events();
+        assert_eq!(events.len(), 1, "expected 1 notify event, got {events:?}");
+        assert_eq!(events[0].skill_id, "apple/apple-notes");
+        assert_eq!(events[0].event_kind, "truncate");
+        assert_eq!(events[0].paths, vec!["scripts/run.sh".to_string()]);
+
+        pending_ctrl.shutdown();
+        notify_ctrl.shutdown();
     }
 }

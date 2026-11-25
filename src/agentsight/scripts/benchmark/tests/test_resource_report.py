@@ -488,3 +488,234 @@ def test_baseline_counter_read_after_load_start_is_unattributed_and_fatal(
         "tail": 0,
         "unattributed": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("before_mem", "after_mem"),
+    [(None, None), (0, 0), (1000, None), (None, 1000)],
+)
+def test_ab_valid_runs_with_missing_or_zero_host_memory_emit_none_host_pct(
+    tmp_path: Path, before_mem: int | None, after_mem: int | None
+) -> None:
+    for label, cpu, rss, mem in (
+        ("before", 30, 400, before_mem),
+        ("after", 20, 250, after_mem),
+    ):
+        directory = artifacts(tmp_path, label, cpu, rss)
+        worker_path = directory / "worker-result.json"
+        worker = json.loads(worker_path.read_text())
+        if mem is None:
+            worker.pop("host_memory_mib", None)
+        else:
+            worker["host_memory_mib"] = mem
+        worker_path.write_text(json.dumps(worker))
+
+    assert resource_report.report(tmp_path, {"before": {}, "after": {}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    assert summary["valid"]
+    assert summary["comparison"]["rss_average_mib"] == {"mib": 150, "percent": 37.5}
+    for key in ("rss_average_host_pct", "rss_peak_host_pct"):
+        assert summary["comparison"][key] == {"percentage_points": None}
+    assert "N/A pp" in (tmp_path / "resource-report.txt").read_text()
+
+
+def _ffi_run_artifacts(tmp_path: Path, label: str = "run") -> Path:
+    directory = artifacts(tmp_path, label, 25, 40)
+    worker_path = directory / "worker-result.json"
+    worker = json.loads(worker_path.read_text())
+    worker["trace_returncode"] = 0
+    worker_path.write_text(json.dumps(worker))
+    (directory / "clients-ready.json").write_text('{"request_ids":["preflight-0"]}')
+    (directory / "ffi-consumer.json").write_text('{"completed":true,"llm_events":2}')
+    (directory / "internal-metrics.prom").write_text(
+        "agentsight_ring_buffer_dropped_total 0\n"
+        "agentsight_channel_dropped_total 0\n"
+        'agentsight_ffi_dropped_total{reason="count"} 0\n'
+    )
+    return directory
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "worker-result.json",
+        "agent-summary.json",
+        "report.json",
+        "safety-stop.json",
+        "metrics-baseline.json",
+        "agents/start.json",
+        "ffi-consumer.json",
+    ],
+)
+@pytest.mark.parametrize("content", [b'{"incomplete":', b"\xff\xfe"])
+def test_malformed_run_json_artifacts_fail_closed_without_crashing(
+    tmp_path: Path, relative: str, content: bytes
+) -> None:
+    directory = _ffi_run_artifacts(tmp_path, "run")
+    (directory / relative).write_bytes(content)
+
+    assert not resource_report.report(tmp_path, {"run": {"mode": "ffi"}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    run = summary["runs"]["run"]
+    assert not summary["valid"] and not run["valid"]
+    if relative == "report.json":
+        assert run["capture"] == "FAIL"
+    elif relative == "agent-summary.json":
+        assert run["load"] == "FAIL"
+    elif relative == "safety-stop.json":
+        assert run["safety_stop"] is not None
+    elif relative == "metrics-baseline.json":
+        assert run["resource_error"]
+    elif relative == "ffi-consumer.json":
+        assert run["ffi_error"]
+
+
+@pytest.mark.parametrize("payload", [None, [], "not-a-dict", 1, True])
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "worker-result.json",
+        "agent-summary.json",
+        "safety-stop.json",
+        "metrics-baseline.json",
+        "agents/start.json",
+        "ffi-consumer.json",
+    ],
+)
+def test_non_dict_auxiliary_artifacts_fail_closed_without_crashing(
+    tmp_path: Path, relative: str, payload: object
+) -> None:
+    directory = _ffi_run_artifacts(tmp_path, "run")
+    (directory / relative).write_text(json.dumps(payload))
+
+    assert not resource_report.report(tmp_path, {"run": {"mode": "ffi"}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    assert not summary["valid"] and not summary["runs"]["run"]["valid"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b'{"incomplete":', b"\xff\xfe", b"null", b"[]", b'"bad"', b"1"],
+)
+def test_malformed_or_non_dict_settings_json_does_not_crash_report(
+    tmp_path: Path, content: bytes
+) -> None:
+    artifacts(tmp_path, "run", 25, 40)
+    (tmp_path / "settings.json").write_bytes(content)
+
+    assert resource_report.report(tmp_path, {"run": {}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    assert summary["valid"] and summary["settings"] == {}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b'{"incomplete":', b"\xff\xfe", b"null", b"[]", b'{"request_ids":null}', b'{"request_ids":"abc"}'],
+)
+def test_malformed_or_non_dict_clients_ready_does_not_crash_ffi_report(
+    tmp_path: Path, content: bytes
+) -> None:
+    directory = _ffi_run_artifacts(tmp_path, "run")
+    (directory / "clients-ready.json").write_bytes(content)
+
+    assert not resource_report.report(tmp_path, {"run": {"mode": "ffi"}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    assert not summary["valid"] and not summary["runs"]["run"]["valid"]
+    assert summary["runs"]["run"]["ffi_error"] == "invalid clients-ready artifact"
+
+
+def test_absent_clients_ready_defaults_preflight_count_to_zero_on_ffi_report(
+    tmp_path: Path,
+) -> None:
+    directory = _ffi_run_artifacts(tmp_path, "run")
+    (directory / "clients-ready.json").unlink()
+    (directory / "ffi-consumer.json").write_text('{"completed":true,"llm_events":1}')
+
+    assert resource_report.report(tmp_path, {"run": {"mode": "ffi"}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    assert summary["valid"] and summary["runs"]["run"]["valid"]
+    assert summary["runs"]["run"]["ffi_error"] is None
+
+
+@pytest.mark.parametrize("llm_events", [None, True, False, "2", 1.5, [], {}])
+def test_ffi_non_int_llm_events_fail_closed_without_crashing(
+    tmp_path: Path, llm_events: object
+) -> None:
+    directory = _ffi_run_artifacts(tmp_path, "run")
+    (directory / "clients-ready.json").unlink()
+    (directory / "ffi-consumer.json").write_text(
+        json.dumps({"completed": True, "llm_events": llm_events})
+    )
+
+    assert not resource_report.report(tmp_path, {"run": {"mode": "ffi"}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    run = summary["runs"]["run"]
+    assert not summary["valid"] and not run["valid"]
+    assert run["ffi_error"]
+
+
+def test_partial_settings_and_non_string_worker_fields_do_not_crash_report(
+    tmp_path: Path,
+) -> None:
+    directory = artifacts(tmp_path, "run", 25, 40)
+    worker_path = directory / "worker-result.json"
+    worker = json.loads(worker_path.read_text())
+    worker.update({"status": None, "error": 123, "host_memory_mib": True})
+    worker_path.write_text(json.dumps(worker))
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"mode": "ffi", "agents": 4, "tokens_per_second": None})
+    )
+
+    assert not resource_report.report(tmp_path, {"run": {}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    assert summary["runs"]["run"]["status"] == "not-run"
+    assert summary["runs"]["run"]["host_memory_mib"] is None
+    assert "123" in (tmp_path / "resource-report.txt").read_text()
+    assert resource_report.safety_message(["unexpected"]) == "['unexpected']"
+
+
+def test_working_tree_source_without_tree_and_binary_run_error_are_tolerated(
+    tmp_path: Path,
+) -> None:
+    directory = artifacts(tmp_path, "run", 25, 40)
+    worker_path = directory / "worker-result.json"
+    worker = json.loads(worker_path.read_text())
+    worker["error"] = "see worker.log"
+    worker_path.write_text(json.dumps(worker))
+    (directory / "worker.log").write_text("worker failed\n")
+    (tmp_path / "run-error.txt").write_bytes(b"fatal: \xff\xfe\n")
+
+    assert not resource_report.report(tmp_path, {"run": {"ref": "working-tree"}})
+    text = (tmp_path / "resource-report.txt").read_text()
+    assert "working-tree (tree unknown)" in text
+    assert "worker failed" in text
+
+
+def test_complete_settings_and_missing_ids_fallback_render_cleanly(
+    tmp_path: Path,
+) -> None:
+    directory = artifacts(tmp_path, "run", 25, 40)
+    capture_path = directory / "report.json"
+    capture = json.loads(capture_path.read_text())
+    capture.pop("missing_count", None)
+    capture["missing_ids"] = ["req-1", "req-2"]
+    capture_path.write_text(json.dumps(capture))
+    (tmp_path / "settings.json").write_text(
+        json.dumps(
+            {
+                "agents": 4,
+                "tokens_per_second": 20,
+                "duration": 30,
+                "tokens_per_response": 128,
+                "payload_kb": 4,
+            }
+        )
+    )
+
+    assert resource_report.report(tmp_path, {"run": {}})
+    summary = json.loads((tmp_path / "resource-summary.json").read_text())
+    assert summary["runs"]["run"]["capture_counts"]["missing_count"] == 2
+    assert (
+        "Load target: 4 agents x 20 output tok/s, 30s; 128 tokens/response, 4 KiB request padding"
+        in (tmp_path / "resource-report.txt").read_text()
+    )

@@ -13,9 +13,23 @@ from check_resource_limits import LIMITS
 from collect_metrics import read_internal_metrics
 
 
+def _read_json_object(path: Path) -> tuple[dict[str, Any], bool]:
+    """Read an optional JSON object; flag existing unreadable, corrupt, or non-object files."""
+    if not path.exists():
+        return {}, False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}, True
+    if not isinstance(value, dict):
+        return {}, True
+    return value, False
+
+
 def read_json(path: Path) -> dict[str, Any]:
-    """Read an optional completed artifact; absent artifacts remain unverified."""
-    return json.loads(path.read_text()) if path.exists() else {}
+    """Read an optional completed artifact; absent or invalid artifacts return {}."""
+    data, _ = _read_json_object(path)
+    return data
 
 
 def resource_stats(rows: list[dict[str, str]], start: float, end: float) -> dict[str, Any]:
@@ -147,12 +161,17 @@ def drops_require_failure(probe_drop_phases: dict[str, dict[str, float]]) -> boo
 
 def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
     """Gate load-window resources on both capture correctness and usable CPU samples."""
+    source = source if isinstance(source, dict) else {}
     worker = read_json(directory / "worker-result.json")
-    load = read_json(directory / "agent-summary.json")
-    capture = read_json(directory / "report.json")
-    if not isinstance(capture, dict):
+    load, load_invalid = _read_json_object(directory / "agent-summary.json")
+    if load_invalid:
+        load = {"invalid": True}
+    capture, capture_invalid = _read_json_object(directory / "report.json")
+    if capture_invalid:
         capture = {"invalid": True}
-    safety_stop = read_json(directory / "safety-stop.json")
+    safety_stop, safety_stop_invalid = _read_json_object(directory / "safety-stop.json")
+    if safety_stop_invalid:
+        safety_stop = {"reason": "invalid safety-stop artifact"}
     rows: list[dict[str, str]] = []
     evictions: list[float] = []
     alive: list[bool] = []
@@ -161,8 +180,8 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         "channel_dropped": [],
     }
     final_metrics = read_internal_metrics(directory / "internal-metrics.prom")
-    baseline_metrics = read_json(directory / "metrics-baseline.json")
-    invalid_counters: set[str] = set()
+    baseline_metrics, baseline_invalid = _read_json_object(directory / "metrics-baseline.json")
+    invalid_counters: set[str] = set(drop_samples) if baseline_invalid else set()
     for key in drop_samples:
         value = numeric(final_metrics.get(key))
         if value is not None and value >= 0:
@@ -215,7 +234,9 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         resource_error = "missing or invalid RSS/CPU samples in the load window"
     elif resources["cpu_measurement_seconds"] < (end - start) * 0.95:
         resource_error = "CPU samples cover less than 95% of the load window"
-    total = worker.get("host_memory_mib")
+    raw_total = worker.get("host_memory_mib")
+    total_mib = numeric(raw_total)
+    total = raw_total if total_mib is not None and total_mib >= 0 else None
     load_status = "PASS" if load.get("passed") is True else "FAIL" if load else "UNVERIFIED"
     probe_drops = {
         key: max(values) if values else None for key, values in drop_samples.items()
@@ -244,13 +265,18 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
     ffi = read_json(directory / "ffi-consumer.json") if source.get("mode") == "ffi" else None
     ffi_error = None
     if ffi is not None:
-        expected = (sent if type(sent) is int and sent > 0 else 0) + len(
-            read_json(directory / "clients-ready.json").get("request_ids", [])
-        )
-        if not ffi.get("completed") or worker.get("trace_returncode") != 0:
+        clients_ready, clients_ready_invalid = _read_json_object(directory / "clients-ready.json")
+        request_ids = clients_ready.get("request_ids", [])
+        clients_ready_bad = clients_ready_invalid or not isinstance(request_ids, list)
+        preflight_count = 0 if clients_ready_bad else len(request_ids)
+        expected = (sent if type(sent) is int and sent > 0 else 0) + preflight_count
+        llm_events = ffi.get("llm_events", 0)
+        if ffi.get("completed") is not True or worker.get("trace_returncode") != 0:
             ffi_error = "FFI consumer did not finish successfully"
-        elif ffi.get("llm_events", 0) < expected or expected == 0:
-            ffi_error = f"FFI consumer received {ffi.get('llm_events', 0)}/{expected} LLM events (including preflight)"
+        elif clients_ready_bad:
+            ffi_error = "invalid clients-ready artifact"
+        elif type(llm_events) is not int or llm_events < expected or expected == 0:
+            ffi_error = f"FFI consumer received {llm_events}/{expected} LLM events (including preflight)"
         elif not final_metrics:
             ffi_error = "missing final FFI pipeline metrics"
         elif numeric(final_metrics.get("ffi_dropped", "0")) != 0:
@@ -288,9 +314,10 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         capture_counts[key] = value if field_valid else None
     if capture_counts["missing_count"] is None and isinstance(capture.get("missing_ids"), list):
         capture_counts["missing_count"] = len(capture["missing_ids"])
+    status = worker.get("status", "not-run")
     return {
         "source": source,
-        "status": worker.get("status", "not-run"),
+        "status": status if isinstance(status, str) else "not-run",
         "error": worker.get("error"),
         "valid": bool(valid),
         **resources,
@@ -299,8 +326,16 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         "resource_error": resource_error,
         "logical_cpus": worker.get("logical_cpus"),
         "host_memory_mib": total,
-        "rss_average_host_pct": average / total * 100 if average is not None and total else None,
-        "rss_peak_host_pct": peak / total * 100 if peak is not None and total else None,
+        "rss_average_host_pct": (
+            average / total_mib * 100
+            if average is not None and total_mib is not None and total_mib > 0
+            else None
+        ),
+        "rss_peak_host_pct": (
+            peak / total_mib * 100
+            if peak is not None and total_mib is not None and total_mib > 0
+            else None
+        ),
         "load": load_status,
         "capture": capture_status,
         "capture_source": capture.get("capture_source"),
@@ -319,6 +354,8 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
 
 def safety_message(record: dict[str, Any]) -> str:
     """Describe each guard with the units used by its command-line threshold."""
+    if not isinstance(record, dict):
+        return str(record)
     reason = record.get("reason", "unknown")
     dimensions = {
         "available_memory": ("host available RAM", "<", 1024**2, "MiB"),
@@ -350,7 +387,12 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
         for key in ("rss_average_mib", "rss_peak_mib"):
             comparison[key] = reduction(runs["before"][key], runs["after"][key])
         for key in ("rss_average_host_pct", "rss_peak_host_pct"):
-            comparison[key] = {"percentage_points": runs["before"][key] - runs["after"][key]}
+            before, after = runs["before"][key], runs["after"][key]
+            comparison[key] = {
+                "percentage_points": (
+                    before - after if before is not None and after is not None else None
+                )
+            }
         for key in ("cpu_average_pct", "cpu_p95_pct", "cpu_peak_pct"):
             before, after = runs["before"][key], runs["after"][key]
             comparison[key] = {
@@ -380,17 +422,27 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
     if settings:
         if settings.get("mode") == "ffi":
             lines.append(
-                f"Scope: minimal C FFI host, {settings['ffi_api']} callbacks; includes library threads, "
+                f"Scope: minimal C FFI host, {settings.get('ffi_api', 'unknown')} callbacks; includes library threads, "
                 "conversion, receipt forwarding and the small C host baseline; excludes application callback work."
             )
             lines.append(
                 "Capture validation: FFI callback receipts; independent of AgentSight SQLite storage."
             )
-        lines.append(
-            f"Load target: {settings['agents']} agents x {settings['tokens_per_second']:g} output tok/s, "
-            f"{settings['duration']:g}s; {settings['tokens_per_response']} tokens/response, "
-            f"{settings['payload_kb']} KiB request padding"
-        )
+        tps = numeric(settings.get("tokens_per_second"))
+        duration = numeric(settings.get("duration"))
+        if (
+            tps is not None
+            and duration is not None
+            and all(
+                settings.get(key) is not None
+                for key in ("agents", "tokens_per_response", "payload_kb")
+            )
+        ):
+            lines.append(
+                f"Load target: {settings['agents']} agents x {tps:g} output tok/s, "
+                f"{duration:g}s; {settings['tokens_per_response']} tokens/response, "
+                f"{settings['payload_kb']} KiB request padding"
+            )
         if "connection_capacity" in settings:
             lines.append(f"Configured connection capacity: {settings['connection_capacity']}")
         if settings.get("cpu_budget_percent"):
@@ -400,10 +452,10 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
         if "ring_buffer_mb" in settings:
             lines.append(f"Configured ring buffer: {settings['ring_buffer_mb']} MiB")
     for label, run in runs.items():
-        source = run["source"]
-        version = source.get("commit", source.get("path", "unknown"))
+        source = run["source"] if isinstance(run.get("source"), dict) else {}
+        version = str(source.get("commit", source.get("path", "unknown")))
         if source.get("ref") == "working-tree":
-            version += f" + working-tree (tree {source['tree']})"
+            version += f" + working-tree (tree {source.get('tree', 'unknown')})"
         lines.append(f"{label}: {version}")
     ab = len(runs) == 2
     lines.append(
@@ -498,14 +550,15 @@ def report(output: Path, sources: dict[str, dict[str, Any]]) -> bool:
                 lines.append(f"{label} connection evictions: {run['connection_evictions']:.0f}")
     lines.append(f"Result: {'VALID' if valid else 'INVALID; do not infer a resource improvement'}")
     if error_file.exists():
-        lines.append(f"Error: {error_file.read_text().strip()}")
+        lines.append(f"Error: {error_file.read_text(errors='replace').strip()}")
     for label, run in runs.items():
         if run["error"]:
             lines.append(f"{label} error: {run['error']}")
-            for name in ("trace.log", "runner.log", "worker.log"):
-                log = output / label / name
-                if name in run["error"] and log.exists():
-                    lines.extend(log.read_text(errors="replace").splitlines()[-4:])
+            if isinstance(run["error"], str):
+                for name in ("trace.log", "runner.log", "worker.log"):
+                    log = output / label / name
+                    if name in run["error"] and log.exists():
+                        lines.extend(log.read_text(errors="replace").splitlines()[-4:])
     lines.append(f"Artifacts: {output}")
     text = "\n".join(lines) + "\n"
     (output / "resource-report.txt").write_text(text)

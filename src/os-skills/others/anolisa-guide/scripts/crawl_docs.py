@@ -4,7 +4,9 @@ ANOLISA 文档爬取脚本
 使用 markdownify 将 HTML 转换为标准 Markdown 格式
 """
 import os
+import stat
 import sys
+import tempfile
 import requests
 from bs4 import BeautifulSoup
 import markdownify
@@ -41,14 +43,33 @@ def get_page_content(url):
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         }
         response = requests.get(BASE_URL + url, headers=headers, timeout=30)
+        response.raise_for_status()
+        status_code = getattr(response, 'status_code', None)
+        if (
+            isinstance(status_code, int)
+            and not isinstance(status_code, bool)
+            and not (200 <= status_code < 300)
+        ):
+            raise requests.HTTPError(
+                f"Unexpected HTTP status {status_code} for {BASE_URL + url}",
+                response=response,
+            )
         response.encoding = 'utf-8'
-        return response.text
+        html = response.text
+        if not isinstance(html, str) or not html.strip():
+            print("  ❌ 获取失败: 响应内容为空")
+            return None
+        return html
     except Exception as e:
         print(f"  ❌ 获取失败: {e}")
         return None
 
 def extract_markdown(html, url):
     """使用 markdownify 提取并转换为 Markdown 格式"""
+    if not isinstance(html, str) or not html.strip():
+        print("  ❌ 页面内容为空")
+        return None
+
     soup = BeautifulSoup(html, 'html.parser')
     
     # 提取标题
@@ -68,34 +89,39 @@ def extract_markdown(html, url):
     
     # 找到 markdown-body 容器
     markdown_body = soup.find('div', class_='markdown-body')
-    
+
     if not markdown_body:
-        print(f"  ⚠️ 未找到 markdown-body 容器")
+        print("  ⚠️ 未找到 markdown-body 容器")
         # 尝试其他容器
         for cls in ['doc-content', 'article-content', 'content']:
             markdown_body = soup.find('div', class_=cls)
             if markdown_body:
                 break
-    
-    content = ""
-    if markdown_body:
-        # 清理不需要的元素
-        for tag in markdown_body.find_all(['script', 'style', 'nav', 'footer', 'header']):
-            tag.decompose()
-        
-        # 使用 markdownify 转换
-        # heading_style='ATX' 使用 # 标题格式
-        # bullets='- 使用 - 作为无序列表
-        content = markdownify.markdownify(
-            str(markdown_body),
-            heading_style='ATX',
-            bullets='-',
-            strip=['script', 'style']
-        )
-        
-        # 后处理：优化格式
-        content = post_process_markdown(content)
-    
+
+    if not markdown_body:
+        print("  ❌ 未找到有效文档内容容器")
+        return None
+
+    # 清理不需要的元素
+    for tag in markdown_body.find_all(['script', 'style', 'nav', 'footer', 'header']):
+        tag.decompose()
+
+    # 使用 markdownify 转换
+    # heading_style='ATX' 使用 # 标题格式
+    # bullets='- 使用 - 作为无序列表
+    content = markdownify.markdownify(
+        str(markdown_body),
+        heading_style='ATX',
+        bullets='-',
+        strip=['script', 'style']
+    )
+
+    # 后处理：优化格式
+    content = post_process_markdown(content)
+    if not isinstance(content, str) or not content.strip():
+        print("  ❌ 提取的文档内容为空")
+        return None
+
     return {
         'url': url,
         'full_url': BASE_URL + url,
@@ -141,10 +167,41 @@ def post_process_markdown(content):
     
     return content
 
+def _write_text_atomic(output_path, content):
+    """原子写入文本文件，避免中断时破坏已有缓存"""
+    output_path = Path(output_path)
+    try:
+        mode = stat.S_IMODE(output_path.stat().st_mode)
+    except OSError:
+        mode = 0o644
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        try:
+            os.chmod(tmp_name, mode)
+        except OSError:
+            pass
+        os.replace(tmp_name, output_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
 def save_markdown_file(data, output_path):
     """保存为 Markdown 文件"""
+    if not data or not isinstance(data.get('content'), str) or not data['content'].strip():
+        raise ValueError("Markdown content is empty")
+
     crawl_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+
     # 构建文件内容
     file_content = f"""# {data['title']}
 
@@ -156,25 +213,25 @@ def save_markdown_file(data, output_path):
 
 {data['content']}
 """
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(file_content)
-    
+
+    _write_text_atomic(output_path, file_content)
+
     return file_content
 
 def crawl_all_docs(reference_dir):
     """爬取所有文档"""
+    reference_dir = Path(reference_dir)
     print("=" * 60)
     print("ANOLISA 文档爬取 (Markdownify v2)")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
-    
+
     results = []
     success_count = 0
-    
+
     for filename, url in DOC_URLS:
         print(f"\n[{filename}] {url}")
-        
+
         # 获取页面
         html = get_page_content(url)
         if not html:
@@ -185,17 +242,25 @@ def crawl_all_docs(reference_dir):
                 'error': '获取页面失败'
             })
             continue
-        
+
         # 提取 Markdown
         data = extract_markdown(html, url)
-        
+        if not data or not isinstance(data.get('content'), str) or not data['content'].strip():
+            results.append({
+                'filename': filename,
+                'url': url,
+                'status': 'failed',
+                'error': '提取文档内容为空'
+            })
+            continue
+
         # 保存文件
         output_path = reference_dir / f"{filename}.md"
         save_markdown_file(data, output_path)
-        
+
         print(f"  ✓ 已保存: {output_path}")
         print(f"  ✓ 内容长度: {len(data['content'])} 字符")
-        
+
         results.append({
             'filename': filename,
             'url': url,
@@ -205,10 +270,10 @@ def crawl_all_docs(reference_dir):
             'last_modified': data['last_modified'],
             'crawl_time': datetime.now().isoformat()
         })
-        
+
         success_count += 1
         time.sleep(0.5)  # 避免请求过快
-    
+
     # 生成摘要
     summary = {
         'crawl_time': datetime.now().isoformat(),
@@ -217,26 +282,25 @@ def crawl_all_docs(reference_dir):
         'failed_count': len(DOC_URLS) - success_count,
         'results': results
     }
-    
+
     summary_path = reference_dir / 'crawl_summary.json'
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    
+    _write_text_atomic(summary_path, json.dumps(summary, ensure_ascii=False, indent=2))
+
     print("\n" + "=" * 60)
     print(f"爬取完成！成功: {success_count}/{len(DOC_URLS)}")
     print(f"摘要已保存: {summary_path}")
     print("=" * 60)
-    
+
     return summary
 
-def main():
+def main(argv=None):
     """主函数"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='ANOLISA 文档爬取脚本')
     parser.add_argument('--output-dir', type=str, help='指定输出目录（默认使用用户缓存目录）')
-    args = parser.parse_args()
-    
+    args = parser.parse_args(argv)
+
     # 确定输出目录
     if args.output_dir:
         # 用户指定输出目录
@@ -245,7 +309,7 @@ def main():
         # 默认使用用户缓存目录
         cache_dir = Path.home() / ".cache" / "anolisa" / "skills" / "anolisa-guide" / "reference"
         static_dir = Path("/usr/share/anolisa/skills/anolisa-guide/reference")
-        
+
         # 优先使用用户缓存目录（用户权限可写）
         if cache_dir.exists() or os.access(cache_dir.parent, os.W_OK):
             reference_dir = cache_dir
@@ -256,14 +320,21 @@ def main():
             # 使用相对路径（开发环境）
             script_dir = Path(__file__).parent
             reference_dir = script_dir.parent / 'reference'
-    
+
     # 确保 reference 目录存在
     reference_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"输出目录: {reference_dir}")
-    
+
     # 爬取文档
-    crawl_all_docs(reference_dir)
+    summary = crawl_all_docs(reference_dir)
+    if summary['failed_count'] > 0:
+        print(
+            f"错误: {summary['failed_count']}/{summary['total_docs']} 篇文档爬取失败",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

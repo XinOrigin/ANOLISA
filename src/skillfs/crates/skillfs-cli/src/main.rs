@@ -1577,14 +1577,19 @@ async fn cmd_mount(
         .map_err(|e| format!("{}", e))?;
     // N3 source-tree guard: reject --activation-events-log inside source,
     // same rationale as audit. Ordered before the file is opened so a
-    // rejected path never creates the log file on disk.
-    if let Some(ref p) = activation_events_log {
-        skillfs_fuse::security::validate_protocol_events_path_outside_source(
-            p,
-            source_roots.physical_source_root(),
-        )
-        .map_err(|e| format!("{}", e))?;
-    }
+    // rejected path never creates the log file on disk. Keep the resolved
+    // path for the writer so symlinked OS dirs (e.g. /var/run) and relative
+    // paths work without re-resolving an unchecked flag at open time.
+    let activation_events_log_resolved: Option<PathBuf> = match activation_events_log.as_ref() {
+        Some(p) => Some(
+            skillfs_fuse::security::protocol_events::resolve_protocol_events_path_outside_source(
+                p,
+                source_roots.physical_source_root(),
+            )
+            .map_err(|e| format!("{}", e))?,
+        ),
+        None => None,
+    };
     // Same guard for --events-log. Without it a log path inside the source
     // is accepted and every security event write lands in the skill
     // workspace: the drift watcher re-scans it (self-feeding loop) and a
@@ -2025,15 +2030,15 @@ async fn cmd_mount(
     // When `--activation-events-log` is set but the file cannot be
     // opened, the mount fails at startup.
     let protocol_event_writer: Arc<dyn ProtocolEventWriter> =
-        if let Some(ref p) = activation_events_log {
-            let writer = JsonlProtocolEventWriter::new(p, 0).map_err(|e| {
+        if let Some(resolved) = activation_events_log_resolved.as_deref() {
+            let writer = JsonlProtocolEventWriter::new(resolved, 0).map_err(|e| {
                 format!(
                     "failed to open --activation-events-log path '{}': {}",
-                    p.display(),
+                    resolved.display(),
                     e
                 )
             })?;
-            info!(path = %p.display(), "activation protocol event log enabled");
+            info!(path = %resolved.display(), "activation protocol event log enabled");
             Arc::new(writer) as Arc<dyn ProtocolEventWriter>
         } else {
             Arc::new(NoopProtocolEventWriter) as Arc<dyn ProtocolEventWriter>

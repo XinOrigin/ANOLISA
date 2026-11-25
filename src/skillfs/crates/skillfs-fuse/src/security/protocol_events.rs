@@ -51,6 +51,7 @@
 //! dispatch, or the active resolver.
 
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,6 +62,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tracing::warn;
+
+use crate::sys::openat_leaf;
 
 pub const PROTOCOL_EVENT_SCHEMA_VERSION: u64 = 1;
 pub const DEFAULT_PROTOCOL_EVENT_QUEUE_CAPACITY: usize = 256;
@@ -169,6 +172,88 @@ pub struct JsonlProtocolEventWriter {
     _worker: Option<JoinHandle<()>>,
 }
 
+/// Open the protocol events log target without letting a symlinked parent,
+/// symlinked leaf, or hard-linked source alias redirect writes into the
+/// source tree.
+///
+/// Mirrors [`super::event_stream::open_events_log`]: each parent component is
+/// pinned with `openat(O_PATH | O_DIRECTORY | O_NOFOLLOW)`, the leaf is
+/// opened with `O_NOFOLLOW`, and [`refuse_aliased_target`] rejects targets
+/// with `nlink() > 1`. Relative paths are refused so no unchecked `cwd`
+/// component enters after validation.
+fn open_protocol_events_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let parent = path
+        .parent()
+        .filter(|parent| parent.is_absolute())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "protocol events log path must be absolute so every component can be checked",
+            )
+        })?;
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "protocol events log path has no file name component",
+        )
+    })?;
+
+    let mut dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open("/")?;
+    for component in parent.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                dir = openat_leaf(
+                    &dir,
+                    name,
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                    0,
+                )?;
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "protocol events log path component {other:?} is not a plain directory name"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let file = openat_leaf(
+        &dir,
+        leaf,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW,
+        0o666,
+    )?;
+    refuse_aliased_target(&file, path)?;
+    Ok(file)
+}
+
+/// Refuse a target whose inode has more than one hard link, since another name
+/// inside the source tree could share the same inode.
+fn refuse_aliased_target(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let links = file.metadata()?.nlink();
+    if links > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to open protocol events log '{}': it has {links} hard links, so a \
+                 file inside the source tree could be this same inode and would receive these \
+                 appends; only a singly linked target is proven disjoint from the source",
+                path.display(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl JsonlProtocolEventWriter {
     pub fn new(path: impl Into<PathBuf>, queue_capacity: usize) -> std::io::Result<Self> {
         let path = path.into();
@@ -178,10 +263,7 @@ impl JsonlProtocolEventWriter {
             queue_capacity
         };
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = open_protocol_events_log(&path)?;
 
         let (tx, rx) = sync_channel::<ProtocolEvent>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -265,21 +347,52 @@ pub fn serialize_protocol_event(event: &ProtocolEvent) -> String {
         .unwrap_or_else(|_| String::from("{\"schemaVersion\":1,\"error\":\"unserializable\"}"))
 }
 
-/// Resolve a protocol events log path: canonicalize the file if it exists,
-/// otherwise canonicalize the parent and append the filename.
+/// Resolve a protocol events log path to the location a later `open` would act
+/// on: follow every symlinked final component (bounded, like the kernel) and
+/// canonicalize the rest, including dangling symlinks and bare relative
+/// filenames resolved against the process current working directory.
 pub fn resolve_protocol_events_path(path: &Path) -> std::io::Result<PathBuf> {
-    if path.exists() {
-        return path.canonicalize();
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = path;
+    for _ in 0..32 {
+        match std::fs::symlink_metadata(&current) {
+            // A real entry ends the chain: canonicalize still resolves any
+            // symlinked parent components.
+            Ok(meta) if !meta.file_type().is_symlink() => return current.canonicalize(),
+            // Follow symlinks including dangling ones whose target open(O_CREAT)
+            // would create, so containment validation sees the real target.
+            Ok(_) => {
+                let target = std::fs::read_link(&current)?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"))
+                        .join(target)
+                };
+            }
+            // Nothing exists at the final component and its parent is
+            // nameable: open(O_CREAT) would create the file right here.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let parent = current.parent().unwrap_or_else(|| Path::new("."));
+                let parent_canonical = parent.canonicalize()?;
+                let file_name = current.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "protocol events path has no file name component",
+                    )
+                })?;
+                return Ok(parent_canonical.join(file_name));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let parent_canonical = parent.canonicalize()?;
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "protocol events path has no file name component",
-        )
-    })?;
-    Ok(parent_canonical.join(file_name))
+    Err(std::io::Error::from_raw_os_error(libc::ELOOP))
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +401,9 @@ pub fn resolve_protocol_events_path(path: &Path) -> std::io::Result<PathBuf> {
 
 #[derive(Debug)]
 pub enum ProtocolEventsPathError {
+    /// The target could not be resolved, so no object can be approved for the
+    /// writer to open.
+    Unresolvable { log_path: PathBuf, reason: String },
     InsideSource {
         log_path: PathBuf,
         source_canonical: PathBuf,
@@ -298,6 +414,13 @@ pub enum ProtocolEventsPathError {
 impl std::fmt::Display for ProtocolEventsPathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unresolvable { log_path, reason } => {
+                write!(
+                    f,
+                    "--activation-events-log path '{}' cannot be resolved: {reason}",
+                    log_path.display(),
+                )
+            }
             Self::InsideSource {
                 log_path,
                 source_canonical,
@@ -318,6 +441,28 @@ impl std::fmt::Display for ProtocolEventsPathError {
 }
 
 impl std::error::Error for ProtocolEventsPathError {}
+
+/// Resolve a protocol events log path, reject targets inside the source tree,
+/// and return the approved canonical path for [`JsonlProtocolEventWriter::new`].
+pub fn resolve_protocol_events_path_outside_source(
+    log_path: &Path,
+    source_canonical: &Path,
+) -> Result<PathBuf, ProtocolEventsPathError> {
+    let log_canonical = resolve_protocol_events_path(log_path).map_err(|e| {
+        ProtocolEventsPathError::Unresolvable {
+            log_path: log_path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })?;
+    if log_canonical.starts_with(source_canonical) {
+        return Err(ProtocolEventsPathError::InsideSource {
+            log_path: log_path.to_path_buf(),
+            source_canonical: source_canonical.to_path_buf(),
+            log_canonical,
+        });
+    }
+    Ok(log_canonical)
+}
 
 /// Reject a protocol events log path that resolves inside the source tree.
 ///
@@ -627,5 +772,257 @@ mod tests {
             validate_protocol_events_path_outside_source(&log_path, &source_canonical).is_ok(),
             "unresolvable paths should defer to file-open step"
         );
+    }
+
+    #[test]
+    fn resolve_protocol_events_path_follows_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let link = dir.path().join("link.jsonl");
+        let target = nested.join("target.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let resolved = resolve_protocol_events_path(&link).expect("resolve dangling symlink");
+        let expected_parent = nested.canonicalize().unwrap();
+        assert_eq!(
+            resolved,
+            expected_parent.join("target.jsonl"),
+            "dangling symlink must resolve to its target's canonical location"
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_events_path_handles_bare_relative_filename() {
+        let resolved =
+            resolve_protocol_events_path(Path::new("relative-protocol-events-resolve.jsonl"))
+                .expect("bare relative filename must resolve against cwd");
+        let cwd_canonical = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(
+            resolved,
+            cwd_canonical.join("relative-protocol-events-resolve.jsonl")
+        );
+
+        let err = validate_protocol_events_path_outside_source(
+            Path::new("relative-protocol-events-resolve.jsonl"),
+            &cwd_canonical,
+        )
+        .expect_err("bare relative path inside cwd/source must be rejected");
+        assert!(matches!(err, ProtocolEventsPathError::InsideSource { .. }));
+    }
+
+    #[test]
+    fn resolve_protocol_events_path_rejects_symlink_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let err = resolve_protocol_events_path(&a).expect_err("symlink loop must fail");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn validate_path_outside_source_rejects_dangling_symlink_into_source() {
+        let source = tempfile::tempdir().unwrap();
+        let source_canonical = source.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join("events.jsonl");
+        let planted = source.path().join("planted-events.jsonl");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+
+        let err = validate_protocol_events_path_outside_source(&link, &source_canonical)
+            .expect_err("dangling symlink into source must be rejected");
+        assert!(
+            matches!(err, ProtocolEventsPathError::InsideSource { .. }),
+            "expected InsideSource, got {err:?}"
+        );
+        assert!(!planted.exists(), "rejected path must not create target");
+    }
+
+    #[test]
+    fn jsonl_writer_refuses_dangling_symlink_at_open() {
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join("events.jsonl");
+        let planted = source.path().join("planted-events.jsonl");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+
+        let err = match JsonlProtocolEventWriter::new(&link, 0) {
+            Ok(_) => panic!("dangling symlink leaf must be refused at open"),
+            Err(e) => e,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert!(
+            !planted.exists(),
+            "refused open must not create target inside source"
+        );
+    }
+
+    #[test]
+    fn jsonl_writer_refuses_symlinked_leaf_at_open() {
+        let source = tempfile::tempdir().unwrap();
+        let existing = source.path().join("existing.jsonl");
+        std::fs::write(&existing, "untouched\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join("events.jsonl");
+        std::os::unix::fs::symlink(&existing, &link).unwrap();
+
+        let err = match JsonlProtocolEventWriter::new(&link, 0) {
+            Ok(_) => panic!("symlinked leaf must be refused at open"),
+            Err(e) => e,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "untouched\n");
+    }
+
+    #[test]
+    fn jsonl_writer_refuses_symlinked_parent_at_open() {
+        let source = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap();
+        let log_dir = outside.join("events-dir");
+        std::os::unix::fs::symlink(source.path(), &log_dir).unwrap();
+        let log_path = log_dir.join("events.jsonl");
+
+        let err = match JsonlProtocolEventWriter::new(&log_path, 0) {
+            Ok(_) => panic!("symlinked parent must be refused at open"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+            "expected ELOOP/ENOTDIR, got {err:?}"
+        );
+        assert!(
+            !source.path().join("events.jsonl").exists(),
+            "refused open must not create log inside source"
+        );
+    }
+
+    #[test]
+    fn jsonl_writer_refuses_hard_link_to_source_file() {
+        let source = tempfile::tempdir().unwrap();
+        let source_canonical = source.path().canonicalize().unwrap();
+        let manifest = source.path().join("SKILL.md");
+        std::fs::write(&manifest, "# trusted manifest\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join("events.jsonl");
+        std::fs::hard_link(&manifest, &link).unwrap();
+
+        assert!(validate_protocol_events_path_outside_source(&link, &source_canonical).is_ok());
+
+        let err = match JsonlProtocolEventWriter::new(&link, 0) {
+            Ok(_) => panic!("hard-linked target must be refused at open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("hard links"),
+            "expected hard-link refusal, got {err}"
+        );
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            b"# trusted manifest\n",
+            "refused open must not modify aliased source file"
+        );
+    }
+
+    #[test]
+    fn jsonl_writer_refuses_relative_path() {
+        let err = match JsonlProtocolEventWriter::new(
+            Path::new("relative-protocol-events-open.jsonl"),
+            0,
+        ) {
+            Ok(_) => panic!("relative path must be refused at open"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn jsonl_writer_works_under_write_only_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap();
+        let log_dir = outside.join("write-only");
+        std::fs::create_dir(&log_dir).unwrap();
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let log_path = log_dir.join("protocol-events.jsonl");
+
+        {
+            let writer = JsonlProtocolEventWriter::new(&log_path, 0)
+                .expect("write-only parent must allow opening protocol events log");
+            writer.emit(&ProtocolEvent::new("/a/alpha", "alpha", "write", vec![]));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let body = std::fs::read_to_string(&log_path).expect("read protocol events log");
+        assert_eq!(body.lines().count(), 1, "expected 1 line, got {body:?}");
+
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn resolve_outside_source_to_writer_supports_relative_and_symlinked_parent_while_rejecting_source_dangling_link()
+     {
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let source = tempfile::tempdir().unwrap();
+        let source_canonical = source.path().canonicalize().unwrap();
+
+        // 1. Bare relative filename resolved outside source opens and writes.
+        let rel_name = format!("tmp-protocol-events-{}.jsonl", std::process::id());
+        let resolved_rel =
+            resolve_protocol_events_path_outside_source(Path::new(&rel_name), &source_canonical)
+                .expect("relative path outside source must resolve");
+        let _cleanup = RemoveOnDrop(resolved_rel.clone());
+        {
+            let writer = JsonlProtocolEventWriter::new(&resolved_rel, 0)
+                .expect("resolved relative path must open");
+            writer.emit(&ProtocolEvent::new("/a/alpha", "alpha", "write", vec![]));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(resolved_rel.exists(), "relative log file should be created");
+
+        // 2. External path through a symlinked parent resolves and opens.
+        let outside = tempfile::tempdir().unwrap();
+        let real_dir = outside.path().join("real-dir");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = outside.path().join("link-dir");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        let through_symlink = link_dir.join("events.jsonl");
+        let resolved_ext =
+            resolve_protocol_events_path_outside_source(&through_symlink, &source_canonical)
+                .expect("external symlinked parent must resolve");
+        assert_eq!(
+            resolved_ext,
+            real_dir.canonicalize().unwrap().join("events.jsonl")
+        );
+        {
+            let writer = JsonlProtocolEventWriter::new(&resolved_ext, 0)
+                .expect("resolved external symlinked-parent path must open");
+            writer.emit(&ProtocolEvent::new("/a/beta", "beta", "write", vec![]));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            real_dir.join("events.jsonl").exists(),
+            "resolved log must land in real target directory"
+        );
+
+        // 3. Dangling symlink into source is rejected before opening.
+        let planted = source.path().join("planted-events.jsonl");
+        let bad_link = outside.path().join("dangling-to-source.jsonl");
+        std::os::unix::fs::symlink(&planted, &bad_link).unwrap();
+        let err = resolve_protocol_events_path_outside_source(&bad_link, &source_canonical)
+            .expect_err("dangling symlink into source must be rejected");
+        assert!(matches!(err, ProtocolEventsPathError::InsideSource { .. }));
+        assert!(!planted.exists(), "rejected symlink must not create target");
     }
 }

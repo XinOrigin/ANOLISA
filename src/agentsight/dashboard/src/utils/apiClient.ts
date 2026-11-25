@@ -137,6 +137,19 @@ export async function apiFetch<T>(url: string, init: RequestInit = {}, redirectO
   return res.json() as Promise<T>;
 }
 
+function redirectOnUnauthorized(res: Response): void {
+  if (res.status === 401) {
+    if (typeof window !== 'undefined' && window.location) window.location.hash = '#/login';
+    throw new Error('Authentication required');
+  }
+}
+
+async function readJsonOrTextBody(res: Response): Promise<unknown> {
+  const text = await res.text().catch(() => '');
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return text; }
+}
+
 // ─── Trajectory reuse labels ────────────────────────────────────────────────
 
 /**
@@ -1250,9 +1263,10 @@ export async function resolveInterruption(interruptionId: string): Promise<void>
     `${API_BASE}/api/interruptions/${encodeURIComponent(interruptionId)}/resolve`,
     { method: 'POST', credentials: 'same-origin' }
   );
+  redirectOnUnauthorized(res);
   if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`POST /api/interruptions/${interruptionId}/resolve -> ${res.status}: ${text}`);
+    const detail = normalizeSecurityRestError(await readJsonOrTextBody(res), '', res.statusText).message;
+    throw new Error(`POST /api/interruptions/${interruptionId}/resolve -> ${res.status}: ${detail}`);
   }
 }
 
@@ -1316,9 +1330,10 @@ export async function fetchAgentProcessHealth(opts?: {
  */
 export async function deleteAgentHealth(pid: number): Promise<void> {
   const res = await fetch(`${API_BASE}/api/agent-health/${pid}`, { method: 'DELETE', credentials: 'same-origin' });
+  redirectOnUnauthorized(res);
   if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`DELETE /api/agent-health/${pid} -> ${res.status}: ${text}`);
+    const detail = normalizeSecurityRestError(await readJsonOrTextBody(res), '', res.statusText).message;
+    throw new Error(`DELETE /api/agent-health/${pid} -> ${res.status}: ${detail}`);
   }
 }
 
@@ -1328,11 +1343,16 @@ export async function deleteAgentHealth(pid: number): Promise<void> {
  */
 export async function restartAgentHealth(pid: number): Promise<{ ok: boolean; new_pid: number; cmd: string[] }> {
   const res = await fetch(`${API_BASE}/api/agent-health/${pid}/restart`, { method: 'POST', credentials: 'same-origin' });
-  const body = await res.json().catch(() => ({}));
+  redirectOnUnauthorized(res);
+  const body = await readJsonOrTextBody(res);
   if (!res.ok) {
-    throw new Error(`POST /api/agent-health/${pid}/restart -> ${res.status}: ${body.error ?? res.statusText}`);
+    const detail = normalizeSecurityRestError(body, '', res.statusText).message;
+    throw new Error(`POST /api/agent-health/${pid}/restart -> ${res.status}: ${detail}`);
   }
-  return body;
+  if (!isObjectRecord(body) || typeof body.ok !== 'boolean' || typeof body.new_pid !== 'number' || !Array.isArray(body.cmd)) {
+    throw new Error(`POST /api/agent-health/${pid}/restart -> invalid response payload`);
+  }
+  return body as { ok: boolean; new_pid: number; cmd: string[] };
 }
 
 // ─── Security Observability API ──────────────────────────────────────────────
@@ -1737,57 +1757,62 @@ async function auditFetch<T>(url: string): Promise<SecurityApiResponse<T>> {
   return fetchSecurityApi<T>(url, true);
 }
 
+function normalizeSecurityRestError(
+  body: unknown,
+  fallbackCode: string,
+  fallbackMessage: string,
+): SecurityRestError {
+  if (isObjectRecord(body)) {
+    const rawError = body.error;
+    if (isObjectRecord(rawError)) {
+      const daemonCode = typeof rawError.daemon_code === 'string' && rawError.daemon_code ? rawError.daemon_code : undefined;
+      return {
+        code: typeof rawError.code === 'string' && rawError.code ? rawError.code : fallbackCode,
+        message: typeof rawError.message === 'string' && rawError.message ? rawError.message : fallbackMessage,
+        retryable: Boolean(rawError.retryable),
+        ...(daemonCode ? { daemon_code: daemonCode } : {}),
+      };
+    }
+    if (typeof rawError === 'string' && rawError) {
+      return { code: rawError, message: typeof body.message === 'string' && body.message ? body.message : rawError, retryable: false };
+    }
+    if (typeof body.message === 'string' && body.message) {
+      return { code: fallbackCode, message: body.message, retryable: false };
+    }
+  }
+  return { code: fallbackCode, message: typeof body === 'string' && body ? body : fallbackMessage, retryable: false };
+}
+
+function isSecurityStateEnvelope<T>(body: unknown): body is SecurityApiResponse<T> {
+  return isObjectRecord(body) && typeof body.state === 'string' && isObjectRecord(body.data);
+}
+
 async function fetchSecurityApi<T>(
   url: string,
   rejectHttpErrorBeforeState: boolean,
 ): Promise<SecurityApiResponse<T>> {
   const res = await fetch(url, { credentials: 'same-origin' });
-  if (res.status === 401) {
-    window.location.hash = '#/login';
-    throw new Error('Authentication required');
-  }
-  const text = await res.text().catch(() => '');
-  let body: unknown = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
-  }
+  redirectOnUnauthorized(res);
+  const body = await readJsonOrTextBody(res);
+  const fallbackMsg = res.statusText || 'Security API request failed';
 
   if (!res.ok && rejectHttpErrorBeforeState) {
-    const errorBody = body && typeof body === 'object' && 'error' in body
-      ? (body as { error: SecurityRestError }).error
-      : {
-          code: 'security_api_error',
-          message: typeof body === 'string' && body ? body : res.statusText,
-          retryable: false,
-        };
-    throw new SecurityApiClientError(res.status, errorBody);
+    throw new SecurityApiClientError(res.status, normalizeSecurityRestError(body, 'security_api_error', fallbackMsg));
   }
 
-  if (body && typeof body === 'object' && 'state' in body) {
-    const envelope = body as Record<string, unknown>;
-    if (typeof envelope.state !== 'string' || !isObjectRecord(envelope.data)) {
+  if (isObjectRecord(body) && 'state' in body) {
+    if (!isSecurityStateEnvelope<T>(body)) {
       throw new SecurityApiClientError(res.status, {
         code: 'malformed_security_response',
         message: 'Security API returned a malformed state response',
         retryable: false,
       });
     }
-    return body as SecurityApiResponse<T>;
+    return body;
   }
 
   if (!res.ok) {
-    const errorBody = body && typeof body === 'object' && 'error' in body
-      ? (body as { error: SecurityRestError }).error
-      : {
-          code: 'security_api_error',
-          message: typeof body === 'string' && body ? body : res.statusText,
-          retryable: false,
-        };
-    throw new SecurityApiClientError(res.status, errorBody);
+    throw new SecurityApiClientError(res.status, normalizeSecurityRestError(body, 'security_api_error', fallbackMsg));
   }
 
   return {
@@ -1950,6 +1975,26 @@ export async function fetchContainmentPlan(
   );
 }
 
+async function parseSecurityCaseResponse<T>(
+  response: Response,
+  fallbackCode: string,
+  fallbackMessage: string,
+): Promise<SecurityApiResponse<T>> {
+  redirectOnUnauthorized(response);
+  const body = await readJsonOrTextBody(response);
+  if (!response.ok) {
+    throw new SecurityApiClientError(response.status, normalizeSecurityRestError(body, fallbackCode, response.statusText || fallbackMessage));
+  }
+  if (!isSecurityStateEnvelope<T>(body)) {
+    throw new SecurityApiClientError(response.status, {
+      code: 'malformed_security_response',
+      message: 'Security API returned a malformed state response',
+      retryable: false,
+    });
+  }
+  return body;
+}
+
 export async function containSecurityCase(
   caseId: string,
   request: SecurityContainmentRequest,
@@ -1963,23 +2008,7 @@ export async function containSecurityCase(
       body: JSON.stringify(request),
     },
   );
-  if (response.status === 401) {
-    window.location.hash = '#/login';
-    throw new Error('Authentication required');
-  }
-  const body = await response.json().catch(() => null) as
-    | SecurityApiResponse<SecurityContainmentAction>
-    | { error?: SecurityRestError }
-    | null;
-  if (!response.ok || !body || !('state' in body)) {
-    const error = body && 'error' in body ? body.error : undefined;
-    throw new SecurityApiClientError(response.status, error ?? {
-      code: 'containment_request_failed',
-      message: response.statusText || 'Containment request failed',
-      retryable: false,
-    });
-  }
-  return body;
+  return parseSecurityCaseResponse<SecurityContainmentAction>(response, 'containment_request_failed', 'Containment request failed');
 }
 
 export async function reviewSecurityCase(
@@ -1995,22 +2024,7 @@ export async function reviewSecurityCase(
       body: JSON.stringify({ status }),
     },
   );
-  if (response.status === 401) {
-    window.location.hash = '#/login';
-    throw new Error('Authentication required');
-  }
-  const body = await response.json().catch(() => null) as SecurityApiResponse<SecurityRiskCase> | {
-    error?: SecurityRestError;
-  } | null;
-  if (!response.ok || !body || !('state' in body)) {
-    const error = body && 'error' in body ? body.error : undefined;
-    throw new SecurityApiClientError(response.status, error ?? {
-      code: 'security_review_failed',
-      message: response.statusText || 'Risk case review failed',
-      retryable: false,
-    });
-  }
-  return body;
+  return parseSecurityCaseResponse<SecurityRiskCase>(response, 'security_review_failed', 'Risk case review failed');
 }
 
 // ─── Skill Metrics types ──────────────────────────────────────────────────────
@@ -2243,8 +2257,9 @@ export async function saveStorageLimit(maxTotalSizeMb: number): Promise<void> {
     credentials: 'same-origin',
     body: JSON.stringify({ max_total_size_mb: maxTotalSizeMb }),
   });
+  redirectOnUnauthorized(res);
   if (!res.ok) {
-    const detail = await res.text().catch(() => '');
+    const detail = normalizeSecurityRestError(await readJsonOrTextBody(res), '', '').message;
     throw new Error(detail || `POST /api/storage/config -> ${res.status}`);
   }
 }

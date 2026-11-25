@@ -2,9 +2,12 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  SecurityApiClientError,
+  containSecurityCase,
   containmentTargetCandidates,
   createFileReadBinding,
   defaultContainmentTargetPid,
+  deleteAgentHealth,
   enforcementSupportsContainment,
   enforcementSupportsMode,
   enforcementViolationTotal,
@@ -15,7 +18,10 @@ const {
   fetchSecurityCase,
   fetchSecurityStatus,
   fetchStorageStatus,
+  resolveInterruption,
+  restartAgentHealth,
   reviewSecurityCase,
+  saveStorageLimit,
   semanticSearchSessions,
 } = require(process.env.AGENTSIGHT_API_CLIENT_BUILD);
 const {
@@ -893,4 +899,70 @@ test('the enforcement page derives its evidence link through the shared helper',
   assert.match(riskPage, /firstCorrelatedCaseId\(violations, agentIdFilter\)/);
   // The inline derivation is what let the link drift from the visible rows.
   assert.doesNotMatch(riskPage, /filteredViolations\.find\(\(event\) => event\.case_id\)/);
+});
+
+test('security API helpers normalize auth.rs flat errors and non-object bodies safely', async () => {
+  const isSecErr = (status, code, message, retryable = false) => (err) => (
+    err instanceof SecurityApiClientError
+    && err.status === status && err.code === code && err.message === message && err.retryable === retryable
+  );
+  const auth403 = JSON.stringify({ error: 'forbidden', message: 'This endpoint is only accessible from localhost' });
+  global.fetch = async () => new Response(auth403, { status: 403, statusText: 'Forbidden' });
+  await assert.rejects(() => fetchSecurityCase('case-1'), isSecErr(403, 'forbidden', 'This endpoint is only accessible from localhost'));
+  await assert.rejects(() => containSecurityCase('case-1', { root_pid: 42, duration_secs: 60 }), isSecErr(403, 'forbidden', 'This endpoint is only accessible from localhost'));
+  await assert.rejects(() => reviewSecurityCase('case-1', 'confirmed'), isSecErr(403, 'forbidden', 'This endpoint is only accessible from localhost'));
+
+  const nested = JSON.stringify({ error: { code: 'case_busy', message: 'Retry later', retryable: true, daemon_code: 'E_BUSY' } });
+  global.fetch = async () => new Response(nested, { status: 503, statusText: 'Service Unavailable' });
+  await assert.rejects(
+    () => containSecurityCase('case-1', { root_pid: 42, duration_secs: 60 }),
+    (err) => isSecErr(503, 'case_busy', 'Retry later', true)(err) && err.daemonCode === 'E_BUSY',
+  );
+
+  global.fetch = async () => new Response(JSON.stringify({ error: null }), { status: 500, statusText: 'Internal Server Error' });
+  await assert.rejects(() => fetchSecurityStatus(), isSecErr(500, 'security_api_error', 'Internal Server Error'));
+
+  global.fetch = async () => new Response(JSON.stringify('upstream timeout'), { status: 502, statusText: 'Bad Gateway' });
+  await assert.rejects(() => containSecurityCase('case-1', { root_pid: 42, duration_secs: 60 }), isSecErr(502, 'containment_request_failed', 'upstream timeout'));
+
+  global.fetch = async () => new Response('123', { status: 500, statusText: 'Internal Server Error' });
+  await assert.rejects(() => reviewSecurityCase('case-1', 'resolved'), isSecErr(500, 'security_review_failed', 'Internal Server Error'));
+});
+
+test('containSecurityCase and reviewSecurityCase reject malformed 2xx payloads', async () => {
+  const isMalformed = (err) => err instanceof SecurityApiClientError && err.status === 200 && err.code === 'malformed_security_response';
+  for (const raw of ['{"state":"contained"}', '{"state":"contained","data":null}', '"ok"']) {
+    global.fetch = async () => new Response(raw, { status: 200 });
+    await assert.rejects(() => containSecurityCase('case-1', { root_pid: 42, duration_secs: 60 }), isMalformed);
+  }
+  for (const raw of ['{"state":"updated","data":[]}', 'null']) {
+    global.fetch = async () => new Response(raw, { status: 200 });
+    await assert.rejects(() => reviewSecurityCase('case-1', 'confirmed'), isMalformed);
+  }
+});
+
+test('mutation wrappers handle null/object error bodies and redirect 401 to login', async () => {
+  global.fetch = async () => new Response('null', { status: 500, statusText: 'Internal Server Error' });
+  await assert.rejects(() => restartAgentHealth(42), /POST \/api\/agent-health\/42\/restart -> 500: Internal Server Error/);
+  await assert.rejects(() => saveStorageLimit(64), /^Error: POST \/api\/storage\/config -> 500$/);
+  await assert.rejects(() => deleteAgentHealth(42), /DELETE \/api\/agent-health\/42 -> 500: Internal Server Error/);
+  await assert.rejects(() => resolveInterruption('int-1'), /POST \/api\/interruptions\/int-1\/resolve -> 500: Internal Server Error/);
+
+  global.fetch = async () => new Response(JSON.stringify({ error: 'forbidden', message: 'localhost only' }), { status: 403 });
+  await assert.rejects(() => restartAgentHealth(42), /POST \/api\/agent-health\/42\/restart -> 403: localhost only/);
+
+  global.fetch = async () => new Response('null', { status: 200 });
+  await assert.rejects(() => restartAgentHealth(42), /invalid response payload/);
+
+  for (const invoke of [
+    () => restartAgentHealth(42),
+    () => saveStorageLimit(64),
+    () => deleteAgentHealth(42),
+    () => resolveInterruption('int-1'),
+  ]) {
+    global.window = { location: { hash: '#/settings' } };
+    global.fetch = async () => new Response('', { status: 401, statusText: 'Unauthorized' });
+    await assert.rejects(invoke, /Authentication required/);
+    assert.equal(global.window.location.hash, '#/login');
+  }
 });

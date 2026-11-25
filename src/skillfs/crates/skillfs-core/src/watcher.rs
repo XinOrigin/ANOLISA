@@ -676,6 +676,14 @@ fn classify_event(
             EventKind::Remove(notify::event::RemoveKind::Folder) => {
                 Some(SkillEvent::DirDeleted(path.to_path_buf()))
             }
+            // Backends that omit per-deletion object types (macOS FSEvents
+            // when IS_DIR is absent, and macOS kqueue Vnode::Delete) emit
+            // `RemoveKind::Any`. Attribute it from `known_dirs` so tracked
+            // directories emit `DirDeleted` while removed files and symlinks
+            // stay silent.
+            EventKind::Remove(notify::event::RemoveKind::Any) if known_dirs.contains(path) => {
+                Some(SkillEvent::DirDeleted(path.to_path_buf()))
+            }
             // MOVED_TO: the new name of a rename inside the source, or a
             // move-in from outside. inotify does not tag the event with
             // the object type, so restat no-follow — like the Create arm,
@@ -2049,6 +2057,227 @@ mod tests {
                 "{kind:?} must not be attributed as a removed directory"
             );
         }
+    }
+
+    #[test]
+    fn removed_tracked_directory_with_remove_any_reports_dir_deleted() {
+        let source = tempfile::tempdir().expect("source directory");
+        let child = source.path().join("alpha");
+        std::fs::create_dir(&child).expect("skill directory");
+        let known_dirs = seed_known_dirs(source.path());
+        assert!(known_dirs.contains(&child));
+
+        std::fs::remove_dir(&child).expect("remove skill directory");
+
+        let event = classify_event(
+            source.path(),
+            &child,
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
+            &known_dirs,
+        );
+        assert!(
+            matches!(event, Some(SkillEvent::DirDeleted(ref path)) if path == &child),
+            "RemoveKind::Any on a tracked directory must emit DirDeleted, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn removed_seeded_non_directory_with_remove_any_stays_silent() {
+        let source = tempfile::tempdir().expect("source directory");
+        let file = source.path().join("scratch");
+        std::fs::write(&file, "regular file").expect("top-level file");
+
+        #[cfg(unix)]
+        let link = {
+            let target = tempfile::tempdir().expect("target directory");
+            let link_path = source.path().join("linked-skill");
+            std::os::unix::fs::symlink(target.path(), &link_path).expect("symlink to dir");
+            link_path
+        };
+
+        let known_dirs = seed_known_dirs(source.path());
+        assert!(!known_dirs.contains(&file));
+        std::fs::remove_file(&file).expect("remove top-level file");
+
+        assert!(
+            classify_event(
+                source.path(),
+                &file,
+                notify::EventKind::Remove(notify::event::RemoveKind::Any),
+                &known_dirs,
+            )
+            .is_none(),
+            "RemoveKind::Any for a regular file must stay silent"
+        );
+
+        #[cfg(unix)]
+        {
+            assert!(!known_dirs.contains(&link));
+            std::fs::remove_file(&link).expect("remove symlink");
+            assert!(
+                classify_event(
+                    source.path(),
+                    &link,
+                    notify::EventKind::Remove(notify::event::RemoveKind::Any),
+                    &known_dirs,
+                )
+                .is_none(),
+                "RemoveKind::Any for a symlink must stay silent"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forward_events_emits_dir_deleted_for_remove_any_and_clears_memory() {
+        let source = tempfile::tempdir().expect("source directory");
+        let seeded = source.path().join("seeded-skill");
+        std::fs::create_dir(&seeded).expect("seeded skill directory");
+        let plain_file = source.path().join("notes");
+        std::fs::write(&plain_file, "regular file").expect("regular file");
+
+        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let src = source.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            forward_events(&src, 50, notify_rx, tx, Some(shutdown_rx)).await;
+        });
+        // Let the task start so seed_known_dirs observes `seeded`.
+        tokio::task::yield_now().await;
+
+        // A directory created after startup must also enter known_dirs via Create(Any).
+        let created = source.path().join("created-skill");
+        std::fs::create_dir(&created).expect("created skill directory");
+        notify_tx
+            .send(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::Any))
+                    .add_path(created.clone()),
+            )
+            .expect("queue create");
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+
+        let mut saw_created = false;
+        while let Ok(event) = rx.try_recv() {
+            if let SkillEvent::DirCreated(path) = event {
+                saw_created |= path == created;
+            }
+        }
+        assert!(saw_created, "created directory must emit DirCreated");
+
+        // Remove all three on disk and report them with Remove(Any) (macOS kqueue/FSEvents shape).
+        std::fs::remove_dir(&seeded).expect("remove seeded directory");
+        std::fs::remove_dir(&created).expect("remove created directory");
+        std::fs::remove_file(&plain_file).expect("remove plain file");
+        for path in [&seeded, &created, &plain_file] {
+            notify_tx
+                .send(
+                    notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Any))
+                        .add_path(path.clone()),
+                )
+                .expect("queue remove");
+        }
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+
+        let mut deleted_paths = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let SkillEvent::DirDeleted(path) = event {
+                deleted_paths.push(path);
+            }
+        }
+        assert!(
+            deleted_paths.contains(&seeded),
+            "seeded directory removed via RemoveKind::Any must emit DirDeleted, got {deleted_paths:?}"
+        );
+        assert!(
+            deleted_paths.contains(&created),
+            "created directory removed via RemoveKind::Any must emit DirDeleted, got {deleted_paths:?}"
+        );
+        assert!(
+            !deleted_paths.contains(&plain_file),
+            "plain file removed via RemoveKind::Any must stay silent, got {deleted_paths:?}"
+        );
+
+        // Recreate the old path as a regular file and remove it with Remove(Any):
+        // the prior DirDeleted must have cleared `known_dirs` so no second DirDeleted fires.
+        std::fs::write(&seeded, "now a regular file").expect("recreate as file");
+        std::fs::remove_file(&seeded).expect("remove recreated file");
+        notify_tx
+            .send(
+                notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Any))
+                    .add_path(seeded.clone()),
+            )
+            .expect("queue second remove");
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+
+        let mut spurious_deleted = false;
+        while let Ok(event) = rx.try_recv() {
+            if let SkillEvent::DirDeleted(path) = event {
+                spurious_deleted |= path == seeded;
+            }
+        }
+        shutdown_tx.send(()).expect("shutdown");
+        join.await.expect("event loop");
+        assert!(
+            !spurious_deleted,
+            "cleared known_dirs entry must not emit a second DirDeleted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn type_replacement_with_remove_any_inside_one_window_does_not_emit_dir_deleted() {
+        let source = tempfile::tempdir().expect("source directory");
+        let scratch = source.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("directory to be replaced");
+
+        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let src = source.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            forward_events(&src, 50, notify_rx, tx, Some(shutdown_rx)).await;
+        });
+        tokio::task::yield_now().await;
+
+        // Replace directory with regular file and delete that file before flush.
+        std::fs::remove_dir(&scratch).expect("remove directory");
+        std::fs::write(&scratch, "regular file").expect("recreate as file");
+        std::fs::remove_file(&scratch).expect("remove replacement file");
+
+        for kind in [
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
+            notify::EventKind::Create(notify::event::CreateKind::File),
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
+        ] {
+            notify_tx
+                .send(notify::Event::new(kind).add_path(scratch.clone()))
+                .expect("queue event");
+        }
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+
+        let mut saw_dir_deleted = false;
+        while let Ok(event) = rx.try_recv() {
+            if let SkillEvent::DirDeleted(path) = event {
+                saw_dir_deleted |= path == scratch;
+            }
+        }
+        shutdown_tx.send(()).expect("shutdown");
+        join.await.expect("event loop");
+        assert!(
+            !saw_dir_deleted,
+            "a directory replaced by a file and then deleted in one window must not emit DirDeleted"
+        );
     }
 
     #[test]

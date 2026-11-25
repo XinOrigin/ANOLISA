@@ -1153,10 +1153,14 @@ pub(crate) fn build_turn_ledger(
                 turn += 1;
             }
             "user" => {
-                pending_user = Some(trunc(
-                    step.message.as_deref().unwrap_or(""),
-                    LEDGER_HEAD_CHARS,
-                ));
+                // Match `trace::extract_user_turns` so IDE-injected system
+                // reminders and slash-command transcripts neither set bogus
+                // `after_user` flags nor overwrite a preceding real message.
+                let text =
+                    crate::trace::strip_system_context(step.message.as_deref().unwrap_or(""));
+                if !text.is_empty() {
+                    pending_user = Some(trunc(&text, LEDGER_HEAD_CHARS));
+                }
             }
             _ => {}
         }
@@ -1296,65 +1300,72 @@ pub(crate) fn extract_waste_candidates_from(
             "agent" => {
                 turn_idx += 1;
                 let step_no = turn_idx.max(0) as usize;
-                for (k, result) in step.results().iter().enumerate() {
-                    let text = result.content.as_deref().unwrap_or("");
-                    let toks = estimate_tokens(text);
-                    if toks >= TOOL_TRIM_MIN {
-                        let name = result
-                            .source_call_id
-                            .as_deref()
-                            .and_then(|id| {
-                                let owner = agentsight_atif::resolve_call_id(
-                                    id,
-                                    step.calls().iter().map(|call| call.tool_call_id.as_str()),
-                                )?;
-                                step.calls()
-                                    .iter()
-                                    .find(|call| call.tool_call_id == owner)
-                                    .map(|call| call.function_name.clone())
-                            })
-                            .or_else(|| {
-                                // Positional pairing is only for documents whose
-                                // results carry no ids at all (the same rule
-                                // `collect_tool_calls_with` applies). Falling
-                                // back whenever the id misses would blame the
-                                // first tool of the step for a sibling's output
-                                // and feed that name into the candidate's facts.
-                                step.results()
-                                    .iter()
-                                    .all(|r| r.source_call_id.is_none())
-                                    .then(|| step.calls().get(k))
-                                    .flatten()
-                                    .map(|c| c.function_name.clone())
-                            })
-                            .unwrap_or_else(|| "unknown".to_string());
-                        tool_outputs.push((
-                            step_no,
-                            name,
-                            toks,
-                            trunc(text, SNIPPET_CHARS),
-                            total_steps.saturating_sub(step_no + 1),
-                        ));
+                let replays = total_steps.saturating_sub(step_no + 1);
+                if replays > 0 {
+                    for (k, result) in step.results().iter().enumerate() {
+                        let text = result.content.as_deref().unwrap_or("");
+                        let toks = estimate_tokens(text);
+                        if toks >= TOOL_TRIM_MIN {
+                            let name = result
+                                .source_call_id
+                                .as_deref()
+                                .and_then(|id| {
+                                    let owner = agentsight_atif::resolve_call_id(
+                                        id,
+                                        step.calls().iter().map(|call| call.tool_call_id.as_str()),
+                                    )?;
+                                    step.calls()
+                                        .iter()
+                                        .find(|call| call.tool_call_id == owner)
+                                        .map(|call| call.function_name.clone())
+                                })
+                                .or_else(|| {
+                                    // Positional pairing is only for documents whose
+                                    // results carry no ids at all (the same rule
+                                    // `collect_tool_calls_with` applies). Falling
+                                    // back whenever the id misses would blame the
+                                    // first tool of the step for a sibling's output
+                                    // and feed that name into the candidate's facts.
+                                    step.results()
+                                        .iter()
+                                        .all(|r| r.source_call_id.is_none())
+                                        .then(|| step.calls().get(k))
+                                        .flatten()
+                                        .map(|c| c.function_name.clone())
+                                })
+                                .unwrap_or_else(|| "unknown".to_string());
+                            tool_outputs.push((
+                                step_no,
+                                name,
+                                toks,
+                                trunc(text, SNIPPET_CHARS),
+                                replays,
+                            ));
+                        }
                     }
                 }
             }
             "user" => {
-                let text = step.message.as_deref().unwrap_or("");
-                let toks = estimate_tokens(text);
-                if toks >= USER_LARGE_MIN {
-                    // The message arrives after turn_idx + 1 agent turns have
-                    // finished, so it enters the context of the turns that
-                    // follow - never the turn that completed before it was
-                    // sent. turn_idx is -1 before the first agent step, hence
-                    // the +1: a leading message is replayed by every turn.
-                    let first_replay_turn = (turn_idx + 1) as usize;
-                    let replays = total_steps.saturating_sub(first_replay_turn);
-                    user_inputs.push((
-                        first_replay_turn,
-                        replays,
-                        toks,
-                        trunc(text, SNIPPET_CHARS),
-                    ));
+                // The message arrives after turn_idx + 1 agent turns have
+                // finished, so it enters the context of the turns that
+                // follow - never the turn that completed before it was
+                // sent. turn_idx is -1 before the first agent step, hence
+                // the +1: a leading message is replayed by every turn.
+                // A trailing message after the final agent turn is never
+                // replayed (`replays == 0`) and carries no prompt cost.
+                let first_replay_turn = (turn_idx + 1) as usize;
+                let replays = total_steps.saturating_sub(first_replay_turn);
+                if replays > 0 {
+                    let text = step.message.as_deref().unwrap_or("");
+                    let toks = estimate_tokens(text);
+                    if toks >= USER_LARGE_MIN {
+                        user_inputs.push((
+                            first_replay_turn,
+                            replays,
+                            toks,
+                            trunc(text, SNIPPET_CHARS),
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -2726,5 +2737,172 @@ mod tests {
         assert_eq!(cost.total_real_input_tok, 8_100);
         let m3 = compute_ratio_metrics(&cost).m3_cache_hit_rate.expect("m3");
         assert!(m3 <= 1.0, "m3_cache_hit_rate must stay in [0, 1], got {m3}");
+    }
+
+    /// A trailing oversized user message after the last agent step has zero
+    /// replays (`replays == 0`): it must not emit a 0-token `user_prompt`
+    /// candidate or pollute an earlier replayed candidate's step list and facts.
+    #[test]
+    fn trailing_unreplayed_user_prompt_is_skipped() {
+        let big = "x ".repeat(4000); // ~2k tokens, over USER_LARGE_MIN
+        let bigger = "y ".repeat(6000); // ~3k tokens
+
+        // Only a trailing oversized user message → no user_prompt candidate.
+        let trailing_only = traj(&format!(
+            r#"[
+            {{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"go"}},
+            {{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z","message":"a1"}},
+            {{"step_id":3,"source":"agent","timestamp":"2026-07-02T06:30:02.000Z","message":"a2"}},
+            {{"step_id":4,"source":"user","timestamp":"2026-07-02T06:30:03.000Z","message":"{big}"}}
+        ]"#
+        ));
+        let set = extract_waste_candidates(&trailing_only).expect("extract_waste_candidates");
+        assert!(
+            set.candidates.iter().all(|c| c.id != "user_prompt"),
+            "trailing un-replayed user input must not emit a 0-token user_prompt candidate: {:?}",
+            set.candidates
+        );
+
+        // Leading replayed large prompt + trailing un-replayed larger prompt →
+        // only the replayed prompt is counted, with valid step index and facts.
+        let mixed = traj(&format!(
+            r#"[
+            {{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"{big}"}},
+            {{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z","message":"a1"}},
+            {{"step_id":3,"source":"agent","timestamp":"2026-07-02T06:30:02.000Z","message":"a2"}},
+            {{"step_id":4,"source":"user","timestamp":"2026-07-02T06:30:03.000Z","message":"{bigger}"}}
+        ]"#
+        ));
+        let set = extract_waste_candidates(&mixed).expect("extract_waste_candidates");
+        let up = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "user_prompt")
+            .expect("leading replayed user input still emits user_prompt");
+        assert_eq!(up.steps, vec![0]);
+        assert!(
+            up.facts.contains("1 段超长用户输入"),
+            "trailing un-replayed input must not inflate segment count: {}",
+            up.facts
+        );
+        assert!(
+            up.facts.contains("最大 2.0k tok"),
+            "trailing un-replayed input must not skew max token count: {}",
+            up.facts
+        );
+        assert_eq!(up.potential_save_tokens, 2_400);
+    }
+
+    /// A tool output on the final agent step is never replayed (`replays == 0`),
+    /// so it must not be included in `tool_output` evidence or blame the final
+    /// step when only earlier copied context contributed to `trim_tok`.
+    #[test]
+    fn final_step_unreplayed_tool_output_is_excluded_from_evidence() {
+        let big = "x ".repeat(6000); // ~3k tokens, over TOOL_TRIM_MIN
+        let bigger = "y ".repeat(10000); // ~5k tokens
+
+        // Earlier replayed tool output + final-step un-replayed tool output.
+        let t = traj(&format!(
+            r#"[
+            {{"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"go"}},
+            {{"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+              "tool_calls":[{{"tool_call_id":"c1","function_name":"Read","arguments":{{"file_path":"/a"}}}}],
+              "observation":{{"results":[{{"source_call_id":"c1","content":"{big}"}}]}}}},
+            {{"step_id":3,"source":"agent","timestamp":"2026-07-02T06:30:02.000Z",
+              "tool_calls":[{{"tool_call_id":"c2","function_name":"Bash","arguments":{{"command":"cat /b"}}}}],
+              "observation":{{"results":[{{"source_call_id":"c2","content":"{bigger}"}}]}}}}
+        ]"#
+        ));
+        let set = extract_waste_candidates(&t).expect("extract_waste_candidates");
+        let tool = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "tool_output")
+            .expect("earlier replayed tool output still emits tool_output");
+        assert_eq!(tool.steps, vec![0]);
+        assert!(tool.facts.contains("Read"), "facts: {}", tool.facts);
+        assert!(
+            !tool.facts.contains("Bash"),
+            "final-step un-replayed tool output must not appear in facts: {}",
+            tool.facts
+        );
+
+        // Copied context contributes trim_tok, while only the final step has a
+        // non-copied oversized output → must not emit a candidate blaming it.
+        let copied_only = traj(&format!(
+            r#"[
+            {{"step_id":1,"source":"user","is_copied_context":true,"message":"prior",
+              "observation":{{"results":[{{"content":"{big}"}}]}}}},
+            {{"step_id":2,"source":"user","timestamp":"2026-07-02T06:30:00.000Z","message":"go"}},
+            {{"step_id":3,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z",
+              "tool_calls":[{{"tool_call_id":"c2","function_name":"Bash","arguments":{{"command":"cat /b"}}}}],
+              "observation":{{"results":[{{"source_call_id":"c2","content":"{bigger}"}}]}}}}
+        ]"#
+        ));
+        let set = extract_waste_candidates(&copied_only).expect("extract_waste_candidates");
+        assert!(
+            set.candidates.iter().all(|c| c.id != "tool_output"),
+            "un-replayed final-step output must not emit tool_output candidate: {:?}",
+            set.candidates
+        );
+    }
+
+    /// System-injected user steps (`<system-reminder>`, slash-command
+    /// transcripts, etc.) must be stripped in `build_turn_ledger` so they do
+    /// not set bogus `after_user = true`, overwrite a preceding real user
+    /// message, or inflate the detour `prevention_ceiling`.
+    #[test]
+    fn ledger_and_detour_strip_system_context_from_user_steps() {
+        let t = traj(
+            r#"[
+            {"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00.000Z",
+             "message":"<system-reminder>MEMORY.md dump</system-reminder>\n实现解析器"},
+            {"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01.000Z","message":"t0"},
+            {"step_id":3,"source":"user","timestamp":"2026-07-02T06:30:02.000Z",
+             "message":"<system-reminder>mid-session hook</system-reminder>"},
+            {"step_id":4,"source":"agent","timestamp":"2026-07-02T06:30:03.000Z","message":"t1"},
+            {"step_id":5,"source":"user","timestamp":"2026-07-02T06:30:04.000Z","message":"请改用 snake_case"},
+            {"step_id":6,"source":"user","timestamp":"2026-07-02T06:30:05.000Z",
+             "message":"<command-message>clear</command-message>\n<command-name>/clear</command-name>"},
+            {"step_id":7,"source":"agent","timestamp":"2026-07-02T06:30:06.000Z","message":"t2"},
+            {"step_id":8,"source":"agent","timestamp":"2026-07-02T06:30:07.000Z","message":"t3"},
+            {"step_id":9,"source":"agent","timestamp":"2026-07-02T06:30:08.000Z","message":"t4"}
+        ]"#,
+        );
+        let set = extract_waste_candidates(&t).expect("extract_waste_candidates");
+        assert_eq!(set.ledger.len(), 5);
+
+        assert!(set.ledger[0].after_user);
+        assert_eq!(set.ledger[0].user_head, "实现解析器");
+        assert!(
+            !set.ledger[1].after_user,
+            "system-only reminder must not set after_user on T1"
+        );
+        assert!(set.ledger[1].user_head.is_empty());
+        assert!(set.ledger[2].after_user);
+        assert_eq!(
+            set.ledger[2].user_head, "请改用 snake_case",
+            "trailing system-only step must not overwrite pending real user text"
+        );
+        assert!(!set.ledger[3].after_user);
+        assert!(!set.ledger[4].after_user);
+
+        let rendered = render_ledger(&set.ledger);
+        assert!(rendered.contains("USER→: 实现解析器"));
+        assert!(rendered.contains("USER→: 请改用 snake_case"));
+        assert!(!rendered.contains("system-reminder"));
+        assert!(!rendered.contains("mid-session hook"));
+        assert!(!rendered.contains("command-message"));
+
+        let detour = set
+            .candidates
+            .iter()
+            .find(|c| c.id == "detour")
+            .expect("detour fires on 5-turn trajectory");
+        assert_eq!(
+            detour.potential_save_tokens,
+            set.ledger[0].tokens + set.ledger[2].tokens,
+            "system-only user step must not inflate prevention_ceiling"
+        );
     }
 }

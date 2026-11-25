@@ -152,7 +152,10 @@ fn render_user_messages(trajectory: &AtifTrajectory) -> String {
         match step.source.as_str() {
             "agent" => turn += 1,
             "user" => {
-                let msg = step.message.as_deref().unwrap_or("");
+                let msg = crate::trace::strip_system_context(step.message.as_deref().unwrap_or(""));
+                if msg.is_empty() {
+                    continue;
+                }
                 let limit = if first { FIRST_USER_CHARS } else { USER_CHARS };
                 let tag = if first {
                     "初始 prompt"
@@ -162,7 +165,7 @@ fn render_user_messages(trajectory: &AtifTrajectory) -> String {
                 first = false;
                 out.push_str(&format!(
                     "[{tag} → T{turn}] {}\n",
-                    crate::atif::truncate_chars(msg, limit)
+                    crate::atif::truncate_chars(&msg, limit)
                 ));
             }
             _ => {}
@@ -306,5 +309,51 @@ mod tests {
         )
         .expect("fixture parses");
         assert!(render_final_outcome(&t).contains("没有可用的最终产出文本"));
+    }
+
+    #[test]
+    fn render_user_messages_strips_system_context() {
+        let t = AtifTrajectory::from_json(
+            r#"{"schema_version":"ATIF-v1.7","session_id":"s3",
+                "agent":{"name":"a","version":"1","model_name":"m"},
+                "steps":[
+                  {"step_id":1,"source":"user","message":"<system-reminder>MEMORY.md dump</system-reminder>"},
+                  {"step_id":2,"source":"user","message":"<system-reminder>env info</system-reminder>\n实现一个解析器"},
+                  {"step_id":3,"source":"agent","message":"drafted"},
+                  {"step_id":4,"source":"user","message":"[SYSTEM NOTIFICATION - NOT USER INPUT]\nautomated hook"},
+                  {"step_id":5,"source":"agent","message":"checked"},
+                  {"step_id":6,"source":"user","message":"命名要用 snake_case\n<system-reminder>reminder</system-reminder>"},
+                  {"step_id":7,"source":"agent","message":"done"}
+                ]}"#,
+        )
+        .expect("fixture parses");
+        let users = render_user_messages(&t);
+        assert!(
+            users.contains("[初始 prompt → T0] 实现一个解析器"),
+            "system-only step must not consume [初始 prompt]: {users}"
+        );
+        assert!(
+            users.contains("[后续消息 → T2] 命名要用 snake_case"),
+            "subsequent user turn should keep cleaned text and turn index: {users}"
+        );
+        assert!(!users.contains("system-reminder"));
+        assert!(!users.contains("MEMORY.md"));
+        assert!(!users.contains("env info"));
+        assert!(!users.contains("SYSTEM NOTIFICATION"));
+        assert_eq!(users.lines().count(), 2);
+
+        let system_only = AtifTrajectory::from_json(
+            r#"{"schema_version":"ATIF-v1.7","session_id":"s4",
+                "agent":{"name":"a","version":"1","model_name":"m"},
+                "steps":[
+                  {"step_id":1,"source":"user","message":"<system-reminder>only system</system-reminder>"},
+                  {"step_id":2,"source":"agent","message":"done"}
+                ]}"#,
+        )
+        .expect("fixture parses");
+        assert_eq!(
+            render_user_messages(&system_only),
+            "（本轨迹没有 user 步）\n"
+        );
     }
 }

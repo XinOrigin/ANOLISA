@@ -200,6 +200,7 @@ impl WorkspaceState {
     }
 
     /// Add or replace metadata together with its chronological identity key.
+    #[cfg(test)]
     pub(crate) fn insert_snapshot(&mut self, id: String, meta: ws_ckpt_common::SnapshotMeta) {
         self.remove_snapshot(&id);
         self.snapshot_order.insert(ListKey {

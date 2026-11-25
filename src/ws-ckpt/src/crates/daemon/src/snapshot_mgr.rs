@@ -321,18 +321,21 @@ pub async fn checkpoint(
         child_ids: vec![ws_ckpt_common::LIVE_CHILD.to_string()],
     };
 
-    // 10. Update index (maintain DAG bidirectional pointers)
-    if let Some(old_head) = ws.index.head.clone() {
-        if let Some(hm) = ws.index.snapshots.get_mut(&old_head) {
+    // 10. Stage index update (maintain DAG bidirectional pointers)
+    let mut next_index = ws.index.clone();
+    if let Some(old_head) = next_index.head.clone() {
+        if let Some(hm) = next_index.snapshots.get_mut(&old_head) {
             hm.child_ids.retain(|c| c != ws_ckpt_common::LIVE_CHILD);
             hm.child_ids.push(snapshot_id.clone());
         }
     }
-    ws.insert_snapshot(snapshot_id.clone(), meta);
-    ws.index.head = Some(snapshot_id.clone());
+    next_index.snapshots.insert(snapshot_id.clone(), meta);
+    next_index.head = Some(snapshot_id.clone());
 
-    // 11. Persist index
-    index_store::save(&snap_dir, &ws.index).await?;
+    // 11. Persist index before mutating live in-memory state so a save
+    //     failure never leaves a phantom head or drops LIVE_CHILD.
+    index_store::save(&snap_dir, &next_index).await?;
+    ws.replace_index(next_index);
 
     // 11a. Release write lock before save_manifest (try_read inside
     //      collect_workspace_entries would fail while write lock is held)
@@ -3095,5 +3098,114 @@ mod tests {
             1,
             "missing entries must not be re-cleaned on every pass"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_index_save_failure_preserves_live_index_and_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("ckpt-save-fail-data");
+        let backend = Arc::new(PartialFailBackend::new(
+            data_root.clone(),
+            std::iter::empty(),
+        ));
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend as Arc<dyn StorageBackend>,
+            tmp.path().join("state"),
+        ));
+
+        let ws_id = "ws-save-fail";
+        let subvol = data_root.join(ws_id);
+        std::fs::create_dir_all(&subvol).unwrap();
+        std::fs::write(subvol.join("file.txt"), b"content").unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+
+        let initial_index = chain_index(&ws_path, ws_id, 1);
+        let snap_dir = state.index_dir(ws_id);
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        index_store::save(&snap_dir, &initial_index).await.unwrap();
+        state
+            .register_workspace(ws_id.to_string(), ws_path.clone(), initial_index)
+            .unwrap();
+
+        // Obstruct atomic_write's temp path so index_store::save fails after
+        // backend.create_snapshot succeeds.
+        std::fs::create_dir_all(snap_dir.join("index.json.tmp")).unwrap();
+
+        let err = checkpoint(&state, ws_id, "snap-2", Some("blocked".into()), None, false)
+            .await
+            .expect_err("checkpoint must return Err when index_store::save fails");
+        assert!(
+            format!("{err:#}").contains("index.json.tmp"),
+            "unexpected save error: {err:#}"
+        );
+
+        let arc = state.get_by_wsid(ws_id).expect("workspace registered");
+        {
+            let ws = arc.read().await;
+            assert_eq!(
+                ws.index.head.as_deref(),
+                Some("snap-1"),
+                "failed save must not advance live head"
+            );
+            assert_eq!(
+                ws.index.snapshots.len(),
+                1,
+                "failed save must not insert phantom snapshot into live index"
+            );
+            assert!(!ws.index.snapshots.contains_key("snap-2"));
+            assert_eq!(
+                ws.index.snapshots["snap-1"].child_ids,
+                vec![ws_ckpt_common::LIVE_CHILD.to_string()],
+                "failed save must preserve LIVE_CHILD on old head"
+            );
+            assert_eq!(
+                ws.snapshot_keys().len(),
+                1,
+                "failed save must not insert phantom key into snapshot_order"
+            );
+        }
+
+        let on_disk = index_store::load(&snap_dir).await.unwrap();
+        assert_eq!(on_disk.head.as_deref(), Some("snap-1"));
+        assert_eq!(on_disk.snapshots.len(), 1);
+        assert_eq!(
+            on_disk.snapshots["snap-1"].child_ids,
+            vec![ws_ckpt_common::LIVE_CHILD.to_string()]
+        );
+
+        // Once the obstruction clears, a subsequent checkpoint persists and
+        // publishes the updated DAG and snapshot_order cleanly.
+        std::fs::remove_dir(snap_dir.join("index.json.tmp")).unwrap();
+        let resp = checkpoint(&state, ws_id, "snap-3", Some("ok".into()), None, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::CheckpointOk { ref snapshot_id } if snapshot_id == "snap-3"),
+            "expected CheckpointOk(snap-3), got {resp:?}"
+        );
+
+        let ws = arc.read().await;
+        assert_eq!(ws.index.head.as_deref(), Some("snap-3"));
+        assert_eq!(ws.index.snapshots.len(), 2);
+        assert_eq!(
+            ws.index.snapshots["snap-1"].child_ids,
+            vec!["snap-3".to_string()]
+        );
+        assert_eq!(
+            ws.index.snapshots["snap-3"].parent_id.as_deref(),
+            Some("snap-1")
+        );
+        assert_eq!(
+            ws.index.snapshots["snap-3"].child_ids,
+            vec![ws_ckpt_common::LIVE_CHILD.to_string()]
+        );
+        assert_eq!(ws.snapshot_keys().len(), 2);
+        drop(ws);
+
+        let on_disk = index_store::load(&snap_dir).await.unwrap();
+        assert_eq!(on_disk.head.as_deref(), Some("snap-3"));
+        assert_eq!(on_disk.snapshots.len(), 2);
     }
 }

@@ -1091,6 +1091,7 @@ function SessionAnalysisView({ sessionId }: { sessionId: string }) {
     setReport(EMPTY_REPORT);
     setAnalyzeError(null);
     setLlmNotConfigured(false);
+    setResultsUnavailable(false);
     runDimensions(ALL_DIMS);
   }, [runDimensions]);
 
@@ -1270,6 +1271,8 @@ function SessionEntryView() {
 
   useEffect(() => {
     let cancelled = false;
+    setError(null);
+    setLoading(true);
     fetchOptimizeHistory(HISTORY_FETCH_LIMIT)
       .then((data) => {
         if (!cancelled) setHistory(data);

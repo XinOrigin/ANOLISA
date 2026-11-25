@@ -213,7 +213,13 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
 
 fn sql_column(columns: &HashSet<String>, name: &str, fallback: &str) -> String {
     if columns.contains(name) {
-        format!("\"{name}\"")
+        if fallback == "NULL" {
+            format!("\"{name}\"")
+        } else {
+            // Nullable columns in Hermes state.db may hold SQL NULL even when a
+            // schema default exists; coalesce so CAST does not fail non-Option gets.
+            format!("COALESCE(\"{name}\", {fallback})")
+        }
     } else {
         fallback.to_string()
     }
@@ -323,6 +329,20 @@ fn load_messages(
     Ok(rows)
 }
 
+fn last_activity_timestamp(session: &HermesSession, messages: &[HermesMessage]) -> f64 {
+    messages
+        .iter()
+        .rev()
+        .filter_map(|message| message.timestamp)
+        .find(|&timestamp| timestamp_ns(timestamp) > 0)
+        .or_else(|| {
+            session
+                .ended_at
+                .filter(|&timestamp| timestamp_ns(timestamp) > 0)
+        })
+        .unwrap_or(session.started_at)
+}
+
 fn session_is_expired(
     session: &HermesSession,
     messages: &[HermesMessage],
@@ -336,11 +356,7 @@ fn session_is_expired(
         .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let cutoff = retention_cutoff_ns(now_ns, retention_days)?;
-    let last_timestamp = messages
-        .last()
-        .map(|message| message.timestamp)
-        .or(session.ended_at)
-        .unwrap_or(session.started_at);
+    let last_timestamp = last_activity_timestamp(session, messages);
     Ok(timestamp_ns(last_timestamp) < i64::try_from(cutoff).unwrap_or(i64::MAX))
 }
 
@@ -354,10 +370,7 @@ fn ingest_session(
 ) -> Result<bool> {
     let session_id = scoped_session_id(database_namespace, &session.id);
     let fingerprint = source_fingerprint(schema_version, session, messages);
-    let last_seen_ns = messages
-        .last()
-        .map(|message| timestamp_ns(message.timestamp))
-        .unwrap_or_else(|| timestamp_ns(session.started_at));
+    let last_seen_ns = timestamp_ns(last_activity_timestamp(session, messages));
     let file_path = db_path.to_string_lossy().to_string();
     if store.get_source_session_state(&session_id, SOURCE, &file_path)?
         == Some((fingerprint, last_seen_ns))

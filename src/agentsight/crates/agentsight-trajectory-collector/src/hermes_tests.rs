@@ -886,3 +886,182 @@ fn assert_hermes_result_identity(separate_steps: bool) {
     drop(writer);
     std::fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn nullable_session_fields_with_null_values_are_ingested_with_defaults() {
+    let base = tmp_dir("null-session-fields");
+    let writer = create_hermes_db(&base);
+    writer
+        .execute_batch(
+            "INSERT INTO sessions (
+                 id, source, model, cwd, started_at, ended_at,
+                 input_tokens, output_tokens, cache_read_tokens,
+                 cache_write_tokens, reasoning_tokens,
+                 estimated_cost_usd, actual_cost_usd, api_call_count
+             ) VALUES (
+                 'null-counters', 'cli', 'gpt-5', '/workspace/app', 1781517600.0, NULL,
+                 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+             );
+             INSERT INTO messages (session_id, role, content, timestamp)
+             VALUES ('null-counters', 'user', 'hello', 1781517601.0);",
+        )
+        .unwrap();
+
+    // Also verify nullable source/started_at in relaxed schemas while X'00' BLOBs stay rejected.
+    let relaxed_dir = base.join("relaxed");
+    std::fs::create_dir_all(&relaxed_dir).unwrap();
+    let relaxed = Connection::open(relaxed_dir.join("state.db")).unwrap();
+    relaxed
+        .execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 source TEXT,
+                 started_at REAL,
+                 input_tokens INTEGER
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 content TEXT,
+                 timestamp REAL
+             );
+             INSERT INTO sessions (id, source, started_at, input_tokens)
+             VALUES ('relaxed-nulls', NULL, NULL, NULL),
+                    ('bad-blob-source', X'00', 10.0, 5);
+             INSERT INTO messages (session_id, role, content, timestamp)
+             VALUES ('relaxed-nulls', 'user', 'hi', 1781517601.0),
+                    ('bad-blob-source', 'user', 'ignored', 1781517601.0);",
+        )
+        .unwrap();
+
+    let store = TrajectoryStore::new_with_path(&base.join("trajectories.db")).unwrap();
+    let outcome = hermes::collect_database(&store, &base.join("state.db"), 0).unwrap();
+    assert_eq!((outcome.sessions, outcome.ingested), (2, 2));
+
+    let record = store
+        .get(&stored_id(&base, "null-counters"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.total_prompt_tokens, Some(0));
+    assert_eq!(record.total_completion_tokens, Some(0));
+    let doc: serde_json::Value = serde_json::from_str(&record.atif_json).unwrap();
+    assert_eq!(doc["final_metrics"]["total_prompt_tokens"], 0);
+    assert_eq!(doc["final_metrics"]["total_completion_tokens"], 0);
+    assert_eq!(doc["final_metrics"]["total_cached_tokens"], 0);
+    assert_eq!(doc["final_metrics"]["extra"]["cache_write_tokens"], 0);
+    assert_eq!(doc["final_metrics"]["extra"]["reasoning_tokens"], 0);
+    assert_eq!(doc["final_metrics"]["extra"]["api_call_count"], 0);
+
+    let relaxed_outcome =
+        hermes::collect_database(&store, &relaxed_dir.join("state.db"), 0).unwrap();
+    assert_eq!((relaxed_outcome.sessions, relaxed_outcome.ingested), (1, 1));
+    let relaxed_record = store
+        .get(&stored_id(&relaxed_dir, "relaxed-nulls"))
+        .unwrap()
+        .unwrap();
+    let relaxed_doc: serde_json::Value = serde_json::from_str(&relaxed_record.atif_json).unwrap();
+    assert_eq!(relaxed_doc["extra"]["hermes_source"], "hermes");
+    assert!(store
+        .get(&stored_id(&relaxed_dir, "bad-blob-source"))
+        .unwrap()
+        .is_none());
+
+    drop(store);
+    drop(writer);
+    drop(relaxed);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn null_message_timestamps_do_not_fail_or_falsely_expire_active_sessions() {
+    let base = tmp_dir("null-message-timestamps");
+    let db_path = base.join("state.db");
+    let writer = Connection::open(&db_path).unwrap();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    writer
+        .execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 source TEXT NOT NULL,
+                 started_at REAL NOT NULL,
+                 ended_at REAL
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 content TEXT,
+                 timestamp REAL
+             );",
+        )
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at) VALUES
+             ('mixed-ts', 'cli', ?1, NULL),
+             ('all-null-recent', 'cli', ?2, NULL),
+             ('all-null-expired', 'cli', 1.0, NULL),
+             ('bad-blob-role', 'cli', ?2, NULL)",
+            params![now_secs - 120.0, now_secs - 60.0],
+        )
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES
+             ('mixed-ts', 'user', 'first', ?1),
+             ('mixed-ts', 'assistant', 'second without ts', NULL),
+             ('all-null-recent', 'user', 'recent session without msg ts', NULL),
+             ('all-null-expired', 'user', 'old session without msg ts', NULL)",
+            params![now_secs - 60.0],
+        )
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO messages (session_id, role, content, timestamp)
+             VALUES ('bad-blob-role', X'00', 'corrupt role', NULL)",
+            [],
+        )
+        .unwrap();
+
+    let store = TrajectoryStore::new_with_path(&base.join("trajectories.db")).unwrap();
+    let outcome = hermes::collect_database(&store, &db_path, 30).unwrap();
+    assert_eq!(outcome.sessions, 4);
+    assert_eq!(outcome.ingested, 2);
+
+    let mixed = store.get(&stored_id(&base, "mixed-ts")).unwrap().unwrap();
+    assert!(mixed.start_time.is_some());
+    assert_ne!(
+        mixed.start_time.as_deref(),
+        Some("1970-01-01T00:00:00.000Z")
+    );
+    let mixed_doc: serde_json::Value = serde_json::from_str(&mixed.atif_json).unwrap();
+    let mixed_steps = mixed_doc["steps"].as_array().unwrap();
+    assert!(mixed_steps[0].get("timestamp").is_some());
+    assert!(mixed_steps[1].get("timestamp").is_none());
+
+    let recent = store
+        .get(&stored_id(&base, "all-null-recent"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recent.num_steps, 1);
+    assert!(recent.start_time.is_none());
+    assert!(recent.end_time.is_none());
+
+    assert!(store
+        .get(&stored_id(&base, "all-null-expired"))
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get(&stored_id(&base, "bad-blob-role"))
+        .unwrap()
+        .is_none());
+
+    drop(store);
+    drop(writer);
+    std::fs::remove_dir_all(base).unwrap();
+}

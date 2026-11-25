@@ -41,7 +41,7 @@ pub(crate) struct HermesMessage {
     pub(crate) tool_call_id: Option<String>,
     pub(crate) tool_calls: Option<String>,
     pub(crate) tool_name: Option<String>,
-    pub(crate) timestamp: f64,
+    pub(crate) timestamp: Option<f64>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) reasoning: Option<String>,
     pub(crate) reasoning_content: Option<String>,
@@ -145,7 +145,7 @@ fn message_step(
         step_id,
         source,
         message: content_text(message.content.as_deref()),
-        timestamp: format_timestamp(message.timestamp),
+        timestamp: message.timestamp.and_then(format_timestamp),
         model_name: None,
         reasoning_effort: None,
         reasoning_content: message
@@ -236,7 +236,7 @@ fn attach_tool_result(
                 call.tool_call_id = id;
             }
             result.source_call_id = Some(call.tool_call_id.clone());
-            if let Some(timestamp) = format_timestamp(message.timestamp) {
+            if let Some(timestamp) = message.timestamp.and_then(format_timestamp) {
                 call.extra
                     .get_or_insert_with(HashMap::new)
                     .insert("result_timestamp".into(), Value::String(timestamp));
@@ -255,7 +255,7 @@ fn attach_tool_result(
         step_id: steps.len() + 1,
         source: StepSource::Agent,
         message: String::new(),
-        timestamp: format_timestamp(message.timestamp),
+        timestamp: message.timestamp.and_then(format_timestamp),
         model_name: None,
         reasoning_effort: None,
         reasoning_content: None,
@@ -419,7 +419,7 @@ pub(crate) fn source_fingerprint(
         message.tool_call_id.hash(&mut hasher);
         message.tool_calls.hash(&mut hasher);
         message.tool_name.hash(&mut hasher);
-        message.timestamp.to_bits().hash(&mut hasher);
+        message.timestamp.map(f64::to_bits).hash(&mut hasher);
         message.finish_reason.hash(&mut hasher);
         message.reasoning.hash(&mut hasher);
         message.reasoning_content.hash(&mut hasher);

@@ -40,6 +40,7 @@ pub fn exchange(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(UdsError::InvalidTimeout)?;
+    validate_request_line(request_line)?;
     let mut stream = connect_bounded(socket, deadline)?;
     if let Some(uid) = expected_uid {
         verify_peer_uid(&stream, uid)?;
@@ -49,6 +50,15 @@ pub fn exchange(
         write_all_bounded(&stream, b"\n", deadline)?;
     }
     read_line_bounded(&mut stream, deadline, max_response_bytes)
+}
+
+fn validate_request_line(request_line: &[u8]) -> Result<(), UdsError> {
+    let body = request_line.strip_suffix(b"\n").unwrap_or(request_line);
+    let payload = body.strip_suffix(b"\r").unwrap_or(body);
+    if payload.is_empty() || body.contains(&b'\n') {
+        return Err(UdsError::InvalidFrame);
+    }
+    Ok(())
 }
 
 fn remaining_timeout(deadline: Instant) -> Result<Duration, UdsError> {
@@ -536,5 +546,81 @@ mod tests {
         let sock = Path::new("/tmp/aw-exec-nonexistent-timeout.sock");
         let err = exchange(sock, b"{}", Duration::MAX, None, 4096).unwrap_err();
         assert_eq!(err, UdsError::InvalidTimeout);
+    }
+
+    #[test]
+    fn exchange_rejects_embedded_newline_and_empty_request_frames_before_connecting() {
+        let dir = TempDir::new("bad-req");
+        let sock = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("set_nonblocking");
+
+        let malformed: &[&[u8]] = &[
+            b"",
+            b"\n",
+            b"\r",
+            b"\r\n",
+            b"{\"a\":1}\n{\"b\":2}",
+            b"{\"a\":1}\n{\"b\":2}\n",
+            b"{\"a\":1}\r\n{\"b\":2}\r\n",
+            b"{\"a\":1}\n\n",
+            b"\n{\"a\":1}",
+        ];
+        let uid = current_uid();
+        for request in malformed {
+            let err = exchange(&sock, request, Duration::from_millis(80), Some(uid), 4096)
+                .expect_err("malformed request frame must be rejected");
+            assert_eq!(
+                err,
+                UdsError::InvalidFrame,
+                "expected InvalidFrame for request {request:?}"
+            );
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                "client must not connect when request frame {request:?} is malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_accepts_single_line_request_with_trailing_lf_or_crlf() {
+        let dir = TempDir::new("valid-eol");
+        let sock = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let handle = thread::spawn(move || {
+            for (expected, reply) in [
+                ("{\"ping\":1}\n", b"{\"pong\":1}\n".as_slice()),
+                ("{\"ping\":2}\r\n", b"{\"pong\":2}\r\n".as_slice()),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read");
+                assert_eq!(line, expected);
+                stream.write_all(reply).expect("write");
+            }
+        });
+
+        let uid = current_uid();
+        let out_lf = exchange(
+            &sock,
+            b"{\"ping\":1}\n",
+            Duration::from_secs(2),
+            Some(uid),
+            4096,
+        )
+        .expect("lf request");
+        assert_eq!(out_lf, b"{\"pong\":1}");
+
+        let out_crlf = exchange(
+            &sock,
+            b"{\"ping\":2}\r\n",
+            Duration::from_secs(2),
+            Some(uid),
+            4096,
+        )
+        .expect("crlf request");
+        assert_eq!(out_crlf, b"{\"pong\":2}");
+        handle.join().expect("join");
     }
 }

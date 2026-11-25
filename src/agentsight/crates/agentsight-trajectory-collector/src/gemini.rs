@@ -346,7 +346,7 @@ fn apply_patch(messages: &mut Vec<serde_json::Value>, patch: &serde_json::Value)
     }
 }
 
-/// Patch one message: replace `content`, merge tool-call `result`s by id.
+/// Patch one message: replace `content`, merge tool-call `result`/`status` by id.
 fn apply_single_patch(messages: &mut [serde_json::Value], patch: &serde_json::Value) {
     let Some(id) = patch.get("id").and_then(|v| v.as_str()) else {
         return;
@@ -359,25 +359,36 @@ fn apply_single_patch(messages: &mut [serde_json::Value], patch: &serde_json::Va
             fields.insert("content".to_string(), content.clone());
         }
     }
-    if let Some(call_patches) = patch.get("toolCalls").and_then(|v| v.as_array()) {
-        if let Some(calls) = target.get_mut("toolCalls").and_then(|v| v.as_array_mut()) {
-            for call_patch in call_patches {
-                let Some(call_id) = call_patch.get("id").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Some(result) = call_patch.get("result") else {
-                    continue;
-                };
-                if let Some(call) = calls
-                    .iter_mut()
-                    .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(call_id))
-                {
-                    if let Some(fields) = call.as_object_mut() {
-                        fields.insert("result".to_string(), result.clone());
-                    }
-                }
-            }
-        }
+    let Some(call_patches) = patch.get("toolCalls").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let Some(calls) = target.get_mut("toolCalls").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for call_patch in call_patches {
+        apply_tool_call_patch(calls, call_patch);
+    }
+}
+
+fn apply_tool_call_patch(calls: &mut [serde_json::Value], call_patch: &serde_json::Value) {
+    let Some(call_id) = call_patch.get("id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(fields) = calls
+        .iter_mut()
+        .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(call_id))
+        .and_then(|c| c.as_object_mut())
+    else {
+        return;
+    };
+    if let Some(result) = call_patch.get("result") {
+        fields.insert("result".to_string(), result.clone());
+    }
+    if let Some(status) = call_patch
+        .get("status")
+        .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+    {
+        fields.insert("status".to_string(), status.clone());
     }
 }
 
@@ -797,5 +808,89 @@ mod tests {
         let extra = extract_private_metadata(&events, "proj");
         assert_eq!(extra["user_message_count"], serde_json::json!(1));
         assert_eq!(extra["project"], serde_json::json!("proj"));
+    }
+
+    #[test]
+    fn test_convert_patch_propagates_tool_call_status() {
+        let content = concat!(
+            "{\"sessionId\":\"s-patch-status\",\"projectHash\":\"h\"}\n",
+            "{\"id\":\"g1\",\"timestamp\":\"2026-10-22T09:00:02Z\",\"type\":\"gemini\",\"content\":\"running\",\"toolCalls\":[",
+            "{\"id\":\"tc-ok\",\"name\":\"run_shell_command\",\"args\":{\"command\":\"echo hi\"},\"status\":\"scheduled\"},",
+            "{\"id\":\"tc-err\",\"name\":\"run_shell_command\",\"args\":{\"command\":\"false\"},\"status\":\"scheduled\"},",
+            "{\"id\":\"tc-res-only\",\"name\":\"run_shell_command\",\"args\":{\"command\":\"pwd\"},\"status\":\"scheduled\"},",
+            "{\"id\":\"tc-unpatched\",\"name\":\"run_shell_command\",\"args\":{\"command\":\"sleep 1\"},\"status\":\"scheduled\"}",
+            "]}\n",
+            "{\"$patch\":{\"updates\":[{\"id\":\"g1\",\"toolCalls\":[",
+            "{\"id\":\"tc-ok\",\"status\":\"success\",\"result\":\"hi\\n\"},",
+            "{\"id\":\"tc-err\",\"status\":\"error\",\"result\":\"exit 1\"},",
+            "{\"id\":\"tc-res-only\",\"result\":\"/tmp\\n\"}",
+            "]}]}}\n",
+        );
+        let traj = convert_gemini_events(&load_jsonl_events(content), "gemini-cli").unwrap();
+        let obs = traj.steps[0].observation.as_ref().unwrap();
+        assert_eq!(obs.results.len(), 3);
+
+        assert_eq!(obs.results[0].source_call_id.as_deref(), Some("tc-ok"));
+        assert_eq!(obs.results[0].content, Some(serde_json::json!("hi")));
+        assert_eq!(
+            obs.results[0].extra.as_ref().unwrap()[EXTRA_IS_ERROR],
+            serde_json::json!(false)
+        );
+
+        assert_eq!(obs.results[1].source_call_id.as_deref(), Some("tc-err"));
+        assert_eq!(obs.results[1].content, Some(serde_json::json!("exit 1")));
+        assert_eq!(
+            obs.results[1].extra.as_ref().unwrap()[EXTRA_IS_ERROR],
+            serde_json::json!(true)
+        );
+
+        assert_eq!(
+            obs.results[2].source_call_id.as_deref(),
+            Some("tc-res-only")
+        );
+        assert_eq!(obs.results[2].content, Some(serde_json::json!("/tmp")));
+        assert!(obs.results[2].extra.is_none());
+    }
+
+    #[test]
+    fn test_convert_status_only_patch_updates_tool_call() {
+        let content = concat!(
+            "{\"sessionId\":\"s-status-only\",\"projectHash\":\"h\"}\n",
+            "{\"id\":\"g1\",\"timestamp\":\"2026-10-22T09:00:02Z\",\"type\":\"gemini\",\"content\":\"running\",\"toolCalls\":[",
+            "{\"id\":\"tc-1\",\"name\":\"run_shell_command\",\"args\":{\"command\":\"boom\"},\"status\":\"scheduled\"},",
+            "{\"id\":\"tc-2\",\"name\":\"run_shell_command\",\"args\":{\"command\":\"ls\"},\"status\":\"scheduled\"},",
+            "{\"id\":\"tc-3\",\"name\":\"run_shell_command\",\"args\":{\"command\":\"cancel\"},\"status\":\"scheduled\"}",
+            "]}\n",
+            // Result first, then status-only patch (direct shape), then null-status result update.
+            "{\"$patch\":{\"updates\":[{\"id\":\"g1\",\"toolCalls\":[{\"id\":\"tc-1\",\"result\":\"failed\"}]}]}}\n",
+            "{\"$patch\":{\"id\":\"g1\",\"toolCalls\":[{\"id\":\"tc-1\",\"status\":\"error\"}]}}\n",
+            "{\"$patch\":{\"id\":\"g1\",\"toolCalls\":[{\"id\":\"tc-1\",\"status\":null,\"result\":\"failed again\"}]}}\n",
+            // Status-only patch first (updates shape), then result-only patch.
+            "{\"$patch\":{\"updates\":[{\"id\":\"g1\",\"toolCalls\":[{\"id\":\"tc-2\",\"status\":\"executing\"}]}]}}\n",
+            "{\"$patch\":{\"updates\":[{\"id\":\"g1\",\"toolCalls\":[{\"id\":\"tc-2\",\"status\":\"success\"}]}]}}\n",
+            "{\"$patch\":{\"id\":\"g1\",\"toolCalls\":[{\"id\":\"tc-2\",\"result\":\"files\"}]}}\n",
+            // Status-only patch without any result must not fabricate an observation.
+            "{\"$patch\":{\"id\":\"g1\",\"toolCalls\":[{\"id\":\"tc-3\",\"status\":\"error\"}]}}\n",
+        );
+        let traj = convert_gemini_events(&load_jsonl_events(content), "gemini-cli").unwrap();
+        let obs = traj.steps[0].observation.as_ref().unwrap();
+        assert_eq!(obs.results.len(), 2);
+
+        assert_eq!(obs.results[0].source_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(
+            obs.results[0].content,
+            Some(serde_json::json!("failed again"))
+        );
+        assert_eq!(
+            obs.results[0].extra.as_ref().unwrap()[EXTRA_IS_ERROR],
+            serde_json::json!(true)
+        );
+
+        assert_eq!(obs.results[1].source_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(obs.results[1].content, Some(serde_json::json!("files")));
+        assert_eq!(
+            obs.results[1].extra.as_ref().unwrap()[EXTRA_IS_ERROR],
+            serde_json::json!(false)
+        );
     }
 }

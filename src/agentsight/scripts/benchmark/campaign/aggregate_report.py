@@ -30,6 +30,11 @@ def read_json(path: Path) -> dict[str, Any]:
         return {"_artifact_error": str(path)}
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return a mapping when *value* is a dict, or an empty dict otherwise."""
+    return value if isinstance(value, dict) else {}
+
+
 def _artifact_number(value: Any) -> float | None:
     """Read an int/float artifact field, or None for anything else.
 
@@ -295,10 +300,14 @@ def write_capacity(results: Path) -> dict[str, dict[str, Any]]:
         path = results / f"capacity-{version}.json"
         value = read_json(path) if path.exists() else {}
         capacities[version] = value
-        confirmation = value.get("confirmation") or {}
-        pretest = value.get("pretest") or {}
-        probes = value.get("probes") or {}
-        probe_count = len(probes) if value else None
+        confirmation = _as_dict(value.get("confirmation"))
+        pretest = _as_dict(value.get("pretest"))
+        raw_probes = value.get("probes")
+        probe_count = (
+            len(raw_probes)
+            if isinstance(raw_probes, dict) and not value.get("_artifact_error")
+            else None
+        )
         lines.append(
             f"| {version} | {display(pretest.get('estimate_qps'))} | "
             f"{display(value.get('search_start_qps'))} | {display(probe_count)} | "
@@ -351,8 +360,7 @@ def write_soak(results: Path, items: list[tuple[Path, dict[str, Any]]]) -> None:
     ]
     runs = scenario_runs(items, "soak")
     for _, run in runs:
-        summary = run.get("summary")
-        summary = summary if isinstance(summary, dict) else {}
+        summary = _as_dict(run.get("summary"))
         verdict = campaign_evidence.evaluation_dict(run).get("verdict", "—")
         version = display(run.get("version"))
         duration = display(run.get("duration_seconds"), "s")
@@ -508,8 +516,7 @@ def write_fault(
         version = str(run.get("version", "?"))
         results_by_version[version] = outcome
         summary = run.get("summary", {})
-        outcomes = fault.get("outcomes")
-        outcomes = outcomes if isinstance(outcomes, dict) else {}
+        outcomes = _as_dict(fault.get("outcomes"))
         for name, entry in outcomes.items():
             total = fault_case_total(entry)
             lines.append(
@@ -604,8 +611,12 @@ def comparison_summary(
 
     trace_baseline, trace_optimized = values("trace_completeness")
     drop_baseline, drop_optimized = values("drop_rate")
-    capacity_baseline = capacities.get("baseline", {}).get("maximum_sustainable_qps")
-    capacity_optimized = capacities.get("optimized", {}).get("maximum_sustainable_qps")
+    capacity_baseline = _as_dict(capacities.get("baseline")).get(
+        "maximum_sustainable_qps"
+    )
+    capacity_optimized = _as_dict(capacities.get("optimized")).get(
+        "maximum_sustainable_qps"
+    )
     capacity_before = _artifact_number(capacity_baseline)
     capacity_after = _artifact_number(capacity_optimized)
     soak_slopes: dict[str, float | None] = {}
@@ -799,19 +810,23 @@ def write_final(
     regression: dict[str, Any],
 ) -> dict[str, Any]:
     """Write the campaign-level final verdict and reproducibility pointers."""
+    safe_capacities = {
+        key: _as_dict(value) for key, value in _as_dict(capacities).items()
+    }
     issues = campaign_evidence.audit_campaign(
-        campaign_data, items, capacities, recovery, faults, regression
+        campaign_data, items, safe_capacities, recovery, faults, regression
     )
     manifest = read_json(results / "manifest.json")
     if manifest.get("_artifact_error"):
         issues.append("manifest could not be read; frozen inputs are unverified")
     complete = not issues
-    host = manifest.get("host", {})
-    frozen = manifest.get("frozen", {})
-    frozen_versions = frozen.get("versions", {})
+    host = _as_dict(manifest.get("host"))
+    frozen = _as_dict(manifest.get("frozen"))
+    frozen_versions = _as_dict(frozen.get("versions"))
+    tools = _as_dict(manifest.get("tools"))
     comparison_mode = frozen.get("comparison_mode", "ab_comparison")
     aa_calibration = comparison_mode == "aa_calibration"
-    comparison = comparison_summary(rows, capacities, items)
+    comparison = comparison_summary(rows, safe_capacities, items)
     capacity_lines = [
         (
             "| 版本 | 预试验估算 QPS | 正式搜索起点 | 最大可持续 QPS | "
@@ -821,8 +836,8 @@ def write_final(
     ]
     capacity_delta = comparison["metrics"]["maximum_sustainable_qps"]["delta_pct"]
     for version in ("baseline", "optimized"):
-        capacity = capacities.get(version, {})
-        pretest = capacity.get("pretest") or {}
+        capacity = _as_dict(safe_capacities.get(version))
+        pretest = _as_dict(capacity.get("pretest"))
         capacity_lines.append(
             f"| {version} | {display(pretest.get('estimate_qps'))} | "
             f"{display(capacity.get('search_start_qps'))} | "
@@ -835,15 +850,16 @@ def write_final(
         "| 版本 | Git commit | 二进制 SHA-256 | 配置 SHA-256 |",
         "| --- | --- | --- | --- |",
     ]
+    campaign_versions = _as_dict(campaign_data.get("versions"))
     for version in ("baseline", "optimized"):
-        frozen = frozen_versions.get(version, {})
-        commit = frozen.get("commit") or campaign_data["versions"][version].get(
-            "commit"
-        )
+        frozen_version = _as_dict(frozen_versions.get(version))
+        commit = frozen_version.get("commit") or _as_dict(
+            campaign_versions.get(version)
+        ).get("commit")
         version_lines.append(
             f"| {version} | `{commit or '—'}` | "
-            f"`{frozen.get('binary_sha256') or '—'}` | "
-            f"`{frozen.get('config_sha256') or '—'}` |"
+            f"`{frozen_version.get('binary_sha256') or '—'}` | "
+            f"`{frozen_version.get('config_sha256') or '—'}` |"
         )
     regression_checks = regression.get("checks", [])
     regression_checks = regression_checks if isinstance(regression_checks, list) else []
@@ -905,8 +921,8 @@ def write_final(
         f"| 内存 | {host.get('memory_total', '—')} |",
         f"| CPU governor | {host.get('cpu_governor', '—')} |",
         f"| BTF | {host.get('btf_available', False)} |",
-        f"| k6 | {manifest.get('tools', {}).get('k6') or '—'} |",
-        f"| OpenSSL | {manifest.get('tools', {}).get('openssl') or '—'} |",
+        f"| k6 | {tools.get('k6') or '—'} |",
+        f"| OpenSSL | {tools.get('openssl') or '—'} |",
         "",
         (
             f"本报告的性能结论只适用于以上 {host.get('machine', '未知架构')} "
@@ -968,7 +984,7 @@ def write_final(
         lines.extend(f"- {issue}。" for issue in issues)
     else:
         lines.append("- 未发现阻断正式结论的缺失证据或失败门禁。")
-    if manifest.get("tools", {}).get("h2load") is None:
+    if tools.get("h2load") is None:
         lines.append("- 未安装 h2load，因此没有可选的 HTTP/2 补充结果。")
     (results / "final-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     summary = {

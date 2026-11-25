@@ -765,33 +765,77 @@ impl Drop for PendingInstallController {
 }
 
 /// Check whether a skill directory has a complete skill shape:
-/// - directory exists as a real directory (not a symlink)
-/// - `SKILL.md` exists as a real regular file (not a symlink)
-/// - `SKILL.md` can be parsed successfully (Ok or Degraded status)
+/// - every path component under `source_root` is a real directory (not a symlink)
+/// - `SKILL.md` exists as a real regular file (not a symlink or FIFO)
+/// - `SKILL.md` fits within `max_skill_size` and can be parsed successfully
+///   (Ok or Degraded status)
 ///
-/// Uses `symlink_metadata` (no-follow) to prevent external symlinks
-/// from triggering a pending install notification.
+/// Steps component-by-component with `openat` (`O_DIRECTORY | O_NOFOLLOW`) and
+/// reads `SKILL.md` from an `O_NOFOLLOW | O_NONBLOCK` fd to eliminate both
+/// intermediate-symlink traversal (e.g. Hermes `category/skill`) and the
+/// stat-to-open TOCTOU race.
 fn is_skill_complete(
     source_root: &std::path::Path,
     skill_name: &str,
     max_skill_size: usize,
 ) -> bool {
-    let skill_dir = source_root.join(skill_name);
-    match std::fs::symlink_metadata(&skill_dir) {
-        Ok(meta) if meta.file_type().is_dir() => {}
-        _ => return false,
+    use std::io::Read;
+
+    if skill_name.is_empty() {
+        return false;
     }
-    let skill_md = skill_dir.join("SKILL.md");
-    match std::fs::symlink_metadata(&skill_md) {
-        Ok(meta) if meta.file_type().is_file() => {}
-        _ => return false,
+    let mut dir = match crate::sys::open_dir_path(source_root) {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let mut leaf_name = "unknown";
+    for comp in skill_name.split('/') {
+        if comp.is_empty() || comp == "." || comp == ".." || comp.contains('\0') {
+            return false;
+        }
+        dir = match crate::sys::openat_leaf(
+            &dir,
+            std::ffi::OsStr::new(comp),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(next) => next,
+            Err(_) => return false,
+        };
+        leaf_name = comp;
     }
+    let skill_md = match crate::sys::openat_leaf(
+        &dir,
+        std::ffi::OsStr::new("SKILL.md"),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let meta = match skill_md.metadata() {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
     // The configured ceiling, not the default: the completeness probe must
     // refuse exactly the manifests the mount's reads and listings refuse.
-    match skillfs_core::parser::parse_skill_file_with_limit(&skill_md, max_skill_size) {
-        Ok(entry) => !entry.parse_status.is_error(),
-        Err(_) => false,
+    if !meta.file_type().is_file() || meta.len() > max_skill_size as u64 {
+        return false;
     }
+    let mut bytes = Vec::new();
+    let read_limit = (max_skill_size as u64).saturating_add(1);
+    if skill_md.take(read_limit).read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    if bytes.len() > max_skill_size {
+        return false;
+    }
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+    let entry = skillfs_core::parser::parse_skill_md(&content, leaf_name);
+    !entry.parse_status.is_error()
 }
 
 async fn pending_install_worker_loop(
@@ -1543,6 +1587,88 @@ mod tests {
             "sized-skill",
             skillfs_core::DEFAULT_MAX_SKILL_SIZE
         ));
+    }
+
+    #[test]
+    fn is_skill_complete_hermes_nested_real_dir_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("cat").join("good-skill");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: good-skill\ndescription: test\n---\n",
+        )
+        .unwrap();
+        assert!(
+            super::is_skill_complete(dir.path(), "cat/good-skill", 1 << 20),
+            "Hermes nested real category + skill dir + SKILL.md must be complete"
+        );
+    }
+
+    #[test]
+    fn is_skill_complete_intermediate_symlink_dir_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+
+        let external = dir.path().join("external");
+        let ext_skill = external.join("good-skill");
+        std::fs::create_dir_all(&ext_skill).unwrap();
+        std::fs::write(
+            ext_skill.join("SKILL.md"),
+            "---\nname: good-skill\ndescription: external\n---\n",
+        )
+        .unwrap();
+
+        std::os::unix::fs::symlink(&external, source_root.join("cat-link")).unwrap();
+        assert!(
+            !super::is_skill_complete(&source_root, "cat-link/good-skill", 1 << 20),
+            "intermediate category symlink must not be followed by completeness check"
+        );
+    }
+
+    #[test]
+    fn is_skill_complete_rejects_invalid_and_traversal_skill_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+
+        let valid_md = "---\nname: good-skill\ndescription: test\n---\n";
+        std::fs::write(source_root.join("SKILL.md"), valid_md).unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("SKILL.md"), valid_md).unwrap();
+
+        let nested = source_root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), valid_md).unwrap();
+
+        for invalid in ["../outside", "/abs", "a/./b", ""] {
+            assert!(
+                !super::is_skill_complete(&source_root, invalid, 1 << 20),
+                "invalid skill_name {invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_skill_complete_fifo_skill_md_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("fifo-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        let fifo_path = skill.join("SKILL.md");
+        let fifo_c = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        assert!(
+            !super::is_skill_complete(dir.path(), "fifo-skill", 1 << 20),
+            "FIFO at SKILL.md must be rejected without blocking"
+        );
     }
 
     // -----------------------------------------------------------------------

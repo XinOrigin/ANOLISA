@@ -831,3 +831,75 @@ fn the_eperm_prose_spelling_is_a_failure() {
     assert_eq!(v.status, CallStatus::Ok);
     assert_eq!(v.matched_rule, "R1(success)");
 }
+
+#[test]
+fn a_quoted_separator_is_not_a_command_chain() {
+    for command in [
+        "pgrep -f \"agent|worker\"",
+        "pgrep -f 'a;b&&c'",
+        "pgrep -f \"a\\\"|b\"",
+        r"pgrep -f agent\;worker",
+        r"pgrep -f agent\|worker",
+        "test -f /missing <&0",
+        "pgrep -f \"中文|日志\"",
+    ] {
+        let v = classify(
+            &bash_call(command),
+            "No such file or directory\nExit code 1",
+        );
+        assert_eq!(
+            v.status,
+            CallStatus::OkProbe,
+            "{command} graded as {} ({:?})",
+            v.matched_rule,
+            v.status
+        );
+        assert_eq!(v.matched_rule, "B3", "{command}");
+    }
+}
+
+#[test]
+fn a_chain_after_a_quoted_separator_is_still_a_chain() {
+    for command in [
+        "pgrep -f \"agent|worker\" && rm -rf /tmp/x",
+        "pgrep -f \"foo\\\\\"|rm -rf /tmp/x",
+        "pgrep -f 'foo\\'||rm -rf /tmp/x",
+    ] {
+        let v = classify(&bash_call(command), "Exit code 1");
+        assert_eq!(
+            v.status,
+            CallStatus::Failed,
+            "real chain after quoted separator must stay Failed: {command}"
+        );
+        assert_eq!(v.matched_rule, "R3", "{command}");
+    }
+}
+
+#[test]
+fn an_escaped_quote_does_not_hide_a_chain() {
+    let command = r#"test -d \"$d\" || mkdir -p \"$d\""#;
+    let v = classify(&bash_call(command), "Exit code 1");
+    assert_eq!(
+        v.status,
+        CallStatus::Failed,
+        "escaped quotes before `|| mkdir` must not be parsed as one quoted probe"
+    );
+    assert_eq!(v.matched_rule, "R3");
+}
+
+#[test]
+fn an_unclosed_quote_does_not_hide_a_chain() {
+    for command in [
+        "pgrep -f \"unclosed && rm -rf /tmp/x",
+        "ls 'unclosed; rm -rf /tmp/x",
+        "ls 'ok' \"unclosed || rm -rf /tmp/x",
+    ] {
+        let v = classify(&bash_call(command), "Exit code 1");
+        assert_eq!(
+            v.status,
+            CallStatus::Failed,
+            "unclosed quote must not swallow trailing command chain: {command}"
+        );
+        assert_eq!(v.matched_rule, "R3", "{command}");
+    }
+}

@@ -534,30 +534,83 @@ fn is_probe(call: &ToolCall) -> bool {
         })
 }
 
+fn has_closing_quote(bytes: &[u8], open: usize, quote: u8) -> bool {
+    let mut i = open + 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote == b'"' && b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == quote {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Shell command separators, unrolled into the segments they delimit.
 ///
 /// `;`, `|`, `&&`, `||` and a newline chain commands, and so does a bare `&`.
-/// The character `&` on its own is *not* enough to split on, though: inside
-/// `2>&1`, `1>&2`, `&>` and `>&` it belongs to a redirection, which describes
-/// where a stream goes rather than where the next command starts. Splitting per
-/// character turned `ls /nope 2>&1` into `["ls /nope 2>", "1"]`, and the stray
-/// `1` — whose head is not a probe command — made a probe whose non-zero exit
-/// *is* the answer get graded as a real failure.
+/// Separators inside single or double quotes, or escaped by a backslash outside
+/// quotes, are literal data and do not split segments. Unclosed quotes are not
+/// treated as quoting the rest of the command, so a stray quote cannot swallow a
+/// subsequent command chain. Inside `2>&1`, `1>&2`, `&>`, `>&`, and `<&`, the
+/// `&` belongs to a stream redirection rather than a background operator.
 fn command_segments(command: &str) -> Vec<&str> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
+    let mut quote: Option<u8> = None;
     let mut i = 0;
     while i < bytes.len() {
-        let separator_len = match bytes[i] {
-            b'\n' | b';' | b'|' => 1,
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if q == b'"' && b == b'\\' {
+                    i += 1;
+                    if let Some(ch) = command[i..].chars().next() {
+                        i += ch.len_utf8();
+                    }
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            None => {
+                if b == b'\\' {
+                    i += 1;
+                    if let Some(ch) = command[i..].chars().next() {
+                        i += ch.len_utf8();
+                    }
+                    continue;
+                }
+                if matches!(b, b'\'' | b'"') && has_closing_quote(bytes, i, b) {
+                    quote = Some(b);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        let separator_len = match b {
+            b'\n' | b';' => 1,
+            b'|' => {
+                if bytes.get(i + 1) == Some(&b'|') {
+                    2
+                } else {
+                    1
+                }
+            }
             b'&' => match bytes.get(i + 1) {
                 // `&>` / `&>>` redirect stdout and stderr.
                 Some(b'>') => 0,
                 Some(b'&') => 2,
-                // `<&`/`>&` duplication, written `>&2` or `2>&1`: the `&`
-                // follows the `>` that opened the redirection.
-                _ if i > 0 && bytes[i - 1] == b'>' => 0,
+                // `<&` / `>&` duplication, written `>&2`, `2>&1`, or `<&0`.
+                _ if i > 0 && matches!(bytes[i - 1], b'>' | b'<') => 0,
                 _ => 1,
             },
             _ => 0,

@@ -1525,16 +1525,30 @@ fn validate_file_config(fc: &FileConfig, path: &Path) -> Result<(), WsCkptError>
     Ok(())
 }
 
-/// Validates and saves config to a TOML file, creating parent directories as
-/// needed. Nothing is created or written when validation fails.
+fn resolve_config_target(path: &Path) -> Result<(&Path, &str), WsCkptError> {
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        WsCkptError::Config(format!("invalid config file path: {}", path.display()))
+    })?;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok((dir, file_name))
+}
+
+/// Validates and atomically saves config to a TOML file, creating parent
+/// directories as needed. Nothing is created or written when validation fails.
 pub fn save_config_file(path: &Path, config: &FileConfig) -> Result<(), WsCkptError> {
     validate_file_config(config, path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let (dir, file_name) = resolve_config_target(path)?;
     let content = toml::to_string_pretty(config)
         .map_err(|e| WsCkptError::Config(format!("serialize config: {}", e)))?;
-    std::fs::write(path, content)?;
+    persist::atomic_write(dir, file_name, content.as_bytes(), None).map_err(|e| {
+        match e.downcast::<std::io::Error>() {
+            Ok(io) => WsCkptError::Io(io),
+            Err(other) => WsCkptError::Config(format!("save_config_file: {:#}", other)),
+        }
+    })?;
     Ok(())
 }
 
@@ -3230,6 +3244,86 @@ mod tests {
         };
         save_config_file(&path, &fc).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn resolve_config_target_handles_bare_relative_and_rejects_dir_only() {
+        assert_eq!(
+            resolve_config_target(Path::new("config.toml")).unwrap(),
+            (Path::new("."), "config.toml")
+        );
+        assert_eq!(
+            resolve_config_target(Path::new("/etc/ws-ckpt/config.toml")).unwrap(),
+            (Path::new("/etc/ws-ckpt"), "config.toml")
+        );
+        for invalid in [
+            Path::new("/"),
+            Path::new(""),
+            Path::new("."),
+            Path::new(".."),
+        ] {
+            let err = resolve_config_target(invalid).unwrap_err();
+            assert!(
+                matches!(err, WsCkptError::Config(_)),
+                "expected Config error for {invalid:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_config_file_atomic_overwrite_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let fc1 = FileConfig {
+            auto_cleanup_keep: Some(CleanupRetention::Count(5)),
+            ..Default::default()
+        };
+        save_config_file(&path, &fc1).unwrap();
+        assert!(!dir.path().join("config.toml.tmp").exists());
+
+        #[cfg(unix)]
+        let backup = {
+            let backup = dir.path().join("config.toml.hardlink");
+            std::fs::hard_link(&path, &backup).unwrap();
+            backup
+        };
+
+        let fc2 = FileConfig {
+            auto_cleanup_keep: Some(CleanupRetention::Count(9)),
+            health_check_interval_secs: Some(45),
+            ..Default::default()
+        };
+        save_config_file(&path, &fc2).unwrap();
+        assert!(!dir.path().join("config.toml.tmp").exists());
+        assert_eq!(load_config_file(&path).unwrap(), fc2);
+        #[cfg(unix)]
+        assert_eq!(
+            load_config_file(&backup).unwrap(),
+            fc1,
+            "save_config_file must replace via atomic rename, not truncate in place"
+        );
+
+        assert!(save_config_file(Path::new("/"), &fc2).is_err());
+    }
+
+    #[test]
+    fn save_config_file_preserves_existing_file_when_tmp_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let fc1 = FileConfig {
+            auto_cleanup_keep: Some(CleanupRetention::Count(5)),
+            ..Default::default()
+        };
+        save_config_file(&path, &fc1).unwrap();
+
+        std::fs::create_dir(dir.path().join("config.toml.tmp")).unwrap();
+        let fc2 = FileConfig {
+            auto_cleanup_keep: Some(CleanupRetention::Count(9)),
+            health_check_interval_secs: Some(45),
+            ..Default::default()
+        };
+        assert!(save_config_file(&path, &fc2).is_err());
+        assert_eq!(load_config_file(&path).unwrap(), fc1);
     }
 
     #[test]

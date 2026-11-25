@@ -511,6 +511,11 @@ def confirmation_verdicts(evidence: object, level: int) -> list[str]:
     return [entry for entry in entries if isinstance(entry, str)]
 
 
+def positive_int(value: object) -> bool:
+    """Return True only for positive integers, rejecting booleans."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def audit_campaign(
     campaign_data: dict[str, Any],
     items: list[tuple[Path, dict[str, Any]]],
@@ -533,7 +538,11 @@ def audit_campaign(
         if value.get("safety_limit_reached") or not value.get("boundary_confirmed"):
             issues.append(f"{version} capacity boundary is not confirmed")
             continue
-        if not isinstance(maximum, int) or failure != maximum + resolution:
+        if (
+            not positive_int(maximum)
+            or not positive_int(failure)
+            or failure != maximum + resolution
+        ):
             issues.append(f"{version} capacity lacks an adjacent failed QPS")
             continue
         # The confirmation map comes from the capacity probe's own result
@@ -555,13 +564,13 @@ def audit_campaign(
         capacities.get(version, {}).get("maximum_sustainable_qps")
         for version in VERSIONS
     ]
-    if all(isinstance(value, int) and value > 0 for value in maxima):
+    if all(positive_int(value) for value in maxima):
         common = min(maxima)
         matrix_qps = campaign_data["matrix"].get("qps") or [
             max(resolution, int(common * fraction / resolution) * resolution)
             for fraction in (0.2, 0.4, 0.6, 0.8, 1.0)
         ]
-        soak_qps = int(common * 0.8 / resolution) * resolution
+        soak_qps = max(resolution, int(common * 0.8 / resolution) * resolution)
         lower_versions = [
             capacities[version]
             for version in VERSIONS
@@ -570,7 +579,7 @@ def audit_campaign(
         failed_qps = [value.get("first_failed_qps") for value in lower_versions]
         overload_qps = (
             min(failed_qps)
-            if failed_qps and all(isinstance(value, int) for value in failed_qps)
+            if failed_qps and all(positive_int(value) for value in failed_qps)
             else None
         )
     else:

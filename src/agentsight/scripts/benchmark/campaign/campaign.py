@@ -33,6 +33,19 @@ def align_up(value: float, resolution: int) -> int:
     return max(resolution, math.ceil(value / resolution) * resolution)
 
 
+def grid_midpoint(low: int, high: int, resolution: int) -> int | None:
+    """Return an interior grid point strictly between low and high, if one exists."""
+    steps = (high - low) // resolution
+    if steps < 2:
+        return None
+    return low + (steps // 2) * resolution
+
+
+def is_positive_int(value: object) -> bool:
+    """Return True only for positive integers, rejecting booleans."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def capacity_verdict(result: dict[str, Any]) -> str:
     """Return a monotonic capacity verdict, deferring long-term trend gates."""
     evaluation = result["evaluation"]
@@ -405,9 +418,10 @@ def capacity(
         low = search_start
     else:
         first_fail = search_start
+        aligned_pretest_low = align_down(pretest_low, resolution) if pretest_low else 0
         candidate = (
-            pretest_low
-            if 0 < pretest_low < first_fail
+            aligned_pretest_low
+            if 0 < aligned_pretest_low < first_fail
             else align_down(search_start / 2, resolution)
         )
         while candidate < first_fail:
@@ -435,9 +449,11 @@ def capacity(
                 break
             candidate = min(safety_max, align_up(low * 2, resolution))
 
-    while low and first_fail and first_fail - low > resolution:
-        steps = (first_fail - low) // resolution
-        candidate = low + (steps // 2) * resolution
+    while (
+        low
+        and first_fail
+        and (candidate := grid_midpoint(low, first_fail, resolution)) is not None
+    ):
         verdict = probe_search(candidate)
         if verdict == "PASS":
             low = candidate
@@ -560,10 +576,8 @@ def capacity(
     while (
         confirmed_pass is not None
         and confirmed_fail is not None
-        and confirmed_fail - confirmed_pass > resolution
+        and (candidate := grid_midpoint(confirmed_pass, confirmed_fail, resolution)) is not None
     ):
-        steps = (confirmed_fail - confirmed_pass) // resolution
-        candidate = confirmed_pass + (steps // 2) * resolution
         if confirmation_outcome(candidate) == "PASS":
             confirmed_pass = candidate
         else:
@@ -621,7 +635,7 @@ def resolved_qps(campaign: dict[str, Any], results: Path) -> tuple[list[int], in
     """Resolve the common matrix, soak, and overload QPS values."""
     capacities = [read_json(results / f"capacity-{name}.json") for name in campaign["versions"]]
     maxima = [item.get("maximum_sustainable_qps") for item in capacities]
-    if not all(isinstance(value, int) and value > 0 for value in maxima):
+    if not all(is_positive_int(value) for value in maxima):
         raise ValueError("both versions need confirmed capacity results")
     common = min(maxima)
     resolution = campaign["capacity"]["qps_resolution"]
@@ -631,12 +645,12 @@ def resolved_qps(campaign: dict[str, Any], results: Path) -> tuple[list[int], in
     ]
     if len(set(matrix)) != 5:
         raise ValueError("common capacity is too low for five unique matrix QPS values")
-    soak = int(common * 0.8 / resolution) * resolution
+    soak = max(resolution, int(common * 0.8 / resolution) * resolution)
     lower_capacity_versions = [
         item for item in capacities if item.get("maximum_sustainable_qps") == common
     ]
     failed_values = [item.get("first_failed_qps") for item in lower_capacity_versions]
-    if not all(isinstance(value, int) and value > common for value in failed_values):
+    if not all(is_positive_int(value) and value > common for value in failed_values):
         raise ValueError("lower-capacity version needs an adjacent failed QPS")
     overload = min(failed_values)
     resolution_path = results / "campaign-resolution.json"

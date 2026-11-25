@@ -15,6 +15,161 @@ use ws_ckpt_common::{
 use super::{btrfs_common, btrfs_identity, rollback_recovery};
 use btrfs_common::{backup_path_for, recover_orphan_backup, resolve_symlink_path};
 
+// ────────────────────────────────────────────────────────────────────────────
+// Injectable ops seam for rollback and recovery (testable without live Btrfs)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Operations needed by `BtrfsBaseBackend::rollback` and `recover_workspace`.
+/// Production uses [`BtrfsRollbackTmpOps`]; unit tests inject a fake.
+#[async_trait]
+trait BtrfsRollbackOps: Sync {
+    /// Inspect `path` and classify whether it is missing, a verified Btrfs
+    /// subvolume, or an unverified non-subvolume entry.
+    async fn inspect_rollback_tmp(&self, path: &Path) -> anyhow::Result<RollbackTmpState>;
+    /// Admit one subvolume creation on `fs_root`.
+    async fn ensure_create_allowed(&self, fs_root: &Path) -> anyhow::Result<()>;
+    /// Create a writable snapshot of `src` at `dst`.
+    async fn create_writable_snapshot(&self, src: &Path, dst: &Path) -> anyhow::Result<()>;
+    /// Delete a verified Btrfs subvolume via space-aware deletion.
+    async fn delete_subvolume(&self, path: &Path, fs_root: &Path) -> anyhow::Result<()>;
+    /// Restore subvolume contents from `src` (with trailing `/`) to `original_path`.
+    async fn rsync_restore(&self, src: &str, original_path: &str) -> anyhow::Result<()>;
+    /// Delete all snapshot subvolumes under `snapshot_dir` and `workspace_subvolume`.
+    async fn delete_recovery_subvolumes(
+        &self,
+        snapshot_dir: &Path,
+        workspace_subvolume: &Path,
+        fs_root: &Path,
+        original_path: &str,
+    ) -> anyhow::Result<()>;
+}
+
+/// Inspection result for a potential stale rollback-tmp path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RollbackTmpState {
+    /// Path does not exist — nothing to reclaim.
+    Missing,
+    /// Path is a verified Btrfs subvolume — safe to delete.
+    Subvolume,
+    /// Path exists but is NOT a verified subvolume (symlink, plain dir, etc.).
+    NotSubvolume(String),
+}
+
+struct BtrfsRollbackTmpOps;
+
+#[async_trait]
+impl BtrfsRollbackOps for BtrfsRollbackTmpOps {
+    async fn inspect_rollback_tmp(&self, path: &Path) -> anyhow::Result<RollbackTmpState> {
+        let metadata = match tokio::fs::symlink_metadata(path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RollbackTmpState::Missing);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(RollbackTmpState::NotSubvolume("a symlink".to_string()));
+        }
+        if !metadata.is_dir() {
+            return Ok(RollbackTmpState::NotSubvolume(
+                "not a directory or Btrfs subvolume".to_string(),
+            ));
+        }
+        match btrfs_identity::subvolume_lineage(path) {
+            Ok(_) => Ok(RollbackTmpState::Subvolume),
+            Err(err) => Ok(RollbackTmpState::NotSubvolume(format!("{err:#}"))),
+        }
+    }
+
+    async fn ensure_create_allowed(&self, fs_root: &Path) -> anyhow::Result<()> {
+        btrfs_common::ensure_create_allowed(fs_root).await
+    }
+
+    async fn create_writable_snapshot(&self, src: &Path, dst: &Path) -> anyhow::Result<()> {
+        btrfs_common::create_snapshot(src, dst, false).await
+    }
+
+    async fn delete_subvolume(&self, path: &Path, fs_root: &Path) -> anyhow::Result<()> {
+        btrfs_common::delete_subvolume_space_aware(path, fs_root).await
+    }
+
+    async fn rsync_restore(&self, src: &str, original_path: &str) -> anyhow::Result<()> {
+        let rsync_status = Command::new("rsync")
+            .args(["-aHAX", "--delete", src, original_path])
+            .status()
+            .await
+            .context("failed to run rsync")?;
+        if !rsync_status.success() {
+            bail!(
+                "rsync failed restoring {} -> {}, exit: {:?}; \
+                 workspace and snapshots preserved for retry",
+                src,
+                original_path,
+                rsync_status.code()
+            );
+        }
+        Ok(())
+    }
+
+    async fn delete_recovery_subvolumes(
+        &self,
+        snapshot_dir: &Path,
+        workspace_subvolume: &Path,
+        fs_root: &Path,
+        original_path: &str,
+    ) -> anyhow::Result<()> {
+        btrfs_common::delete_recovery_subvolumes(
+            snapshot_dir,
+            workspace_subvolume,
+            fs_root,
+            original_path,
+        )
+        .await
+    }
+}
+
+/// Reclaim a stale `<ws_id>.rollback-tmp` left by a prior non-fatal cleanup
+/// failure. Called before `rename(ws_path, tmp_path)` in rollback and during
+/// `recover_workspace` teardown.
+///
+/// If `tmp_path` exists:
+/// - Verified subvolume → delete via space-aware deletion.
+/// - Not a subvolume → refuse with an error (never `remove_dir_all`).
+/// - Missing → no-op.
+async fn reclaim_stale_rollback_tmp<O: BtrfsRollbackOps>(
+    tmp_path: &Path,
+    fs_root: &Path,
+    ops: &O,
+) -> anyhow::Result<()> {
+    match ops.inspect_rollback_tmp(tmp_path).await? {
+        RollbackTmpState::Missing => Ok(()),
+        RollbackTmpState::Subvolume => {
+            info!(
+                "reclaiming stale rollback-tmp subvolume: {}",
+                tmp_path.display()
+            );
+            ops.delete_subvolume(tmp_path, fs_root)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reclaim stale rollback-tmp subvolume {}",
+                        tmp_path.display()
+                    )
+                })
+        }
+        RollbackTmpState::NotSubvolume(reason) => {
+            bail!(
+                "stale rollback-tmp path {} exists but is not a verified Btrfs \
+                 subvolume ({}); refusing to delete — inspect and remove it manually",
+                tmp_path.display(),
+                reason
+            );
+        }
+    }
+}
+
 /// Deployment scenario for BtrfsBase backend.
 #[derive(Debug, Clone, Copy)]
 pub enum BtrfsBaseScenario {
@@ -177,6 +332,173 @@ impl BtrfsBaseBackend {
         );
         Ok(())
     }
+
+    async fn rollback_with_ops<O: BtrfsRollbackOps>(
+        &self,
+        ws_id: &str,
+        snapshot_id: &str,
+        ops: &O,
+    ) -> anyhow::Result<PathBuf> {
+        btrfs_common::ensure_snapshot_id_is_single_component(snapshot_id)?;
+        let ws_path = self.data_root.join(ws_id);
+        let tmp_path = self.data_root.join(format!("{}.rollback-tmp", ws_id));
+        let snap_path = self.snapshots_dir.join(ws_id).join(snapshot_id);
+
+        // Verify ws_path is a real subvolume, not a symlink
+        let metadata = tokio::fs::symlink_metadata(&ws_path)
+            .await
+            .context("Failed to read workspace metadata")?;
+        if metadata.file_type().is_symlink() {
+            bail!("workspace path {:?} is a symlink, expected btrfs subvolume; aborting rollback to prevent symlink chain corruption", ws_path);
+        }
+
+        // Warmup snapshot metadata cache
+        btrfs_common::warmup_snapshot_metadata(&snap_path).await;
+
+        // Admit the writable snapshot before moving the workspace aside (#7234).
+        ops.ensure_create_allowed(&self.data_root).await?;
+
+        // Reclaim a stale rollback-tmp left by a prior non-fatal cleanup
+        // failure — without this the rename below fails with ENOTEMPTY/EEXIST
+        // on every subsequent rollback for this workspace.
+        reclaim_stale_rollback_tmp(&tmp_path, &self.data_root, ops).await?;
+
+        // Move current workspace aside
+        tokio::fs::rename(&ws_path, &tmp_path).await?;
+
+        // Create writable snapshot from target
+        match ops.create_writable_snapshot(&snap_path, &ws_path).await {
+            Ok(()) => {}
+            Err(e) => {
+                // Rollback protection: restore original workspace
+                error!("rollback snapshot failed, restoring original: {}", e);
+                tokio::fs::rename(&tmp_path, &ws_path).await?;
+                return Err(e);
+            }
+        }
+
+        // Clean up old subvolume (non-fatal). Space-aware: on a nearly-full
+        // backend the async cleaner may stall (ENOSPC) and leave a DELETED
+        // zombie pinning all space, so the guarded path pushes it synchronously
+        // and warns loudly with recovery guidance when it cannot (#3053).
+        if let Err(e) = ops.delete_subvolume(&tmp_path, &self.data_root).await {
+            warn!("failed to delete old subvolume (non-fatal): {}", e);
+        }
+
+        Ok(ws_path)
+    }
+
+    async fn recover_workspace_with_ops<O: BtrfsRollbackOps>(
+        &self,
+        ws_id: &str,
+        original_path: &str,
+        ops: &O,
+    ) -> anyhow::Result<Vec<String>> {
+        let subvol_path = self.data_root.join(ws_id);
+        let snap_base = self.snapshots_dir.join(ws_id);
+
+        // Record subvolume root permissions before rsync
+        let subvol_meta = tokio::fs::metadata(&subvol_path).await.with_context(|| {
+            format!(
+                "cannot recover: subvolume {:?} is missing or unreadable; no data was restored. \
+                 If it was deleted, use `ws-ckpt unregister -w {:?} --force` to remove only \
+                 the registration while retaining backups and snapshots",
+                subvol_path, original_path
+            )
+        })?;
+
+        // 1. Remove symlink; refuse if a non-symlink directory occupies the path
+        match tokio::fs::symlink_metadata(original_path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                tokio::fs::remove_file(original_path)
+                    .await
+                    .context("failed to remove symlink")?;
+            }
+            Ok(_) => {
+                bail!(
+                    "cannot recover: {} is a regular directory, not a workspace symlink; \
+                     move or rename it first to avoid data loss",
+                    original_path
+                );
+            }
+            Err(_) => {} // path gone, rsync will recreate
+        }
+
+        // 2. Rsync subvolume contents back to original path (restore as normal directory)
+        let src = format!("{}/", subvol_path.to_string_lossy()); // trailing / is important
+
+        let sv_uid = subvol_meta.uid();
+        let sv_gid = subvol_meta.gid();
+        let sv_mode = subvol_meta.mode();
+
+        ops.rsync_restore(&src, original_path).await?;
+        // Restore directory ownership and permissions to match original
+        if let Err(e) = chown(
+            Path::new(original_path),
+            Some(Uid::from_raw(sv_uid)),
+            Some(Gid::from_raw(sv_gid)),
+        ) {
+            warn!("failed to restore ownership on {}: {}", original_path, e);
+        }
+        if let Err(e) =
+            tokio::fs::set_permissions(original_path, std::fs::Permissions::from_mode(sv_mode))
+                .await
+        {
+            warn!("failed to restore permissions on {}: {}", original_path, e);
+        }
+        info!("restored workspace contents to {}", original_path);
+
+        // 3. Delete snapshots before the workspace subvolume so a partial
+        //    teardown remains retryable.
+        ops.delete_recovery_subvolumes(&snap_base, &subvol_path, &self.data_root, original_path)
+            .await?;
+
+        // 4. Reclaim any stale <ws_id>.rollback-tmp subvolume before removing
+        //    the snapshots/{ws_id} ownership marker so it does not strand
+        //    permanently unowned.
+        let rollback_tmp = self.data_root.join(format!("{}.rollback-tmp", ws_id));
+        if let Err(e) = reclaim_stale_rollback_tmp(&rollback_tmp, &self.data_root, ops).await {
+            warn!(
+                "failed to reclaim stale rollback-tmp {:?} during recovery (non-fatal): {:#}",
+                rollback_tmp, e
+            );
+        }
+
+        // 5. Remove snapshots/{ws_id} directory
+        if let Err(e) = tokio::fs::remove_dir_all(&snap_base).await {
+            warn!("failed to remove snapshots dir {:?}: {}", snap_base, e);
+        }
+
+        // 6. Remove the workspace's internal diff temp directory. recover
+        //    holds the same workspace mutation lock as diff, so nothing here
+        //    can be a live temp snapshot; leftovers sweep first, then the
+        //    directory itself goes away — but only when empty: a plain
+        //    remove_dir keeps the entries the sweep refused to touch (they
+        //    are already reported as leftovers), so the warning never lists
+        //    a path this teardown deleted.
+        let diff_tmp_dir = self
+            .data_root
+            .join(btrfs_common::DIFF_TMP_DIR_NAME)
+            .join(ws_id);
+        let mut temp_leftovers =
+            btrfs_common::sweep_diff_tmp_dir(&diff_tmp_dir, &self.data_root).await;
+        match tokio::fs::remove_dir(&diff_tmp_dir).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    "failed to remove internal diff temp dir {:?}: {}",
+                    diff_tmp_dir, e
+                );
+                temp_leftovers.push(diff_tmp_dir.display().to_string());
+            }
+        }
+
+        // The backup can contain files absent from an interrupted migration.
+        // Leave it intact; the manager archives it and reports the new location.
+
+        Ok(temp_leftovers)
+    }
 }
 
 #[async_trait]
@@ -252,49 +574,8 @@ impl StorageBackend for BtrfsBaseBackend {
     }
 
     async fn rollback(&self, ws_id: &str, snapshot_id: &str) -> anyhow::Result<PathBuf> {
-        btrfs_common::ensure_snapshot_id_is_single_component(snapshot_id)?;
-        let ws_path = self.data_root.join(ws_id);
-        let tmp_path = self.data_root.join(format!("{}.rollback-tmp", ws_id));
-        let snap_path = self.snapshots_dir.join(ws_id).join(snapshot_id);
-
-        // Verify ws_path is a real subvolume, not a symlink
-        let metadata = tokio::fs::symlink_metadata(&ws_path)
+        self.rollback_with_ops(ws_id, snapshot_id, &BtrfsRollbackTmpOps)
             .await
-            .context("Failed to read workspace metadata")?;
-        if metadata.file_type().is_symlink() {
-            bail!("workspace path {:?} is a symlink, expected btrfs subvolume; aborting rollback to prevent symlink chain corruption", ws_path);
-        }
-
-        // Warmup snapshot metadata cache
-        btrfs_common::warmup_snapshot_metadata(&snap_path).await;
-
-        // Admit the writable snapshot before moving the workspace aside (#7234).
-        btrfs_common::ensure_create_allowed(&self.data_root).await?;
-
-        // Move current workspace aside
-        tokio::fs::rename(&ws_path, &tmp_path).await?;
-
-        // Create writable snapshot from target
-        match btrfs_common::create_snapshot(&snap_path, &ws_path, false).await {
-            Ok(()) => {}
-            Err(e) => {
-                // Rollback protection: restore original workspace
-                error!("rollback snapshot failed, restoring original: {}", e);
-                tokio::fs::rename(&tmp_path, &ws_path).await?;
-                return Err(e);
-            }
-        }
-
-        // Clean up old subvolume (non-fatal). Space-aware: on a nearly-full
-        // backend the async cleaner may stall (ENOSPC) and leave a DELETED
-        // zombie pinning all space, so the guarded path pushes it synchronously
-        // and warns loudly with recovery guidance when it cannot (#3053).
-        if let Err(e) = btrfs_common::delete_subvolume_space_aware(&tmp_path, &self.data_root).await
-        {
-            warn!("failed to delete old subvolume (non-fatal): {}", e);
-        }
-
-        Ok(ws_path)
     }
 
     async fn delete_snapshot(&self, ws_id: &str, snapshot_id: &str) -> anyhow::Result<()> {
@@ -308,118 +589,8 @@ impl StorageBackend for BtrfsBaseBackend {
         ws_id: &str,
         original_path: &str,
     ) -> anyhow::Result<Vec<String>> {
-        let subvol_path = self.data_root.join(ws_id);
-        let snap_base = self.snapshots_dir.join(ws_id);
-
-        // Record subvolume root permissions before rsync
-        let subvol_meta = tokio::fs::metadata(&subvol_path).await.with_context(|| {
-            format!(
-                "cannot recover: subvolume {:?} is missing or unreadable; no data was restored. \
-                 If it was deleted, use `ws-ckpt unregister -w {:?} --force` to remove only \
-                 the registration while retaining backups and snapshots",
-                subvol_path, original_path
-            )
-        })?;
-
-        // 1. Remove symlink; refuse if a non-symlink directory occupies the path
-        match tokio::fs::symlink_metadata(original_path).await {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                tokio::fs::remove_file(original_path)
-                    .await
-                    .context("failed to remove symlink")?;
-            }
-            Ok(_) => {
-                bail!(
-                    "cannot recover: {} is a regular directory, not a workspace symlink; \
-                     move or rename it first to avoid data loss",
-                    original_path
-                );
-            }
-            Err(_) => {} // path gone, rsync will recreate
-        }
-
-        // 2. Rsync subvolume contents back to original path (restore as normal directory)
-        let src = format!("{}/", subvol_path.to_string_lossy()); // trailing / is important
-
-        let sv_uid = subvol_meta.uid();
-        let sv_gid = subvol_meta.gid();
-        let sv_mode = subvol_meta.mode();
-
-        let rsync_status = Command::new("rsync")
-            .args(["-aHAX", "--delete", &src, original_path])
-            .status()
+        self.recover_workspace_with_ops(ws_id, original_path, &BtrfsRollbackTmpOps)
             .await
-            .context("failed to run rsync")?;
-        if !rsync_status.success() {
-            bail!(
-                "rsync failed restoring {} -> {}, exit: {:?}; \
-                 workspace and snapshots preserved for retry",
-                src,
-                original_path,
-                rsync_status.code()
-            );
-        } else {
-            // Restore directory ownership and permissions to match original
-            if let Err(e) = chown(
-                Path::new(original_path),
-                Some(Uid::from_raw(sv_uid)),
-                Some(Gid::from_raw(sv_gid)),
-            ) {
-                warn!("failed to restore ownership on {}: {}", original_path, e);
-            }
-            if let Err(e) =
-                tokio::fs::set_permissions(original_path, std::fs::Permissions::from_mode(sv_mode))
-                    .await
-            {
-                warn!("failed to restore permissions on {}: {}", original_path, e);
-            }
-            info!("restored workspace contents to {}", original_path);
-        }
-
-        // 3. Delete snapshots before the workspace subvolume so a partial
-        //    teardown remains retryable.
-        btrfs_common::delete_recovery_subvolumes(
-            &snap_base,
-            &subvol_path,
-            &self.data_root,
-            original_path,
-        )
-        .await?;
-
-        // 4. Remove snapshots/{ws_id} directory
-        if let Err(e) = tokio::fs::remove_dir_all(&snap_base).await {
-            warn!("failed to remove snapshots dir {:?}: {}", snap_base, e);
-        }
-
-        // 5. Remove the workspace's internal diff temp directory. recover
-        //    holds the same workspace mutation lock as diff, so nothing here
-        //    can be a live temp snapshot; leftovers sweep first, then the
-        //    directory itself goes away — but only when empty: a plain
-        //    remove_dir keeps the entries the sweep refused to touch (they
-        //    are already reported as leftovers), so the warning never lists
-        //    a path this teardown deleted.
-        let diff_tmp_dir = self
-            .data_root
-            .join(btrfs_common::DIFF_TMP_DIR_NAME)
-            .join(ws_id);
-        let mut temp_leftovers =
-            btrfs_common::sweep_diff_tmp_dir(&diff_tmp_dir, &self.data_root).await;
-        match tokio::fs::remove_dir(&diff_tmp_dir).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                warn!(
-                    "failed to remove internal diff temp dir {:?}: {}",
-                    diff_tmp_dir, e
-                );
-                temp_leftovers.push(diff_tmp_dir.display().to_string());
-            }
-        }
-
-        // The backup can contain files absent from an interrupted migration.
-        // Leave it intact; the manager archives it and reports the new location.
-
-        Ok(temp_leftovers)
     }
 
     async fn diff(
@@ -672,5 +843,371 @@ mod tests {
 
         assert!(format!("{error:#}").contains("ambiguous interrupted rollback"));
         assert!(candidate.exists(), "unsafe candidate must be preserved");
+    }
+
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use anyhow::bail;
+    use async_trait::async_trait;
+
+    use super::{BtrfsRollbackOps, BtrfsRollbackTmpOps, RollbackTmpState};
+
+    #[derive(Default)]
+    struct FakeRollbackOps {
+        subvolume_inodes: Mutex<HashSet<(u64, u64)>>,
+        fail_delete_calls: Mutex<HashSet<usize>>,
+        delete_calls: Mutex<Vec<PathBuf>>,
+    }
+
+    impl FakeRollbackOps {
+        fn with_failed_delete_calls(calls: impl IntoIterator<Item = usize>) -> Self {
+            Self {
+                fail_delete_calls: Mutex::new(calls.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        async fn create_subvolume(&self, path: &Path, files: &[(&str, &[u8])]) {
+            tokio::fs::create_dir_all(path).await.unwrap();
+            for (name, contents) in files {
+                tokio::fs::write(path.join(name), contents).await.unwrap();
+            }
+            let meta = tokio::fs::symlink_metadata(path).await.unwrap();
+            self.subvolume_inodes
+                .lock()
+                .unwrap()
+                .insert((meta.dev(), meta.ino()));
+        }
+
+        fn delete_calls(&self) -> Vec<PathBuf> {
+            self.delete_calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl BtrfsRollbackOps for FakeRollbackOps {
+        async fn inspect_rollback_tmp(&self, path: &Path) -> anyhow::Result<RollbackTmpState> {
+            let meta = match tokio::fs::symlink_metadata(path).await {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(RollbackTmpState::Missing);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if meta.file_type().is_symlink() {
+                return Ok(RollbackTmpState::NotSubvolume("a symlink".to_string()));
+            }
+            if !meta.is_dir() {
+                return Ok(RollbackTmpState::NotSubvolume(
+                    "not a directory or Btrfs subvolume".to_string(),
+                ));
+            }
+            if self
+                .subvolume_inodes
+                .lock()
+                .unwrap()
+                .contains(&(meta.dev(), meta.ino()))
+            {
+                Ok(RollbackTmpState::Subvolume)
+            } else {
+                Ok(RollbackTmpState::NotSubvolume(
+                    "not a subvolume root".to_string(),
+                ))
+            }
+        }
+
+        async fn ensure_create_allowed(&self, _fs_root: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn create_writable_snapshot(&self, src: &Path, dst: &Path) -> anyhow::Result<()> {
+            tokio::fs::create_dir_all(dst).await?;
+            let mut entries = tokio::fs::read_dir(src).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_type().await?.is_file() {
+                    tokio::fs::copy(entry.path(), dst.join(entry.file_name())).await?;
+                }
+            }
+            let meta = tokio::fs::symlink_metadata(dst).await?;
+            self.subvolume_inodes
+                .lock()
+                .unwrap()
+                .insert((meta.dev(), meta.ino()));
+            Ok(())
+        }
+
+        async fn delete_subvolume(&self, path: &Path, _fs_root: &Path) -> anyhow::Result<()> {
+            let call_index = {
+                let mut calls = self.delete_calls.lock().unwrap();
+                calls.push(path.to_path_buf());
+                calls.len()
+            };
+            if self.fail_delete_calls.lock().unwrap().contains(&call_index) {
+                bail!("injected subvolume delete failure on call #{call_index}");
+            }
+            let meta = tokio::fs::symlink_metadata(path).await?;
+            let key = (meta.dev(), meta.ino());
+            if !self.subvolume_inodes.lock().unwrap().remove(&key) {
+                bail!("attempted to delete unverified non-subvolume {path:?}");
+            }
+            tokio::fs::remove_dir_all(path).await?;
+            Ok(())
+        }
+
+        async fn rsync_restore(&self, src: &str, original_path: &str) -> anyhow::Result<()> {
+            let src_dir = Path::new(src.trim_end_matches('/'));
+            let dst_dir = Path::new(original_path);
+            tokio::fs::create_dir_all(dst_dir).await?;
+            let mut entries = tokio::fs::read_dir(src_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_type().await?.is_file() {
+                    tokio::fs::copy(entry.path(), dst_dir.join(entry.file_name())).await?;
+                }
+            }
+            Ok(())
+        }
+
+        async fn delete_recovery_subvolumes(
+            &self,
+            snapshot_dir: &Path,
+            workspace_subvolume: &Path,
+            fs_root: &Path,
+            _original_path: &str,
+        ) -> anyhow::Result<()> {
+            if let Ok(mut entries) = tokio::fs::read_dir(snapshot_dir).await {
+                while let Some(entry) = entries.next_entry().await? {
+                    if entry.file_type().await?.is_dir() {
+                        self.delete_subvolume(&entry.path(), fs_root).await?;
+                    }
+                }
+            }
+            self.delete_subvolume(workspace_subvolume, fs_root).await
+        }
+    }
+
+    #[tokio::test]
+    async fn second_rollback_reclaims_stale_rollback_tmp_after_prior_cleanup_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BtrfsBaseBackend::new(tmp.path().to_path_buf(), BtrfsBaseScenario::InPlace);
+        let ws_id = "ws-abc123";
+        let snap_id = "snap-1";
+        let ws_path = backend.data_root.join(ws_id);
+        let tmp_path = backend.data_root.join("ws-abc123.rollback-tmp");
+        let snap_path = backend.snapshots_dir.join(ws_id).join(snap_id);
+
+        // Fail the 1st delete_subvolume call (post-snapshot cleanup of rollback #1),
+        // leaving tmp_path populated as a valid subvolume on disk.
+        let ops = FakeRollbackOps::with_failed_delete_calls([1]);
+        ops.create_subvolume(&ws_path, &[("state.txt", b"live-v1")])
+            .await;
+        ops.create_subvolume(&snap_path, &[("state.txt", b"snapshot-v0")])
+            .await;
+
+        // Rollback #1 succeeds even though the post-snapshot delete of tmp_path failed.
+        let returned = backend
+            .rollback_with_ops(ws_id, snap_id, &ops)
+            .await
+            .unwrap();
+        assert_eq!(returned, ws_path);
+        assert_eq!(
+            tokio::fs::read(&ws_path.join("state.txt")).await.unwrap(),
+            b"snapshot-v0"
+        );
+        assert!(
+            tmp_path.join("state.txt").is_file(),
+            "rollback #1 cleanup failure leaves populated rollback-tmp on disk"
+        );
+
+        // Pre-fix behavior check: raw rename(&ws_path, &tmp_path) onto the populated
+        // stale rollback-tmp directory fails with ENOTEMPTY / EEXIST.
+        let raw_rename_err = tokio::fs::rename(&ws_path, &tmp_path).await.unwrap_err();
+        assert!(
+            matches!(
+                raw_rename_err.kind(),
+                std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::AlreadyExists
+            ),
+            "expected ENOTEMPTY/EEXIST without stale rollback-tmp cleanup, got: {raw_rename_err:?}"
+        );
+
+        // Mutate live workspace and run Rollback #2: it must reclaim the stale
+        // rollback-tmp subvolume before renaming ws_path aside, then succeed.
+        tokio::fs::write(ws_path.join("state.txt"), b"live-v2-dirty")
+            .await
+            .unwrap();
+        let returned_second = backend
+            .rollback_with_ops(ws_id, snap_id, &ops)
+            .await
+            .unwrap();
+        assert_eq!(returned_second, ws_path);
+        assert_eq!(
+            tokio::fs::read(&ws_path.join("state.txt")).await.unwrap(),
+            b"snapshot-v0"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "rollback #2 must reclaim stale rollback-tmp and clean up its own temporary subvolume"
+        );
+        assert_eq!(
+            ops.delete_calls(),
+            vec![tmp_path.clone(), tmp_path.clone(), tmp_path],
+            "expected 3 delete attempts: #1 failed post-rollback, #2 pre-rename reclaim, #3 post-rollback cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_non_subvolume_rollback_tmp_without_deleting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BtrfsBaseBackend::new(tmp.path().to_path_buf(), BtrfsBaseScenario::InPlace);
+        let ws_id = "ws-abc123";
+        let snap_id = "snap-1";
+        let ws_path = backend.data_root.join(ws_id);
+        let tmp_path = backend.data_root.join("ws-abc123.rollback-tmp");
+        let snap_path = backend.snapshots_dir.join(ws_id).join(snap_id);
+
+        let ops = FakeRollbackOps::default();
+        ops.create_subvolume(&ws_path, &[("state.txt", b"live-v1")])
+            .await;
+        ops.create_subvolume(&snap_path, &[("state.txt", b"snapshot-v0")])
+            .await;
+
+        // 1. Ordinary non-subvolume directory at tmp_path must be rejected and preserved.
+        tokio::fs::create_dir_all(&tmp_path).await.unwrap();
+        let sentinel = tmp_path.join("foreign.txt");
+        tokio::fs::write(&sentinel, b"must-not-be-deleted")
+            .await
+            .unwrap();
+
+        let err = backend
+            .rollback_with_ops(ws_id, snap_id, &ops)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a verified Btrfs subvolume"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            ops.delete_calls().is_empty(),
+            "delete_subvolume must not be called on an unverified directory"
+        );
+        assert_eq!(
+            tokio::fs::read(&sentinel).await.unwrap(),
+            b"must-not-be-deleted",
+            "ordinary directory contents at rollback-tmp must never be deleted"
+        );
+        assert_eq!(
+            tokio::fs::read(ws_path.join("state.txt")).await.unwrap(),
+            b"live-v1",
+            "live workspace must remain untouched when rollback-tmp is rejected"
+        );
+
+        // Also verify production BtrfsRollbackTmpOps classifies ordinary dirs, files,
+        // and symlinks as NotSubvolume without touching them.
+        assert!(matches!(
+            BtrfsRollbackTmpOps
+                .inspect_rollback_tmp(&tmp_path)
+                .await
+                .unwrap(),
+            RollbackTmpState::NotSubvolume(_)
+        ));
+        tokio::fs::remove_dir_all(&tmp_path).await.unwrap();
+
+        // 2. Symlink at tmp_path must be rejected without following or deleting target.
+        let target_dir = tmp.path().join("symlink-target");
+        tokio::fs::create_dir_all(&target_dir).await.unwrap();
+        let target_file = target_dir.join("keep.txt");
+        tokio::fs::write(&target_file, b"keep").await.unwrap();
+        tokio::fs::symlink(&target_dir, &tmp_path).await.unwrap();
+
+        let symlink_err = backend
+            .rollback_with_ops(ws_id, snap_id, &ops)
+            .await
+            .unwrap_err();
+        assert!(format!("{symlink_err:#}").contains("a symlink"));
+        assert!(ops.delete_calls().is_empty());
+        assert!(tokio::fs::symlink_metadata(&tmp_path)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(tokio::fs::read(&target_file).await.unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn recover_workspace_reclaims_verified_stale_rollback_tmp_and_preserves_unverified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BtrfsBaseBackend::new(tmp.path().to_path_buf(), BtrfsBaseScenario::InPlace);
+        let ws_id = "ws-abc123";
+        let ws_path = backend.data_root.join(ws_id);
+        let tmp_path = backend.data_root.join("ws-abc123.rollback-tmp");
+        let snap_base = backend.snapshots_dir.join(ws_id);
+        let snap_path = snap_base.join("snap-1");
+        let original_dir = tmp.path().join("user-workspace");
+        let original_str = original_dir.to_str().unwrap();
+
+        // Case 1: Verified stale <ws_id>.rollback-tmp subvolume is reclaimed during recover_workspace.
+        let ops = FakeRollbackOps::default();
+        ops.create_subvolume(&ws_path, &[("app.txt", b"restored-live")])
+            .await;
+        ops.create_subvolume(&snap_path, &[("app.txt", b"snap-data")])
+            .await;
+        ops.create_subvolume(&tmp_path, &[("app.txt", b"stale-rollback-tmp")])
+            .await;
+        tokio::fs::symlink(&ws_path, &original_dir).await.unwrap();
+
+        let leftovers = backend
+            .recover_workspace_with_ops(ws_id, original_str, &ops)
+            .await
+            .unwrap();
+        assert!(leftovers.is_empty());
+        assert!(
+            !tokio::fs::symlink_metadata(&original_dir)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "original_path must be restored as a real directory"
+        );
+        assert_eq!(
+            tokio::fs::read(original_dir.join("app.txt")).await.unwrap(),
+            b"restored-live"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "recover_workspace must reclaim verified stale <ws_id>.rollback-tmp subvolume"
+        );
+        assert!(!ws_path.exists());
+        assert!(!snap_base.exists());
+
+        // Case 2: Unverified non-subvolume at <ws_id>.rollback-tmp is preserved during recover_workspace.
+        tokio::fs::remove_dir_all(&original_dir).await.unwrap();
+        let ops_unverified = FakeRollbackOps::default();
+        ops_unverified
+            .create_subvolume(&ws_path, &[("app.txt", b"restored-live-2")])
+            .await;
+        tokio::fs::create_dir_all(&snap_base).await.unwrap();
+        tokio::fs::create_dir_all(&tmp_path).await.unwrap();
+        let foreign_file = tmp_path.join("foreign.txt");
+        tokio::fs::write(&foreign_file, b"keep-foreign")
+            .await
+            .unwrap();
+        tokio::fs::symlink(&ws_path, &original_dir).await.unwrap();
+
+        let leftovers_unverified = backend
+            .recover_workspace_with_ops(ws_id, original_str, &ops_unverified)
+            .await
+            .unwrap();
+        assert!(leftovers_unverified.is_empty());
+        assert_eq!(
+            tokio::fs::read(original_dir.join("app.txt")).await.unwrap(),
+            b"restored-live-2"
+        );
+        assert_eq!(
+            tokio::fs::read(&foreign_file).await.unwrap(),
+            b"keep-foreign",
+            "unverified non-subvolume rollback-tmp must not be deleted during recover_workspace"
+        );
     }
 }

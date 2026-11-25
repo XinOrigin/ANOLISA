@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -58,6 +59,8 @@ def create_runtime(
     version: str = VERSION,
     platform: str | None = None,
     binary_architecture: str | None = None,
+    extensions: tuple[str, ...] | None = None,
+    extra_members: tuple[str, ...] = (),
     executables: tuple[str, ...] | None = None,
 ) -> Path:
     platform = platform or PLATFORMS[(os_name, architecture)]
@@ -82,8 +85,19 @@ def create_runtime(
                 + "\n"
             ).encode(),
         )
-        extension = "_native.pyd" if os_name == "windows" else "_native.abi3.so"
-        add_member(archive, f"anolisa_tokenless/{extension}", payload, 0o100755)
+        if extensions is None:
+            extensions = ("_native.pyd",) if os_name == "windows" else ("_native.abi3.so",)
+        with warnings.catch_warnings():
+            if len(set(extensions)) != len(extensions):
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Duplicate name:",
+                    category=UserWarning,
+                )
+            for extension in extensions:
+                add_member(archive, f"anolisa_tokenless/{extension}", payload, 0o100755)
+        for member in extra_members:
+            add_member(archive, f"anolisa_tokenless/{member}", b"")
         add_member(archive, "anolisa_tokenless/_bin/__init__.py", b"")
         if executables is None:
             executables = ("tokenless.exe",) if os_name == "windows" else ("tokenless",)
@@ -126,6 +140,7 @@ def run_verifier(
     *arguments: str,
     version: str = VERSION,
     expect_success: bool = True,
+    expected_output: str | None = None,
 ) -> None:
     result = subprocess.run(
         [
@@ -146,6 +161,129 @@ def run_verifier(
         raise AssertionError(
             f"verifier returned {result.returncode}, expected success={expect_success}:\n"
             f"{result.stdout}"
+        )
+    if expected_output is not None and expected_output not in result.stdout:
+        raise AssertionError(
+            f"verifier output did not contain {expected_output!r}:\n{result.stdout}"
+        )
+
+
+def check_native_extension_case(
+    root: Path,
+    os_name: str,
+    architecture: str,
+    case_name: str,
+    *,
+    extensions: tuple[str, ...] | None = None,
+    extra_members: tuple[str, ...] = (),
+    expect_success: bool,
+) -> None:
+    case_dir = root / f"native-{os_name}-{architecture}-{case_name}"
+    case_dir.mkdir()
+    create_runtime(
+        case_dir,
+        os_name,
+        architecture,
+        extensions=extensions,
+        extra_members=extra_members,
+    )
+    if (os_name, architecture) == ("linux", "x86_64"):
+        create_agentscope(case_dir)
+    run_verifier(
+        case_dir,
+        "--layout",
+        "flat",
+        "--os",
+        os_name,
+        "--arch",
+        architecture,
+        expect_success=expect_success,
+        expected_output=None
+        if expect_success
+        else "must contain exactly one native extension",
+    )
+
+
+def test_native_extension_names(root: Path) -> None:
+    for os_name, architecture in PLATFORMS:
+        # Valid controls: default extension with .pyi type stub, plus generic .so on POSIX.
+        check_native_extension_case(
+            root,
+            os_name,
+            architecture,
+            "valid-with-stub",
+            extra_members=("_native.pyi",),
+            expect_success=True,
+        )
+        if os_name != "windows":
+            check_native_extension_case(
+                root,
+                os_name,
+                architecture,
+                "valid-generic-so",
+                extensions=("_native.so",),
+                expect_success=True,
+            )
+
+        if os_name == "windows":
+            invalid_cases = {
+                "wrong-basename": ("_native_extra.pyd",),
+                "other-module": ("other.pyd",),
+                "nested-dir": ("sub/_native.pyd",),
+                "abi3-pyd-suffix": ("_native.abi3.pyd",),
+                "cpython-pyd-suffix": ("_native.cp311-win_amd64.pyd",),
+                "posix-abi3-so": ("_native.abi3.so",),
+                "posix-generic-so": ("_native.so",),
+                "dll-suffix": ("_native.dll",),
+                "uppercase-pyd": ("_native.PYD",),
+                "missing": (),
+                "multi-extra": ("_native.pyd", "_native_extra.pyd"),
+                "multi-abi3-pyd": ("_native.pyd", "_native.abi3.pyd"),
+                "multi-duplicate": ("_native.pyd", "_native.pyd"),
+                "multi-other": ("_native.pyd", "other.pyd"),
+                "multi-cross-os": ("_native.pyd", "_native.abi3.so"),
+            }
+        else:
+            cpython_suffix = (
+                f"_native.cpython-311-{architecture}-linux-gnu.so"
+                if os_name == "linux"
+                else "_native.cpython-311-darwin.so"
+            )
+            invalid_cases = {
+                "wrong-basename-abi3": ("_native_extra.abi3.so",),
+                "wrong-basename-so": ("_native_extra.so",),
+                "other-module": ("other.so",),
+                "nested-dir": ("sub/_native.abi3.so",),
+                "cpython-so-suffix": (cpython_suffix,),
+                "windows-pyd": ("_native.pyd",),
+                "dylib-suffix": ("_native.dylib",),
+                "uppercase-so": ("_native.SO",),
+                "missing": (),
+                "multi-abi3-and-so": ("_native.abi3.so", "_native.so"),
+                "multi-extra": ("_native.abi3.so", "_native_extra.abi3.so"),
+                "multi-duplicate": ("_native.abi3.so", "_native.abi3.so"),
+                "multi-other": ("_native.abi3.so", "other.so"),
+                "multi-cross-os": ("_native.abi3.so", "_native.pyd"),
+            }
+
+        for case_name, extensions in invalid_cases.items():
+            check_native_extension_case(
+                root,
+                os_name,
+                architecture,
+                case_name,
+                extensions=extensions,
+                expect_success=False,
+            )
+
+        check_native_extension_case(
+            root,
+            os_name,
+            architecture,
+            "stub-only",
+            extensions=(),
+            extra_members=("_native.pyi",),
+            expect_success=False,
         )
 
 
@@ -359,6 +497,8 @@ def main() -> int:
             str(manifest),
             expect_success=False,
         )
+
+        test_native_extension_names(root)
 
     print("Tokenless wheel verifier tests passed")
     return 0

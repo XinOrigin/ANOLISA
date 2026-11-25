@@ -24,6 +24,16 @@ RUNTIME_NAME = "anolisa-tokenless"
 RUNTIME_FILENAME = "anolisa_tokenless"
 AGENTSCOPE_NAME = "anolisa-tokenless-agentscope"
 AGENTSCOPE_FILENAME = "anolisa_tokenless_agentscope"
+NATIVE_EXTENSION_SUFFIXES = (".pyd", ".so", ".dylib", ".dll")
+EXPECTED_NATIVE_EXTENSIONS = {
+    "windows": frozenset({"anolisa_tokenless/_native.pyd"}),
+    "linux": frozenset(
+        {"anolisa_tokenless/_native.abi3.so", "anolisa_tokenless/_native.so"}
+    ),
+    "macos": frozenset(
+        {"anolisa_tokenless/_native.abi3.so", "anolisa_tokenless/_native.so"}
+    ),
+}
 WHEEL_PATTERN = re.compile(
     r"^(anolisa_tokenless(?:_agentscope)?)-([^-]+)-([^-]+)-([^-]+)-([^-]+)\.whl$"
 )
@@ -222,14 +232,19 @@ def verify_runtime(path: Path, version: str, executable: str) -> NativeTarget:
             fail(f"{path.name} has the wrong METADATA Version")
         verify_wheel_tags(wheel, python_tag, abi_tag, platforms)
 
+        expected_native = EXPECTED_NATIVE_EXTENSIONS[target.os_name]
         native_members = [
             name
             for name in archive.namelist()
-            if name.startswith("anolisa_tokenless/_native")
-            and name.endswith(".pyd" if target.os_name == "windows" else ".so")
+            if name.startswith("anolisa_tokenless/")
+            and not name.startswith("anolisa_tokenless/_bin/")
+            and name.lower().endswith(NATIVE_EXTENSION_SUFFIXES)
         ]
-        if len(native_members) != 1:
-            fail(f"{path.name} must contain exactly one native extension")
+        if len(native_members) != 1 or native_members[0] not in expected_native:
+            fail(
+                f"{path.name} must contain exactly one native extension "
+                f"in {sorted(expected_native)}, found {native_members}"
+            )
         if target.os_name == "windows":
             executable += ".exe"
         # _bin is also a Python package; any other file there is a stale binary.

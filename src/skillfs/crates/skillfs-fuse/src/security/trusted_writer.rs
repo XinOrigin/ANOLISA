@@ -287,31 +287,72 @@ impl LinuxProcCommResolver {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn resolve_exe_from_symlink(exe_link: &Path) -> Option<(PathBuf, FileId)> {
+    use std::os::unix::fs::MetadataExt;
+    let exe_path = std::fs::read_link(exe_link).ok()?;
+    // Stat the `/proc/<tgid>/exe` symlink itself (following the kernel
+    // magic link to the running executable's inode) rather than
+    // statting the `read_link` path string, which can resolve to a
+    // different file across mount namespaces or after binary
+    // replacement or deletion.
+    let meta = std::fs::metadata(exe_link).ok()?;
+    Some((
+        exe_path,
+        FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_identity_bracketed<FStart, FComm, FExe>(
+    mut read_starttime: FStart,
+    read_comm: FComm,
+    read_exe: FExe,
+) -> Option<ProcessIdentity>
+where
+    FStart: FnMut() -> Option<u64>,
+    FComm: FnOnce() -> Option<String>,
+    FExe: FnOnce() -> Option<(PathBuf, FileId)>,
+{
+    // Bracket comm and exe resolution with two starttime reads so PID
+    // exit or reuse mid-collection is detected and rejected.
+    let starttime_before = read_starttime()?;
+    // comm is log-only in exe mode, and in comm mode an empty string
+    // can never equal a configured name. A raw-byte comm (non-UTF-8
+    // executable name, or a UTF-8 name the kernel truncated to 15
+    // bytes mid-character) must not fail the whole identity lookup.
+    let comm = read_comm().unwrap_or_default();
+    let (exe_path, exe_file_id) = match read_exe() {
+        Some((path, file_id)) => (Some(path), Some(file_id)),
+        None => (None, None),
+    };
+    let starttime_after = read_starttime()?;
+    if starttime_before != starttime_after {
+        return None;
+    }
+    Some(ProcessIdentity {
+        comm,
+        starttime: Some(starttime_before),
+        exe_path,
+        exe_file_id,
+    })
+}
+
 impl ProcessIdentityResolver for LinuxProcCommResolver {
     #[cfg(target_os = "linux")]
     fn resolve_identity(&self, pid: u32) -> Option<ProcessIdentity> {
-        use std::os::unix::fs::MetadataExt;
         let tgid = read_tgid_from_status(&Self::status_path(pid))?;
-        // comm is log-only in exe mode, and in comm mode an empty string
-        // can never equal a configured name. A raw-byte comm (non-UTF-8
-        // executable name, or a UTF-8 name the kernel truncated to 15
-        // bytes mid-character) must not fail the whole identity lookup.
-        let comm = read_comm_file(&Self::comm_path(tgid)).unwrap_or_default();
-        let starttime = read_starttime_from_stat(&Self::stat_path(tgid));
-        let exe_path = std::fs::read_link(Self::exe_symlink_path(tgid)).ok();
-        let exe_file_id = exe_path.as_ref().and_then(|p| {
-            let meta = std::fs::metadata(p).ok()?;
-            Some(FileId {
-                dev: meta.dev(),
-                ino: meta.ino(),
-            })
-        });
-        Some(ProcessIdentity {
-            comm,
-            starttime,
-            exe_path,
-            exe_file_id,
-        })
+        let stat_path = Self::stat_path(tgid);
+        let comm_path = Self::comm_path(tgid);
+        let exe_link = Self::exe_symlink_path(tgid);
+        resolve_identity_bracketed(
+            || read_starttime_from_stat(&stat_path),
+            || read_comm_file(&comm_path),
+            || resolve_exe_from_symlink(&exe_link),
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1226,5 +1267,247 @@ PPid:\t1
 
         child.kill().ok();
         child.wait().ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_stat_and_exe_path_formats_are_pinned() {
+        assert_eq!(
+            LinuxProcCommResolver::stat_path(1234),
+            PathBuf::from("/proc/1234/stat")
+        );
+        assert_eq!(
+            LinuxProcCommResolver::exe_symlink_path(1234),
+            PathBuf::from("/proc/1234/exe")
+        );
+    }
+
+    /// `resolve_exe_from_symlink` must stat the symlink itself rather
+    /// than statting the path string returned by `read_link`. A
+    /// relative symlink whose target name does not exist in CWD proves
+    /// `metadata(exe_link)` is used instead of `metadata(read_link_val)`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_exe_from_symlink_stats_symlink_directly() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_name = "skillfs_unique_relative_exe_target";
+        let real_bin = dir.path().join(target_name);
+        std::fs::write(&real_bin, b"binary").unwrap();
+        let expected_meta = std::fs::metadata(&real_bin).unwrap();
+        let expected_fid = FileId {
+            dev: expected_meta.dev(),
+            ino: expected_meta.ino(),
+        };
+
+        let exe_link = dir.path().join("exe");
+        std::os::unix::fs::symlink(target_name, &exe_link).unwrap();
+
+        // Sanity check: statting the raw read_link string fails because
+        // it is relative to `exe_link`'s parent, not CWD.
+        let raw_target = std::fs::read_link(&exe_link).unwrap();
+        assert!(std::fs::metadata(&raw_target).is_err());
+
+        let (resolved_path, resolved_fid) = resolve_exe_from_symlink(&exe_link)
+            .expect("statting exe symlink directly must succeed");
+        assert_eq!(resolved_path, PathBuf::from(target_name));
+        assert_eq!(resolved_fid, expected_fid);
+    }
+
+    /// When a running executable is replaced (or unlinked) on disk,
+    /// `read_link("/proc/<tgid>/exe")` returns `"... (deleted)"` and
+    /// statting that path string fails with ENOENT. Statting
+    /// `/proc/<tgid>/exe` directly follows the kernel magic symlink to
+    /// the running binary's true `(dev, ino)` instead of failing or
+    /// statting the replacement binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_resolver_stats_proc_exe_directly_after_replace() {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Stdio;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = dir.path().join("writer");
+        std::fs::copy("/bin/sleep", &writer).expect("copy sleep");
+        let writer_canon = std::fs::canonicalize(&writer).expect("canonicalize writer");
+        let meta_v1 = std::fs::metadata(&writer_canon).expect("stat v1");
+        let fid_v1 = FileId {
+            dev: meta_v1.dev(),
+            ino: meta_v1.ino(),
+        };
+
+        let child = ChildGuard(
+            std::process::Command::new(&writer_canon)
+                .arg("30")
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn writer"),
+        );
+        let pid = child.0.id();
+
+        let exe_link = LinuxProcCommResolver::exe_symlink_path(pid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if std::fs::read_link(&exe_link).ok().as_ref() == Some(&writer_canon) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{exe_link:?} never pointed to {writer_canon:?}: {:?}",
+                std::fs::read_link(&exe_link)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Atomically replace the on-disk binary with a new inode.
+        let writer_new = dir.path().join("writer.new");
+        std::fs::copy("/bin/sleep", &writer_new).expect("copy replacement");
+        let meta_v2 = std::fs::metadata(&writer_new).expect("stat v2");
+        let fid_v2 = FileId {
+            dev: meta_v2.dev(),
+            ino: meta_v2.ino(),
+        };
+        assert_ne!(fid_v1, fid_v2, "replacement binary must have a fresh inode");
+        std::fs::rename(&writer_new, &writer_canon).expect("replace binary");
+
+        let resolver = LinuxProcCommResolver::new();
+        let identity = resolver
+            .resolve_identity(pid)
+            .expect("replaced running executable must still resolve");
+        assert_eq!(
+            identity.exe_file_id,
+            Some(fid_v1),
+            "must stat /proc/<tgid>/exe directly to observe the running binary's original inode"
+        );
+        assert!(identity.starttime.is_some());
+
+        // A gate pinned to the replacement binary must deny the old process.
+        let cfg = TrustedWriterConfig::with_executable(writer_canon, fid_v2);
+        let decision = evaluate_trusted_writer(&cfg, pid, &resolver);
+        assert!(
+            !decision.is_allowed(),
+            "old running binary must be denied against replacement config, got {decision:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_identity_bracketed_reads_starttime_before_and_after() {
+        use std::cell::RefCell;
+
+        let calls = RefCell::new(Vec::new());
+        let fid = FileId { dev: 7, ino: 99 };
+        let path = PathBuf::from("/usr/bin/agent-sec-cli");
+
+        let identity = resolve_identity_bracketed(
+            || {
+                calls.borrow_mut().push("starttime");
+                Some(42)
+            },
+            || {
+                calls.borrow_mut().push("comm");
+                Some("agent-sec-cli".to_string())
+            },
+            || {
+                calls.borrow_mut().push("exe");
+                Some((path.clone(), fid))
+            },
+        )
+        .expect("matching bracketed starttime must succeed");
+
+        assert_eq!(
+            *calls.borrow(),
+            vec!["starttime", "comm", "exe", "starttime"]
+        );
+        assert_eq!(identity.comm, "agent-sec-cli");
+        assert_eq!(identity.starttime, Some(42));
+        assert_eq!(identity.exe_path, Some(path));
+        assert_eq!(identity.exe_file_id, Some(fid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_identity_bracketed_rejects_starttime_mismatch() {
+        use std::cell::Cell;
+
+        struct ChangingStarttimeResolver;
+        impl ProcessIdentityResolver for ChangingStarttimeResolver {
+            fn resolve_identity(&self, _pid: u32) -> Option<ProcessIdentity> {
+                let step = Cell::new(0u8);
+                resolve_identity_bracketed(
+                    || {
+                        let s = step.get();
+                        step.set(s + 1);
+                        if s == 0 { Some(100) } else { Some(200) }
+                    },
+                    || Some("agent-sec-cli".to_string()),
+                    || Some((test_exe_path(), test_file_id())),
+                )
+            }
+        }
+
+        let resolver = ChangingStarttimeResolver;
+        assert!(
+            resolver.resolve_identity(42).is_none(),
+            "starttime change across exe resolution must return None"
+        );
+
+        let exe_cfg = TrustedWriterConfig::with_executable(test_exe_path(), test_file_id());
+        assert_eq!(
+            evaluate_trusted_writer(&exe_cfg, 42, &resolver),
+            TrustedWriterDecision::DeniedExecutableUnresolved
+        );
+
+        let comm_cfg = TrustedWriterConfig::with_process_name("agent-sec-cli");
+        assert_eq!(
+            evaluate_trusted_writer(&comm_cfg, 42, &resolver),
+            TrustedWriterDecision::DeniedIdentityUnresolved
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_identity_bracketed_rejects_missing_starttime() {
+        use std::cell::Cell;
+
+        // Missing starttime before resolution short-circuits immediately.
+        let comm_called = Cell::new(false);
+        let exe_called = Cell::new(false);
+        let missing_before = resolve_identity_bracketed(
+            || None,
+            || {
+                comm_called.set(true);
+                Some("agent-sec-cli".to_string())
+            },
+            || {
+                exe_called.set(true);
+                Some((test_exe_path(), test_file_id()))
+            },
+        );
+        assert!(missing_before.is_none());
+        assert!(!comm_called.get());
+        assert!(!exe_called.get());
+
+        // Missing starttime after resolution (process exited mid-lookup).
+        let step = Cell::new(0u8);
+        let missing_after = resolve_identity_bracketed(
+            || {
+                let s = step.get();
+                step.set(s + 1);
+                if s == 0 { Some(100) } else { None }
+            },
+            || Some("agent-sec-cli".to_string()),
+            || Some((test_exe_path(), test_file_id())),
+        );
+        assert!(missing_after.is_none());
     }
 }

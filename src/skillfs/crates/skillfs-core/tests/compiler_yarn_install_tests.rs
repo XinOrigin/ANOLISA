@@ -76,3 +76,64 @@ fn yarn_keeps_arguments_after_combined_output_redirection() {
         "yarn install & yarn test\n"
     );
 }
+
+#[test]
+fn yarn_rewrites_bare_install_in_inline_prose_and_multi_backtick_spans() {
+    for (input, expected) in [
+        (
+            "Run `npm install` before testing\n",
+            "Run `yarn install` before testing\n",
+        ),
+        (
+            "Run `npm install` && `npm test`\n",
+            "Run `yarn install` && `yarn test`\n",
+        ),
+        ("- `npm install`\n", "- `yarn install`\n"),
+        (
+            "1. `npm install` (required)\n",
+            "1. `yarn install` (required)\n",
+        ),
+        (
+            "Run: `npm install` then `npm test`\n",
+            "Run: `yarn install` then `yarn test`\n",
+        ),
+        ("``npm install``", "``yarn install``"),
+        (
+            "Run ``npm install`` before testing\n",
+            "Run ``yarn install`` before testing\n",
+        ),
+        (
+            "Use ``npm install`` then ``npm install lodash``.\n",
+            "Use ``yarn install`` then ``npm install lodash``.\n",
+        ),
+        (
+            "Use ```npm install``` inline\n",
+            "Use ```yarn install``` inline\n",
+        ),
+        (
+            "` npm install ` and `` npm install ``\n",
+            "` yarn install ` and `` yarn install ``\n",
+        ),
+        (
+            "Use `npm install` or `npm install lodash` or `npm install`\n",
+            "Use `yarn install` or `npm install lodash` or `yarn install`\n",
+        ),
+    ] {
+        assert_eq!(compile(input, &environment()), expected);
+    }
+}
+
+#[test]
+fn yarn_keeps_mismatched_and_nested_backtick_spans_verbatim() {
+    for input in [
+        "``npm install`\n",
+        "`npm install``\n",
+        "``npm install `printf lodash` ``\n",
+        "``npm install`printf lodash``\n",
+        "Run \\`npm install\\`\n",
+        "Run `echo ok` && npm install `printf lodash`\n",
+        "Use ``echo `ok` `` && npm install `printf lodash`\n",
+    ] {
+        assert_eq!(compile(input, &environment()), input);
+    }
+}

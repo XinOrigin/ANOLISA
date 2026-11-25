@@ -961,9 +961,13 @@ fn bare_install_ends_here(prefix: &str, tail: &str) -> bool {
         None | Some(';' | '|' | ')' | '#') => true,
         // Bash's &> and &>> redirect output without ending the command.
         Some('&') => !tail.starts_with("&>"),
-        // Only recognize a standalone inline span. A backtick elsewhere
-        // can start a command substitution that supplies package arguments.
-        Some('`') => prefix.trim() == "`" && tail.trim_end() == "`",
+        // Only recognize a closing Markdown inline code delimiter matching the
+        // currently open backtick run; an unmatched backtick can start a
+        // command substitution that supplies package arguments.
+        Some('`') => {
+            let closing_len = tail.chars().take_while(|&ch| ch == '`').count();
+            inline_code_delimiter(prefix) == Some(closing_len)
+        }
         _ => false,
     }
 }

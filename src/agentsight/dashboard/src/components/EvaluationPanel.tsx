@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   EvaluationNotReadyError,
@@ -29,26 +29,66 @@ export const EvaluationPanel: React.FC<EvaluationPanelProps> = ({
   const [pendingCount, setPendingCount] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const mountedRef = useRef(true);
+  const requestIdRef = useRef(0);
+  const activeConversationIdRef = useRef(conversationId);
+  const latestInitialResultRef = useRef(initialResult);
+  latestInitialResultRef.current = initialResult;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestIdRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    activeConversationIdRef.current = conversationId;
+    setResult(latestInitialResultRef.current);
+    setExpanded(false);
+    setLoading(false);
+    setPendingCount(null);
+    setError(null);
+    return () => {
+      requestIdRef.current += 1;
+    };
+  }, [conversationId]);
+
   useEffect(() => {
     setResult(initialResult);
   }, [initialResult]);
 
   const runEvaluation = async (force: boolean) => {
+    const targetConversationId = conversationId;
+    const requestId = ++requestIdRef.current;
+    const isStale = () =>
+      !mountedRef.current ||
+      requestIdRef.current !== requestId ||
+      activeConversationIdRef.current !== targetConversationId;
+
     setLoading(true);
     setError(null);
     try {
-      const response = await evaluateConversation(conversationId, force);
+      const response = await evaluateConversation(targetConversationId, force);
+      if (isStale()) return;
       setResult(response.result);
       setPendingCount(null);
+      setError(null);
       onResult?.(response.result);
     } catch (err) {
+      if (isStale()) return;
       if (err instanceof EvaluationNotReadyError) {
         setPendingCount(err.pendingCallCount);
+        setError(null);
       } else {
+        setPendingCount(null);
         setError(err instanceof Error ? err.message : t('comp.eval.evaluationFailed'));
       }
     } finally {
-      setLoading(false);
+      if (!isStale()) {
+        setLoading(false);
+      }
     }
   };
 

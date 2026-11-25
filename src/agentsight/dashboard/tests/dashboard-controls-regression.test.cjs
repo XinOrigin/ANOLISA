@@ -74,7 +74,8 @@ function createHooksDriver() {
       driver._cursor += 1;
       return slot.value;
     },
-    useEffect(fn) {
+    useEffect(fn, deps) {
+      fn.__deps = Array.isArray(deps) ? deps : null;
       driver._effects.push(fn);
     },
     useCallback(fn) {
@@ -1002,3 +1003,260 @@ for (const [tab, api, row] of [
     assert.ok(rows(rendered).length, 'successful retry restores the row');
   });
 }
+
+// ─── EvaluationPanel: stale conversationId / unmount / error-pending clearing ─
+
+function setupEvaluationPanelHarness() {
+  const driver = createHooksDriver();
+  const { calls, stubs } = deferredFetchStubs(['evaluateConversation']);
+  class EvaluationNotReadyError extends Error {
+    constructor(message, pendingCallCount) {
+      super(message);
+      this.name = 'EvaluationNotReadyError';
+      this.pendingCallCount = pendingCallCount;
+    }
+  }
+  const onResultCalls = [];
+  const { EvaluationPanel } = loadPageModule('src/components/EvaluationPanel.tsx', {
+    'react-router-dom': { useNavigate: () => () => {} },
+    '../utils/apiClient': { ...stubs, EvaluationNotReadyError },
+    './EvaluationBadge': componentStub('EvaluationBadge'),
+    '../i18n': {
+      useI18n: () => ({ t: (key, params) => (params ? `${key}:${JSON.stringify(params)}` : key) }),
+      interruptionTypeKey: () => null,
+    },
+  }, driver);
+
+  const prevDeps = [];
+  const cleanups = [];
+  const syncEffects = (effects) => {
+    for (let i = 0; i < effects.length; i += 1) {
+      const fn = effects[i];
+      const deps = fn.__deps;
+      const changed = !prevDeps[i]
+        || !deps
+        || deps.length !== prevDeps[i].length
+        || deps.some((d, idx) => !Object.is(d, prevDeps[i][idx]));
+      if (changed) {
+        if (typeof cleanups[i] === 'function') cleanups[i]();
+        cleanups[i] = fn();
+        prevDeps[i] = deps;
+      }
+    }
+  };
+  const unmount = () => {
+    for (let i = 0; i < cleanups.length; i += 1) {
+      if (typeof cleanups[i] === 'function') cleanups[i]();
+      cleanups[i] = undefined;
+    }
+  };
+  const renderPanel = (props) => {
+    const rendered = driver.render(EvaluationPanel, {
+      onResult: (res) => onResultCalls.push({ conversationId: props.conversationId, result: res }),
+      ...props,
+    });
+    syncEffects(rendered.effects);
+    return driver.render(EvaluationPanel, {
+      onResult: (res) => onResultCalls.push({ conversationId: props.conversationId, result: res }),
+      ...props,
+    });
+  };
+  return { calls, driver, EvaluationNotReadyError, onResultCalls, renderPanel, unmount, EvaluationPanel };
+}
+
+const makeEvalResult = (id) => ({
+  verdict: 'warn',
+  score: 0.7,
+  summary: `summary-${id}`,
+  root_cause: `cause-${id}`,
+  recommended_action: `action-${id}`,
+  dimensions: [{ name: 'tool_use', score: 0.7, reason: `reason-${id}`, evidence_refs: [] }],
+  findings: [{ code: 'tool_failure', severity: 'medium', message: `finding-${id}`, evidence_refs: [] }],
+  metadata: { evaluated_with_pending: false, pending_call_count: 0 },
+});
+
+const findButtonByText = (element, label) => collectElements(
+  element,
+  (node) => node.type === 'button' && collectText(node).includes(label),
+)[0];
+
+for (const outcome of ['success', 'not-ready', 'error']) {
+  test(`evaluation panel: stale in-flight ${outcome} is ignored after conversationId changes`, async () => {
+    const { calls, EvaluationNotReadyError, onResultCalls, renderPanel } = setupEvaluationPanelHarness();
+    let rendered = renderPanel({ conversationId: 'conv-1', initialResult: null });
+    findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+    assert.equal(calls.evaluateConversation.length, 1);
+    assert.deepEqual(calls.evaluateConversation[0].args, ['conv-1', false]);
+
+    // Switch conversation before conv-1's request settles.
+    rendered = renderPanel({ conversationId: 'conv-2', initialResult: null });
+    const conv2Start = findButtonByText(rendered.element, 'comp.eval.startEval');
+    assert.ok(conv2Start, 'new conversation must not remain stuck in loading state');
+    assert.equal(conv2Start.props.disabled, false);
+
+    // Start a fresh evaluation on conv-2 while conv-1 is still pending.
+    conv2Start.props.onClick();
+    assert.equal(calls.evaluateConversation.length, 2);
+
+    if (outcome === 'success') {
+      calls.evaluateConversation[0].resolve({ result: makeEvalResult('conv-1'), reused_existing_run: false });
+    } else if (outcome === 'not-ready') {
+      calls.evaluateConversation[0].reject(new EvaluationNotReadyError('pending', 4));
+    } else {
+      calls.evaluateConversation[0].reject(new Error('conv-1 failure'));
+    }
+    await settle();
+
+    rendered = renderPanel({ conversationId: 'conv-2', initialResult: null });
+    const textAfterStale = collectText(rendered.element);
+    assert.equal(onResultCalls.length, 0, 'stale completion must not invoke onResult');
+    assert.ok(!textAfterStale.some((s) => s.includes('conv-1')), 'stale state must not leak into conv-2');
+    assert.ok(!textAfterStale.some((s) => s.includes('comp.eval.pendingCalls')), 'stale pendingCount must not show');
+    assert.ok(findButtonByText(rendered.element, 'comp.eval.evaluating').props.disabled,
+      'stale finally must not clear active conv-2 loading state');
+
+    const conv2Result = makeEvalResult('conv-2');
+    calls.evaluateConversation[1].resolve({ result: conv2Result, reused_existing_run: false });
+    await settle();
+    rendered = renderPanel({ conversationId: 'conv-2', initialResult: conv2Result });
+    assert.equal(onResultCalls.length, 1);
+    assert.equal(onResultCalls[0].result, conv2Result);
+    assert.ok(findButtonByText(rendered.element, 'comp.eval.startEval'));
+  });
+}
+
+test('evaluation panel: unmount discards in-flight evaluation completion and rejection', async () => {
+  for (const rejectRun of [false, true]) {
+    const { calls, driver, onResultCalls, renderPanel, unmount } = setupEvaluationPanelHarness();
+    const rendered = renderPanel({ conversationId: 'conv-1', initialResult: null });
+    findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+    const snapshot = driver.slots.map((s) => s.value);
+    unmount();
+    if (rejectRun) {
+      calls.evaluateConversation[0].reject(new Error('after unmount'));
+    } else {
+      calls.evaluateConversation[0].resolve({ result: makeEvalResult('conv-1'), reused_existing_run: false });
+    }
+    await settle();
+    assert.equal(onResultCalls.length, 0, 'unmounted panel must not emit onResult');
+    assert.deepEqual(driver.slots.map((s) => s.value), snapshot, 'unmounted panel must not mutate state');
+  }
+});
+
+test('evaluation panel: conversationId prop change clears local result, expanded, pendingCount, and error when initialResult stays null', async () => {
+  const { calls, EvaluationNotReadyError, renderPanel } = setupEvaluationPanelHarness();
+  // First populate result + expanded for conv-1 without parent updating initialResult.
+  let rendered = renderPanel({ conversationId: 'conv-1', initialResult: null, onResult: undefined });
+  findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+  calls.evaluateConversation[0].resolve({ result: makeEvalResult('conv-1'), reused_existing_run: false });
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: null, onResult: undefined });
+  findButtonByText(rendered.element, 'comp.eval.viewDetails').props.onClick();
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: null, onResult: undefined });
+  assert.ok(findButtonByText(rendered.element, 'comp.eval.collapseDetails'));
+
+  // Trigger a pending banner as well before switching conversations.
+  findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+  calls.evaluateConversation[1].reject(new EvaluationNotReadyError('pending', 5));
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: null, onResult: undefined });
+  assert.ok(collectText(rendered.element).some((s) => s.includes('comp.eval.pendingCalls')));
+
+  // Switch to conv-2 while initialResult remains null.
+  rendered = renderPanel({ conversationId: 'conv-2', initialResult: null, onResult: undefined });
+  const conv2Text = collectText(rendered.element);
+  assert.ok(conv2Text.includes('comp.eval.noResult'), 'conv-2 must not inherit conv-1 local result');
+  assert.ok(!conv2Text.some((s) => s.includes('comp.eval.pendingCalls')), 'conv-2 must clear pendingCount');
+  assert.equal(findButtonByText(rendered.element, 'comp.eval.collapseDetails'), undefined,
+    'conv-2 must reset expanded state');
+
+  // Populate error on conv-2, then switch to conv-3 (initialResult still null).
+  findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+  calls.evaluateConversation[2].reject(new Error('conv-2 error'));
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-2', initialResult: null, onResult: undefined });
+  assert.ok(collectText(rendered.element).includes('conv-2 error'));
+  rendered = renderPanel({ conversationId: 'conv-3', initialResult: null, onResult: undefined });
+  assert.ok(!collectText(rendered.element).includes('conv-2 error'), 'conv-3 must clear error');
+
+  // Same-conversation initialResult hydration must not cancel an active run.
+  findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+  const cached = makeEvalResult('conv-3-cached');
+  rendered = renderPanel({ conversationId: 'conv-3', initialResult: cached, onResult: undefined });
+  assert.ok(findButtonByText(rendered.element, 'comp.eval.evaluating').props.disabled,
+    'updating initialResult for same conversation must keep active loading state');
+  const fresh = makeEvalResult('conv-3-fresh');
+  calls.evaluateConversation[3].resolve({ result: fresh, reused_existing_run: false });
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-3', initialResult: cached, onResult: undefined });
+  assert.ok(collectText(rendered.element).includes('action-conv-3-fresh'));
+});
+
+test('evaluation panel: superseded run on the same conversation cannot overwrite a newer run', async () => {
+  const { calls, onResultCalls, renderPanel } = setupEvaluationPanelHarness();
+  let rendered = renderPanel({ conversationId: 'conv-1', initialResult: null });
+  const startBtn = findButtonByText(rendered.element, 'comp.eval.startEval');
+  // Simulate a second run starting before the first settles.
+  startBtn.props.onClick();
+  startBtn.props.onClick();
+  assert.equal(calls.evaluateConversation.length, 2);
+
+  const newer = makeEvalResult('newer');
+  calls.evaluateConversation[1].resolve({ result: newer, reused_existing_run: false });
+  await settle();
+  calls.evaluateConversation[0].reject(new Error('older failure'));
+  await settle();
+
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: newer });
+  const text = collectText(rendered.element);
+  assert.ok(text.includes('action-newer'));
+  assert.ok(!text.includes('older failure'));
+  assert.equal(onResultCalls.length, 1);
+  assert.equal(onResultCalls[0].result, newer);
+});
+
+test('evaluation panel: pendingCount and error are mutually exclusive across retries', async () => {
+  const { calls, EvaluationNotReadyError, onResultCalls, renderPanel } = setupEvaluationPanelHarness();
+  let rendered = renderPanel({ conversationId: 'conv-1', initialResult: null });
+
+  // 1. Not-ready -> pending banner only.
+  findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+  calls.evaluateConversation[0].reject(new EvaluationNotReadyError('pending', 3));
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: null });
+  let text = collectText(rendered.element);
+  assert.ok(text.includes('comp.eval.pendingCalls:{"n":3}'));
+
+  // 2. Force evaluate fails with generic error -> error shown, pendingCount cleared.
+  findButtonByText(rendered.element, 'comp.eval.forceEval').props.onClick();
+  assert.deepEqual(calls.evaluateConversation[1].args, ['conv-1', true]);
+  calls.evaluateConversation[1].reject(new Error('backend unavailable'));
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: null });
+  text = collectText(rendered.element);
+  assert.ok(text.includes('backend unavailable'));
+  assert.ok(!text.some((s) => s.includes('comp.eval.pendingCalls')),
+    'non-EvaluationNotReadyError must clear stale pendingCount banner');
+
+  // 3. Retry fails with EvaluationNotReadyError -> pendingCount shown, error cleared.
+  findButtonByText(rendered.element, 'comp.eval.startEval').props.onClick();
+  calls.evaluateConversation[2].reject(new EvaluationNotReadyError('pending', 2));
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: null });
+  text = collectText(rendered.element);
+  assert.ok(text.includes('comp.eval.pendingCalls:{"n":2}'));
+  assert.ok(!text.includes('backend unavailable'),
+    'EvaluationNotReadyError must clear previous error');
+
+  // 4. Force evaluate succeeds -> both pendingCount and error cleared, result stored.
+  findButtonByText(rendered.element, 'comp.eval.forceEval').props.onClick();
+  const okResult = makeEvalResult('conv-1-ok');
+  calls.evaluateConversation[3].resolve({ result: okResult, reused_existing_run: false });
+  await settle();
+  rendered = renderPanel({ conversationId: 'conv-1', initialResult: okResult });
+  text = collectText(rendered.element);
+  assert.ok(!text.some((s) => s.includes('comp.eval.pendingCalls')));
+  assert.ok(!text.includes('backend unavailable'));
+  assert.equal(onResultCalls.length, 1);
+  assert.equal(onResultCalls[0].result, okResult);
+});

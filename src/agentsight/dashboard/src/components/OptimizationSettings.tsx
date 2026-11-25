@@ -154,6 +154,18 @@ export const LlmConfigForm = React.forwardRef<LlmConfigFormHandle>((_, ref) => {
   const availableModels = activeProvider.models;
   const effectiveModel = provider === 'custom' || isKnownModel ? model : customModel;
 
+  function syncModelSelection(pid: string, nextModel: string) {
+    const p = PROVIDERS.find((x) => x.id === pid);
+    const found = p ? p.models.some((m) => m.id === nextModel) : false;
+    if (pid === 'custom' || found) {
+      setIsKnownModel(true);
+      setCustomModel('');
+    } else {
+      setIsKnownModel(false);
+      setCustomModel(nextModel);
+    }
+  }
+
   useEffect(() => {
     let active = true;
     (async () => {
@@ -168,11 +180,7 @@ export const LlmConfigForm = React.forwardRef<LlmConfigFormHandle>((_, ref) => {
         // Auto-detect provider
         const pid = detectProvider(data.base_url);
         setProvider(pid);
-        const p = PROVIDERS.find((x) => x.id === pid);
-        if (p && !p.models.some((m) => m.id === data.model)) {
-          setIsKnownModel(false);
-          setCustomModel(data.model);
-        }
+        syncModelSelection(pid, data.model);
         setError(null);
       } catch (e) {
         if (!active) return;
@@ -185,31 +193,18 @@ export const LlmConfigForm = React.forwardRef<LlmConfigFormHandle>((_, ref) => {
     return () => { active = false; };
   }, []);
 
-  // When provider changes, update base URL
+  // When provider changes, update base URL and model selection state
   function handleProviderChange(id: string) {
     // Carry the visible edit into the next provider's model control.
-    setModel(effectiveModel);
+    const nextModel = effectiveModel;
+    setModel(nextModel);
     setProvider(id);
+    syncModelSelection(id, nextModel);
     const p = PROVIDERS.find((x) => x.id === id);
     if (p && p.id !== 'custom') {
       setBaseUrl(p.base_url);
     }
   }
-
-  // When provider changes, check if current model is in the list
-  useEffect(() => {
-    if (!model) return;
-    const found = availableModels.some((m) => m.id === model);
-    if (found) {
-      setIsKnownModel(true);
-      setCustomModel('');
-    } else if (provider !== 'custom') {
-      // Model not in provider's list — switch to custom input
-      setIsKnownModel(false);
-      setCustomModel(model);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [provider, availableModels]);
 
   async function save(): Promise<boolean> {
     if (loading || config === null) return false;
@@ -393,6 +388,7 @@ export const LlmConfigForm = React.forwardRef<LlmConfigFormHandle>((_, ref) => {
                     } else {
                       setIsKnownModel(true);
                       setModel(e.target.value);
+                      setCustomModel('');
                     }
                   }}
                 >

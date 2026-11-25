@@ -194,3 +194,52 @@ test('saving without editing the key omits both key fields', async () => {
   assert.equal('api_key' in saved, false);
   assert.equal('current_api_key' in saved, false);
 });
+
+test('clearing a loaded custom model before switching to a preset provider stays empty', async () => {
+  const form = await configForm({ base_url: 'https://custom.example/v1', model: 'llama-3.1' });
+  form.input('');
+  await form.provider('openai');
+  assert.equal(form.model(), '');
+  const saved = await form.save();
+  assert.equal(saved.model, '');
+  assert.equal(saved.base_url, 'https://api.openai.com/v1');
+});
+
+test('selecting a preset model clears prior custom input before switching back to custom', async () => {
+  const form = await configForm({ base_url: 'https://api.openai.com/v1', model: 'gpt-4o' });
+  form.preset('__custom__');
+  form.input('stale-custom');
+  form.preset('gpt-4o-mini');
+  form.preset('__custom__');
+  assert.equal(form.model(), '');
+  assert.equal((await form.save()).model, '');
+});
+
+test('clearing a model on custom after using a preset provider keeps the model empty on return', async () => {
+  const form = await configForm({ base_url: 'https://api.openai.com/v1', model: 'gpt-4o' });
+  await form.provider('custom');
+  form.input('');
+  await form.provider('openai');
+  assert.equal(form.model(), '');
+  assert.equal((await form.save()).model, '');
+});
+
+test('clearing an unknown preset model before switching providers keeps the model empty', async () => {
+  const toCustom = await configForm({ base_url: 'https://api.openai.com/v1', model: 'llama-3.1' });
+  toCustom.input('');
+  await toCustom.provider('custom');
+  assert.equal(toCustom.model(), '');
+  assert.equal((await toCustom.save()).model, '');
+
+  const toDeepseek = await configForm({ base_url: 'https://api.openai.com/v1', model: 'llama-3.1' });
+  toDeepseek.input('');
+  await toDeepseek.provider('deepseek');
+  assert.equal(toDeepseek.model(), '');
+  assert.equal((await toDeepseek.save()).model, '');
+});
+
+test('loading a saved preset provider with an empty model keeps the empty custom input', async () => {
+  const form = await configForm({ base_url: 'https://api.openai.com/v1', model: '' });
+  assert.equal(form.model(), '');
+  assert.equal((await form.save()).model, '');
+});

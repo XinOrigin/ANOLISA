@@ -158,6 +158,8 @@ export const CacheDiagnosisPanel: React.FC<{ rangeMs: number }> = ({ rangeMs }) 
 
   const load = useCallback(async () => {
     const requestId = ++requestIdRef.current;
+    setDiagnosis(null);
+    setError(null);
     try {
       const endNs = Date.now() * 1_000_000;
       const data = await fetchCacheDiagnosis(endNs - rangeMs * 1_000_000, endNs);
@@ -165,13 +167,23 @@ export const CacheDiagnosisPanel: React.FC<{ rangeMs: number }> = ({ rangeMs }) 
         setDiagnosis(data);
         setError(null);
       }
-    } catch (e: any) {
-      if (requestId === requestIdRef.current) setError(e.message || t('cache.error'));
+    } catch (e: unknown) {
+      if (requestId === requestIdRef.current) {
+        setDiagnosis(null);
+        const rawMessage =
+          typeof e === 'object' && e !== null && 'message' in e && typeof (e as { message?: unknown }).message === 'string'
+            ? (e as { message: string }).message
+            : '';
+        setError(rawMessage.trim() ? rawMessage : '');
+      }
     }
-  }, [rangeMs, t]);
+  }, [rangeMs]);
 
   useEffect(() => {
     void load();
+    return () => {
+      requestIdRef.current += 1;
+    };
   }, [load]);
 
   const groups = (diagnosis?.groups ?? []).filter(group => group.status !== 'no_usage');
@@ -181,10 +193,12 @@ export const CacheDiagnosisPanel: React.FC<{ rangeMs: number }> = ({ rangeMs }) 
         <h3 className="text-sm font-semibold text-gray-800" title={t('cache.titleHint')}>
           {t('cache.title')}
         </h3>
-        {diagnosis?.truncated && <span className="text-[11px] text-yellow-700">{t('cache.truncated')}</span>}
+        {error === null && diagnosis?.truncated && (
+          <span className="text-[11px] text-yellow-700">{t('cache.truncated')}</span>
+        )}
       </div>
       {error !== null ? (
-        <div className="py-3 text-[12px] text-red-400">{error}</div>
+        <div className="py-3 text-[12px] text-red-400">{error || t('cache.error')}</div>
       ) : diagnosis === null ? (
         <div className="py-3 text-[12px] text-gray-400">{t('common.loading')}</div>
       ) : groups.length === 0 ? (

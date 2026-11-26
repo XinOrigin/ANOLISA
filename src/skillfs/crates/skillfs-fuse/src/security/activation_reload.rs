@@ -18,8 +18,10 @@
 //! * Fresh artifact, same target → stop (`Unchanged`); daemon
 //!   re-confirmed the decision.
 //! * Stale freshness (daemon hasn't written yet) → keep polling.
-//! * I/O error (file not yet created) → keep polling.
-//! * Parse / validation error on a fresh artifact → fail-safe hidden.
+//! * Transient `NotFound`/`Interrupted` I/O error (file not yet created or
+//!   unlinked before read) → keep polling.
+//! * Parse, validation, or non-transient I/O error on a fresh artifact →
+//!   fail-safe hidden.
 //! * Timeout → keep current mapping and log a warning.
 //!
 //! Scope constraints:
@@ -254,10 +256,11 @@ impl ActivationReloadController {
     /// * **Fresh write, target unchanged** → return `Unchanged`
     ///   immediately. The daemon re-confirmed the same decision.
     /// * **Stale freshness** (daemon hasn't written yet) → keep polling.
-    /// * **I/O error on a fresh artifact** (race: stat'd then removed)
-    ///   → keep polling.
-    /// * **Parse / validation error on a fresh artifact** → fail-safe
-    ///   hidden immediately.
+    /// * **Transient `NotFound`/`Interrupted` I/O error on a fresh artifact**
+    ///   (race: stat'd then removed) → keep polling.
+    /// * **Parse, validation, or non-transient I/O error on a fresh artifact**
+    ///   (e.g., invalid UTF-8, `EISDIR`, `EACCES`) → fail-safe hidden
+    ///   immediately.
     /// * **Timeout** → keep current mapping, return `Timeout`.
     pub fn poll_reload_skill(
         &self,
@@ -290,8 +293,13 @@ impl ActivationReloadController {
                         );
                         return ReloadOutcome::Unchanged;
                     }
-                    Err(ActivationError::Io(_)) => {
-                        // Race: stat'd but removed before read.
+                    Err(ActivationError::Io(ref io_err))
+                        if matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        // Race: stat'd but removed before read (or interrupted).
                     }
                     Err(e) => {
                         let hidden = fail_safe_hidden(&e);
@@ -1360,5 +1368,212 @@ mod tests {
             before.has_advanced(&after),
             "xattr write must advance dir ctime; before={before:?} after={after:?}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Non-transient I/O errors on fresh artifacts must fail-safe hidden
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn poll_reload_non_utf8_activation_failsafe_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_skill_with_snapshot(dir.path(), "alpha", "v000001");
+        setup_skill_with_activation(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+        );
+
+        let resolver = Arc::new(ActiveSkillResolver::new(dir.path()));
+        let ctrl = ActivationReloadController::new(
+            dir.path(),
+            resolver.clone(),
+            Duration::from_millis(25),
+            Duration::from_millis(300),
+        );
+
+        ctrl.reload_skill_once("alpha");
+        assert!(matches!(
+            resolver.get("alpha"),
+            Some(ActiveTarget::Snapshot { .. })
+        ));
+
+        let skill_dir = dir.path().join("alpha");
+        let activation_path = skill_dir.join(ACTIVATION_FILE);
+        let baseline_freshness = ctrl.snapshot_freshness("alpha");
+
+        loop {
+            std::thread::sleep(Duration::from_millis(15));
+            std::fs::write(&activation_path, [0xffu8, 0xfe, 0x00]).unwrap();
+            let after = ActivationFreshness::snapshot(&skill_dir);
+            if baseline_freshness.has_advanced(&after) {
+                break;
+            }
+        }
+
+        let outcome = ctrl.poll_reload_skill("alpha", baseline_freshness);
+        assert!(
+            matches!(outcome, ReloadOutcome::FailSafeHidden { .. }),
+            "fresh non-UTF-8 activation.json must fail-safe hidden, got {outcome:?}"
+        );
+        assert!(
+            matches!(resolver.get("alpha"), Some(ActiveTarget::Hidden { .. })),
+            "resolver must hide skill on non-UTF-8 activation.json, got {:?}",
+            resolver.get("alpha")
+        );
+    }
+
+    #[test]
+    fn poll_reload_directory_activation_failsafe_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_skill_with_snapshot(dir.path(), "alpha", "v000001");
+        setup_skill_with_activation(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+        );
+
+        let resolver = Arc::new(ActiveSkillResolver::new(dir.path()));
+        let ctrl = ActivationReloadController::new(
+            dir.path(),
+            resolver.clone(),
+            Duration::from_millis(25),
+            Duration::from_millis(300),
+        );
+
+        ctrl.reload_skill_once("alpha");
+
+        let skill_dir = dir.path().join("alpha");
+        let activation_path = skill_dir.join(ACTIVATION_FILE);
+        let baseline_freshness = ctrl.snapshot_freshness("alpha");
+
+        std::fs::remove_file(&activation_path).unwrap();
+        loop {
+            std::thread::sleep(Duration::from_millis(15));
+            if activation_path.is_dir() {
+                std::fs::remove_dir(&activation_path).unwrap();
+            }
+            std::fs::create_dir(&activation_path).unwrap();
+            let after = ActivationFreshness::snapshot(&skill_dir);
+            if baseline_freshness.has_advanced(&after) {
+                break;
+            }
+        }
+
+        let outcome = ctrl.poll_reload_skill("alpha", baseline_freshness);
+        assert!(
+            matches!(outcome, ReloadOutcome::FailSafeHidden { .. }),
+            "directory at activation.json must fail-safe hidden, got {outcome:?}"
+        );
+        assert!(
+            matches!(resolver.get("alpha"), Some(ActiveTarget::Hidden { .. })),
+            "resolver must hide skill when activation.json is a directory, got {:?}",
+            resolver.get("alpha")
+        );
+    }
+
+    #[test]
+    fn poll_reload_unreadable_activation_failsafe_hidden() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_skill_with_snapshot(dir.path(), "alpha", "v000001");
+        setup_skill_with_activation(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+        );
+
+        let resolver = Arc::new(ActiveSkillResolver::new(dir.path()));
+        let ctrl = ActivationReloadController::new(
+            dir.path(),
+            resolver.clone(),
+            Duration::from_millis(25),
+            Duration::from_millis(300),
+        );
+
+        ctrl.reload_skill_once("alpha");
+
+        let skill_dir = dir.path().join("alpha");
+        let activation_path = skill_dir.join(ACTIVATION_FILE);
+        let baseline_freshness = ctrl.snapshot_freshness("alpha");
+
+        update_activation_fresh(
+            dir.path(),
+            "alpha",
+            r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+        );
+        std::fs::set_permissions(&activation_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let outcome = ctrl.poll_reload_skill("alpha", baseline_freshness);
+
+        // Restore permissions so tempdir cleanup succeeds regardless of outcome.
+        let _ = std::fs::set_permissions(&activation_path, std::fs::Permissions::from_mode(0o644));
+
+        assert!(
+            matches!(outcome, ReloadOutcome::FailSafeHidden { .. }),
+            "unreadable activation.json must fail-safe hidden, got {outcome:?}"
+        );
+        assert!(
+            matches!(resolver.get("alpha"), Some(ActiveTarget::Hidden { .. })),
+            "resolver must hide skill when activation.json is unreadable, got {:?}",
+            resolver.get("alpha")
+        );
+    }
+
+    #[test]
+    fn poll_reload_not_found_io_race_keeps_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_skill_with_snapshot(dir.path(), "alpha", "v000001");
+        let skill_dir = dir.path().join("alpha");
+        std::fs::create_dir_all(skill_dir.join(".skill-meta")).unwrap();
+
+        let resolver = Arc::new(ActiveSkillResolver::new(dir.path()));
+        let ctrl = ActivationReloadController::new(
+            dir.path(),
+            resolver.clone(),
+            Duration::from_millis(25),
+            Duration::from_millis(1500),
+        );
+
+        let baseline_freshness = ctrl.snapshot_freshness("alpha");
+        assert!(baseline_freshness.json_mtime.is_none());
+
+        // Advance skill_dir freshness while activation.json is still absent so
+        // poll_reload_skill enters the fresh branch and observes Io(NotFound).
+        let probe = skill_dir.join("probe");
+        loop {
+            std::thread::sleep(Duration::from_millis(15));
+            std::fs::write(&probe, b"x").unwrap();
+            let _ = std::fs::remove_file(&probe);
+            let after = ActivationFreshness::snapshot(&skill_dir);
+            if baseline_freshness.has_advanced(&after) {
+                break;
+            }
+        }
+
+        let dir_path = dir.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            setup_skill_with_activation(
+                &dir_path,
+                "alpha",
+                r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+            );
+        });
+
+        let outcome = ctrl.poll_reload_skill("alpha", baseline_freshness);
+        writer.join().unwrap();
+
+        match outcome {
+            ReloadOutcome::Updated(ActiveTarget::Snapshot { version, .. }) => {
+                assert_eq!(version, "v000001.snapshot");
+            }
+            other => panic!("NotFound race must keep polling until file appears, got {other:?}"),
+        }
     }
 }

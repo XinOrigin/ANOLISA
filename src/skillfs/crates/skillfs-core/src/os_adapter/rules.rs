@@ -231,12 +231,35 @@ pub(crate) fn compile(
             OsTarget::Ubuntu => (&raw.alinux, &raw.ubuntu),
         };
 
-        // A rule contributes a real substitution only when it is eligible for
-        // this target and actually changes bytes. Everything else (never,
+        // Every rule eligible for this target (`auto_apply: always` in an
+        // allowed direction) claims `from -> to` for duplicate and ambiguity
+        // detection, including eligible identity mappings (`from == to`) so a
+        // conflicting substitution cannot silently override or strip an active
+        // identity rule's protection.
+        let is_eligible = auto_apply && direction.applies_to(target);
+        if is_eligible {
+            if let Some(existing) = seen.get(from) {
+                if existing == to {
+                    return Err(OsAdapterError::DuplicateRule {
+                        pattern: from.clone(),
+                        target: target.as_str(),
+                    });
+                }
+                return Err(OsAdapterError::AmbiguousRule {
+                    pattern: from.clone(),
+                    target: target.as_str(),
+                    existing: existing.clone(),
+                    conflicting: to.clone(),
+                });
+            }
+            seen.insert(from.clone(), to.clone());
+        }
+
+        // A rule emits a byte-changing substitution only when it is eligible
+        // for this target and `from != to`. Everything else (never,
         // direction-disallowed, or identity `from == to`) becomes a protection
         // source so eligibility is not bypassed by a shorter overlapping rule.
-        let is_substitution = auto_apply && direction.applies_to(target) && from != to;
-        if !is_substitution {
+        if !is_eligible || from == to {
             if protect_seen.insert((from.clone(), match_mode)) {
                 protects.push(CompiledProtection {
                     source: from.clone(),
@@ -246,21 +269,6 @@ pub(crate) fn compile(
             continue;
         }
 
-        if let Some(existing) = seen.get(from) {
-            if existing == to {
-                return Err(OsAdapterError::DuplicateRule {
-                    pattern: from.clone(),
-                    target: target.as_str(),
-                });
-            }
-            return Err(OsAdapterError::AmbiguousRule {
-                pattern: from.clone(),
-                target: target.as_str(),
-                existing: existing.clone(),
-                conflicting: to.clone(),
-            });
-        }
-        seen.insert(from.clone(), to.clone());
         rules.push(CompiledRule {
             source: from.clone(),
             target: to.clone(),
@@ -536,5 +544,95 @@ mod tests {
 "#;
         assert_eq!(compile_str(yaml, OsTarget::Ubuntu).unwrap().rules.len(), 0);
         assert_eq!(compile_str(yaml, OsTarget::Alinux).unwrap().rules.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_eligible_identity_rule_is_rejected() {
+        let yaml = "- ubuntu: nginx\n  alinux: nginx\n  direction: bidirectional\n  auto_apply: always\n- ubuntu: nginx\n  alinux: nginx\n  direction: bidirectional\n  auto_apply: always\n";
+        assert!(matches!(
+            compile_str(yaml, OsTarget::Alinux).unwrap_err(),
+            OsAdapterError::DuplicateRule {
+                ref pattern,
+                target: "alinux",
+            } if pattern == "nginx"
+        ));
+        assert!(matches!(
+            compile_str(yaml, OsTarget::Ubuntu).unwrap_err(),
+            OsAdapterError::DuplicateRule {
+                ref pattern,
+                target: "ubuntu",
+            } if pattern == "nginx"
+        ));
+    }
+
+    #[test]
+    fn identity_rule_conflicts_with_eligible_substitution_in_either_order() {
+        let identity_first = "- ubuntu: nginx\n  alinux: nginx\n  direction: bidirectional\n  auto_apply: always\n- ubuntu: nginx\n  alinux: openresty\n  direction: ubuntu_to_alinux_only\n  auto_apply: always\n";
+        assert!(matches!(
+            compile_str(identity_first, OsTarget::Alinux).unwrap_err(),
+            OsAdapterError::AmbiguousRule {
+                ref pattern,
+                target: "alinux",
+                ref existing,
+                ref conflicting,
+            } if pattern == "nginx" && existing == "nginx" && conflicting == "openresty"
+        ));
+
+        let substitution_first = "- ubuntu: nginx\n  alinux: openresty\n  direction: ubuntu_to_alinux_only\n  auto_apply: always\n- ubuntu: nginx\n  alinux: nginx\n  direction: bidirectional\n  auto_apply: always\n";
+        assert!(matches!(
+            compile_str(substitution_first, OsTarget::Alinux).unwrap_err(),
+            OsAdapterError::AmbiguousRule {
+                ref pattern,
+                target: "alinux",
+                ref existing,
+                ref conflicting,
+            } if pattern == "nginx" && existing == "openresty" && conflicting == "nginx"
+        ));
+    }
+
+    #[test]
+    fn unresolved_reverse_ambiguity_with_identity_canonical_is_rejected() {
+        let ambiguous_yaml = r#"
+- ubuntu: "php-fpm"
+  alinux: "php-fpm"
+  direction: bidirectional
+  auto_apply: always
+- ubuntu: "php7.4-fpm"
+  alinux: "php-fpm"
+  direction: bidirectional
+  auto_apply: always
+"#;
+        // Forward target has distinct Ubuntu sources ("php-fpm" and "php7.4-fpm").
+        let forward = compile_str(ambiguous_yaml, OsTarget::Alinux).unwrap();
+        assert_eq!(forward.rules.len(), 1);
+        assert_eq!(forward.rules[0].source, "php7.4-fpm");
+        assert_eq!(forward.rules[0].target, "php-fpm");
+
+        // Reverse target has two active bidirectional mappings for Alinux "php-fpm".
+        assert!(matches!(
+            compile_str(ambiguous_yaml, OsTarget::Ubuntu).unwrap_err(),
+            OsAdapterError::AmbiguousRule {
+                ref pattern,
+                target: "ubuntu",
+                ref existing,
+                ref conflicting,
+            } if pattern == "php-fpm" && existing == "php-fpm" && conflicting == "php7.4-fpm"
+        ));
+
+        // Scoping the alternate to ubuntu_to_alinux_only resolves the reverse conflict.
+        let resolved_yaml = r#"
+- ubuntu: "php-fpm"
+  alinux: "php-fpm"
+  direction: bidirectional
+  auto_apply: always
+- ubuntu: "php7.4-fpm"
+  alinux: "php-fpm"
+  direction: ubuntu_to_alinux_only
+  auto_apply: always
+"#;
+        let reverse = compile_str(resolved_yaml, OsTarget::Ubuntu).unwrap();
+        assert_eq!(reverse.rules.len(), 0);
+        assert_eq!(reverse.protects.len(), 1);
+        assert_eq!(reverse.protects[0].source, "php-fpm");
     }
 }

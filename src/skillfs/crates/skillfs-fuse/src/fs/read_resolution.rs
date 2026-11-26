@@ -400,26 +400,26 @@ impl SkillFs {
         category: &str,
         skill_name: &str,
     ) -> (Option<ActiveTarget>, ReadResolution) {
-        // Non-skill children of a category (a directory without `SKILL.md`,
-        // e.g. `apple/docs`) are plain passthrough — never gated by
-        // activation. Without this, an attached resolver has no entry for
-        // `category/child` and would (incorrectly) map it to `Hidden`,
-        // hiding files like `apple/docs/readme.txt`. Category-child *files*
-        // are reclassified to `CategoryPassthrough` earlier and never reach
-        // here; this guard covers the directory case (including brand-new
-        // install/staging dirs that have no `SKILL.md` yet).
-        if !self.hermes_nested_is_skill(category, skill_name) {
-            return (None, ReadResolution::Source);
-        }
-        let nested_id = Self::hermes_skill_id(category, skill_name);
         let resolver = match self.active_resolver.as_ref() {
             Some(r) => r,
             None => return (None, ReadResolution::Source),
         };
+        let nested_id = Self::hermes_skill_id(category, skill_name);
         let target = resolver.get(&nested_id);
         let resolution = match &target {
-            None => ReadResolution::Hidden,
             Some(t) => self.resolve_from_target(&nested_id, t),
+            None => {
+                // Non-skill children of a category (a directory without
+                // `SKILL.md`, e.g. `apple/docs`) are plain passthrough — never
+                // gated by activation. Apply this guard only when the resolver
+                // has no explicit entry for `category/skill`, so deleting or
+                // replacing a live `SKILL.md` (e.g. with a symlink) cannot
+                // bypass an explicit `Hidden` or `Snapshot` target.
+                if !self.hermes_nested_is_skill(category, skill_name) {
+                    return (None, ReadResolution::Source);
+                }
+                ReadResolution::Hidden
+            }
         };
         (target, resolution)
     }
@@ -438,9 +438,6 @@ impl SkillFs {
         pinned: Option<&ActiveTarget>,
     ) -> Option<String> {
         let resolution = match pinned {
-            // Non-skill category children (e.g. `apple/docs`) are plain
-            // passthrough and never gated; keep them on the source path.
-            Some(_) if !self.hermes_nested_is_skill(category, skill_name) => ReadResolution::Source,
             Some(target) => {
                 let nested_id = Self::hermes_skill_id(category, skill_name);
                 self.resolve_from_target(&nested_id, target)
@@ -1217,5 +1214,195 @@ mod tests {
         );
         let err = std::fs::metadata(dir.join("SKILL.md")).expect_err("lookup refuses it");
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    /// Explicit `Hidden` and `Snapshot` activation targets for Hermes nested
+    /// skills must stay enforced even when the live `SKILL.md` is deleted or
+    /// replaced with a symlink. Untracked non-skill category subdirectories
+    /// (e.g. `cat/docs`) still pass through as `Source`, and untracked nested
+    /// skills with a regular `SKILL.md` still default to `Hidden`.
+    #[test]
+    fn hermes_nested_explicit_hidden_and_snapshot_survive_missing_or_symlinked_live_skill_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        let poison = outside.path().join("poison.md");
+        let poison_body = "# Poisoned live symlink target\n";
+        let trusted_body = "# Trusted v1\n";
+        std::fs::write(&poison, poison_body).unwrap();
+
+        // Hidden nested skill whose live SKILL.md was removed (passthrough remains).
+        std::fs::create_dir_all(src.join("cat/hidden-deleted")).unwrap();
+        std::fs::write(src.join("cat/hidden-deleted/helper.sh"), "echo secret\n").unwrap();
+
+        // Hidden nested skill whose live SKILL.md was replaced with a symlink.
+        std::fs::create_dir_all(src.join("cat/hidden-symlink")).unwrap();
+        std::os::unix::fs::symlink(&poison, src.join("cat/hidden-symlink/SKILL.md")).unwrap();
+
+        // Snapshot nested skill whose live SKILL.md was removed.
+        let snap_deleted_dir = src.join("cat/snap-deleted/.skill-meta/versions/v1");
+        std::fs::create_dir_all(&snap_deleted_dir).unwrap();
+        std::fs::write(snap_deleted_dir.join("SKILL.md"), trusted_body).unwrap();
+
+        // Snapshot nested skill whose live SKILL.md was replaced with a symlink.
+        let snap_symlink_dir = src.join("cat/snap-symlink/.skill-meta/versions/v1");
+        std::fs::create_dir_all(&snap_symlink_dir).unwrap();
+        std::fs::write(snap_symlink_dir.join("SKILL.md"), trusted_body).unwrap();
+        std::os::unix::fs::symlink(&poison, src.join("cat/snap-symlink/SKILL.md")).unwrap();
+
+        // Control 1: plain non-skill category directory (untracked, no SKILL.md).
+        std::fs::create_dir_all(src.join("cat/docs")).unwrap();
+        std::fs::write(src.join("cat/docs/readme.txt"), "notes\n").unwrap();
+
+        // Control 2: untracked nested skill with a regular SKILL.md.
+        std::fs::create_dir_all(src.join("cat/uncertified")).unwrap();
+        std::fs::write(src.join("cat/uncertified/SKILL.md"), "# Untracked\n").unwrap();
+
+        let resolver = ActiveSkillResolver::new(src.to_path_buf());
+        resolver.set(
+            "cat/hidden-deleted",
+            ActiveTarget::Hidden {
+                reason: "quarantined".to_string(),
+            },
+        );
+        resolver.set(
+            "cat/hidden-symlink",
+            ActiveTarget::Hidden {
+                reason: "quarantined".to_string(),
+            },
+        );
+        resolver.set(
+            "cat/snap-deleted",
+            ActiveTarget::Snapshot {
+                snapshot_dir: snap_deleted_dir.clone(),
+                version: "v1".to_string(),
+            },
+        );
+        resolver.set(
+            "cat/snap-symlink",
+            ActiveTarget::Snapshot {
+                snapshot_dir: snap_symlink_dir.clone(),
+                version: "v1".to_string(),
+            },
+        );
+
+        let fs = skillfs_with_resolver(src, resolver);
+
+        for name in ["hidden-deleted", "hidden-symlink"] {
+            let (target, res) = fs.resolve_hermes_nested_read_pinned("cat", name);
+            assert!(
+                matches!(target, Some(ActiveTarget::Hidden { .. })),
+                "{name} must keep its pinned Hidden target, got {target:?}"
+            );
+            assert_eq!(tag(&res), "hidden", "{name} must resolve to Hidden");
+            assert!(
+                fs.hermes_nested_skill_read_dir("cat", name).is_none(),
+                "{name} must not expose a physical read dir"
+            );
+            assert!(
+                fs.transformed_skill_attr(name, Some("cat")).is_none(),
+                "{name} must not return attrs for SKILL.md"
+            );
+            assert!(
+                fs.compiled_hermes_nested_skill_md_pinned("cat", name, None)
+                    .is_none(),
+                "{name} must not compile SKILL.md"
+            );
+        }
+
+        for (name, expected_dir) in [
+            ("snap-deleted", &snap_deleted_dir),
+            ("snap-symlink", &snap_symlink_dir),
+        ] {
+            let (target, res) = fs.resolve_hermes_nested_read_pinned("cat", name);
+            assert!(
+                matches!(target, Some(ActiveTarget::Snapshot { .. })),
+                "{name} must keep its pinned Snapshot target, got {target:?}"
+            );
+            assert_eq!(tag(&res), "snapshot", "{name} must resolve to Snapshot");
+            assert_eq!(
+                fs.hermes_nested_skill_read_dir("cat", name).as_deref(),
+                Some(expected_dir.as_path()),
+                "{name} must serve its snapshot dir"
+            );
+            let attr = fs
+                .transformed_skill_attr(name, Some("cat"))
+                .expect("snapshot SKILL.md attrs must stay readable");
+            assert_eq!(attr.size, trusted_body.len() as u64);
+            assert_eq!(
+                fs.compiled_hermes_nested_skill_md_pinned("cat", name, None)
+                    .as_deref(),
+                Some(trusted_body),
+                "{name} must serve trusted snapshot SKILL.md content"
+            );
+        }
+
+        // Controls: untracked non-skill subdir stays Source; untracked real skill stays Hidden.
+        let (docs_target, docs_res) = fs.resolve_hermes_nested_read_pinned("cat", "docs");
+        assert!(docs_target.is_none());
+        assert_eq!(tag(&docs_res), "source");
+        assert_eq!(
+            fs.hermes_nested_skill_read_dir("cat", "docs").as_deref(),
+            Some(src.join("cat/docs").as_path())
+        );
+
+        let (uncert_target, uncert_res) =
+            fs.resolve_hermes_nested_read_pinned("cat", "uncertified");
+        assert!(uncert_target.is_none());
+        assert_eq!(tag(&uncert_res), "hidden");
+        assert!(
+            fs.hermes_nested_skill_read_dir("cat", "uncertified")
+                .is_none()
+        );
+    }
+
+    /// A handle that already pinned a Hermes nested `Snapshot` or `Hidden`
+    /// target must honor that pinned target even if the live `SKILL.md` is
+    /// subsequently deleted or replaced with a symlink.
+    #[test]
+    fn compiled_hermes_nested_skill_md_pinned_honors_pinned_target_when_live_skill_md_mutates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        let trusted_body = "# Trusted pinned snapshot\n";
+        let poison = outside.path().join("poison.md");
+        std::fs::write(&poison, "# Poisoned symlink\n").unwrap();
+
+        let snap_dir = src.join("cloud/deploy/.skill-meta/versions/v1");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(snap_dir.join("SKILL.md"), trusted_body).unwrap();
+
+        let resolver = ActiveSkillResolver::new(src.to_path_buf());
+        let fs = skillfs_with_resolver(src, resolver);
+
+        let pinned_snapshot = ActiveTarget::Snapshot {
+            snapshot_dir: snap_dir,
+            version: "v1".to_string(),
+        };
+        let pinned_hidden = ActiveTarget::Hidden {
+            reason: "quarantined".to_string(),
+        };
+
+        // Case 1: live SKILL.md is absent.
+        assert_eq!(
+            fs.compiled_hermes_nested_skill_md_pinned("cloud", "deploy", Some(&pinned_snapshot))
+                .as_deref(),
+            Some(trusted_body),
+            "pinned Snapshot handle must stay on snapshot when live SKILL.md is deleted"
+        );
+
+        // Case 2: live SKILL.md is replaced with a symlink to outside content.
+        std::os::unix::fs::symlink(&poison, src.join("cloud/deploy/SKILL.md")).unwrap();
+        assert_eq!(
+            fs.compiled_hermes_nested_skill_md_pinned("cloud", "deploy", Some(&pinned_snapshot))
+                .as_deref(),
+            Some(trusted_body),
+            "pinned Snapshot handle must not switch to symlinked live SKILL.md"
+        );
+        assert!(
+            fs.compiled_hermes_nested_skill_md_pinned("cloud", "deploy", Some(&pinned_hidden))
+                .is_none(),
+            "pinned Hidden handle must not bypass to symlinked live SKILL.md"
+        );
     }
 }

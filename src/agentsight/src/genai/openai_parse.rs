@@ -8,10 +8,10 @@
 
 use super::GenAIBuilder;
 use super::semantic::{InputMessage, LLMRequest, MessagePart, OutputMessage};
+use crate::analyzer::message::ResponsesToolCalls;
 use crate::analyzer::message::types::OpenAIChatMessage;
-use crate::analyzer::message::{ResponsesReasoningReplay, ResponsesToolCalls};
 use crate::analyzer::{HttpRecord, ParsedApiMessage};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Upper bound on tool-call slots reconstructed from one response.
 ///
@@ -35,6 +35,263 @@ fn accumulate_text(buf: &mut String, next: &str) {
         *buf = next.to_string();
     } else {
         buf.push_str(next);
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum ResponseItemSlot {
+    Indexed(u64),
+    Unindexed(u64),
+}
+
+#[derive(Default)]
+struct ResponsePartBuf {
+    delta: String,
+    closing: Option<(String, bool)>,
+    saw_delta: bool,
+}
+
+impl ResponsePartBuf {
+    fn push_delta(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.saw_delta = true;
+            self.delta.push_str(text);
+        }
+    }
+
+    fn set_closing(&mut self, text: &str, terminal: bool) {
+        if self.saw_delta || text.is_empty() {
+            return;
+        }
+        if !terminal || self.closing.is_none() {
+            self.closing = Some((text.to_owned(), terminal));
+        }
+    }
+
+    fn merge_from(&mut self, mut older: Self) {
+        if older.saw_delta {
+            if self.saw_delta {
+                older.delta.push_str(&self.delta);
+                self.delta = older.delta;
+            } else {
+                self.delta = older.delta;
+                self.saw_delta = true;
+            }
+        }
+        if !self.saw_delta && self.closing.is_none() {
+            self.closing = older.closing;
+        }
+    }
+}
+
+/// Item- and part-ordered accumulator for OpenAI Responses text, refusal, and
+/// reasoning channels. Uses tree/hash maps keyed by wire identity so sparse
+/// indices never size allocations, deltas supersede closing copies per
+/// `(item, part)`, and mid-stream terminal recoveries stay in `output_index`
+/// order.
+struct ResponsesChannel<K: Ord> {
+    items: BTreeMap<ResponseItemSlot, BTreeMap<K, ResponsePartBuf>>,
+    id_to_slot: HashMap<String, ResponseItemSlot>,
+    anon_delta: String,
+    pending_anon_parts: BTreeMap<K, ResponsePartBuf>,
+    anon_closing_items: Vec<BTreeMap<K, ResponsePartBuf>>,
+    next_unindexed: u64,
+    saw_any_delta: bool,
+    saw_anon_delta: bool,
+}
+
+impl<K: Ord> ResponsesChannel<K> {
+    fn new() -> Self {
+        Self {
+            items: BTreeMap::new(),
+            id_to_slot: HashMap::new(),
+            anon_delta: String::new(),
+            pending_anon_parts: BTreeMap::new(),
+            anon_closing_items: Vec::new(),
+            next_unindexed: 0,
+            saw_any_delta: false,
+            saw_anon_delta: false,
+        }
+    }
+
+    fn alloc_unindexed(&mut self) -> ResponseItemSlot {
+        let slot = ResponseItemSlot::Unindexed(self.next_unindexed);
+        self.next_unindexed = self.next_unindexed.saturating_add(1);
+        slot
+    }
+
+    fn link_identity(
+        &mut self,
+        item_id: Option<&str>,
+        output_index: Option<u64>,
+    ) -> Option<ResponseItemSlot> {
+        let item_id = item_id.filter(|s| !s.is_empty());
+        match (item_id, output_index) {
+            (Some(id), Some(idx)) => {
+                let target = ResponseItemSlot::Indexed(idx);
+                match self.id_to_slot.get(id).copied() {
+                    Some(ResponseItemSlot::Indexed(prev)) if prev != idx => return None,
+                    Some(old @ ResponseItemSlot::Unindexed(_)) => {
+                        if let Some(old_parts) = self.items.remove(&old) {
+                            let dst = self.items.entry(target).or_default();
+                            for (key, part) in old_parts {
+                                dst.entry(key).or_default().merge_from(part);
+                            }
+                        }
+                        self.id_to_slot.insert(id.to_owned(), target);
+                    }
+                    None => {
+                        self.id_to_slot.insert(id.to_owned(), target);
+                    }
+                    Some(_) => {}
+                }
+                Some(target)
+            }
+            (Some(id), None) => {
+                if let Some(&slot) = self.id_to_slot.get(id) {
+                    Some(slot)
+                } else {
+                    let slot = self.alloc_unindexed();
+                    self.id_to_slot.insert(id.to_owned(), slot);
+                    Some(slot)
+                }
+            }
+            (None, Some(idx)) => Some(ResponseItemSlot::Indexed(idx)),
+            (None, None) => None,
+        }
+    }
+
+    fn observe_delta(
+        &mut self,
+        item_id: Option<&str>,
+        output_index: Option<u64>,
+        key: K,
+        delta: &str,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+        self.saw_any_delta = true;
+        if let Some(slot) = self.link_identity(item_id, output_index) {
+            self.items
+                .entry(slot)
+                .or_default()
+                .entry(key)
+                .or_default()
+                .push_delta(delta);
+        } else {
+            self.saw_anon_delta = true;
+            self.anon_delta.push_str(delta);
+        }
+    }
+
+    fn observe_part_done(
+        &mut self,
+        item_id: Option<&str>,
+        output_index: Option<u64>,
+        key: K,
+        text: &str,
+    ) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if let Some(slot) = self.link_identity(item_id, output_index) {
+            self.items
+                .entry(slot)
+                .or_default()
+                .entry(key)
+                .or_default()
+                .set_closing(text, false);
+        } else {
+            self.pending_anon_parts
+                .entry(key)
+                .or_default()
+                .set_closing(text, false);
+        }
+        true
+    }
+
+    fn observe_item_parts<'a>(
+        &mut self,
+        item_id: Option<&str>,
+        output_index: Option<u64>,
+        parts: impl IntoIterator<Item = (K, &'a str)>,
+        terminal: bool,
+    ) -> bool {
+        let non_empty: Vec<(K, &'a str)> =
+            parts.into_iter().filter(|(_, t)| !t.is_empty()).collect();
+        if non_empty.is_empty() {
+            return false;
+        }
+        if let Some(slot) = self.link_identity(item_id, output_index) {
+            let dst = self.items.entry(slot).or_default();
+            for (key, text) in non_empty {
+                dst.entry(key).or_default().set_closing(text, terminal);
+            }
+        } else {
+            let mut item_map = std::mem::take(&mut self.pending_anon_parts);
+            for (key, text) in non_empty {
+                item_map.entry(key).or_default().set_closing(text, terminal);
+            }
+            self.anon_closing_items.push(item_map);
+        }
+        true
+    }
+
+    fn finish(mut self) -> String {
+        let mut out = String::new();
+        if self.saw_anon_delta {
+            for parts in self.items.into_values() {
+                for part in parts.into_values() {
+                    if part.saw_delta {
+                        out.push_str(&part.delta);
+                    }
+                }
+            }
+            out.push_str(&self.anon_delta);
+            return out;
+        }
+
+        if !self.pending_anon_parts.is_empty() {
+            self.anon_closing_items.push(self.pending_anon_parts);
+        }
+        let linked_indexed: HashSet<ResponseItemSlot> = self.id_to_slot.values().copied().collect();
+        let has_unlinked_id_delta = self.items.iter().any(|(slot, parts)| {
+            matches!(slot, ResponseItemSlot::Unindexed(_)) && parts.values().any(|p| p.saw_delta)
+        });
+        let has_unlinked_index_delta = self.items.iter().any(|(slot, parts)| {
+            matches!(slot, ResponseItemSlot::Indexed(_))
+                && !linked_indexed.contains(slot)
+                && parts.values().any(|p| p.saw_delta)
+        });
+        let suppress_terminal = !self.anon_closing_items.is_empty();
+
+        for (slot, parts) in self.items {
+            let unlinked_index =
+                matches!(slot, ResponseItemSlot::Indexed(_)) && !linked_indexed.contains(&slot);
+            let unlinked_id = matches!(slot, ResponseItemSlot::Unindexed(_));
+            for part in parts.into_values() {
+                if part.saw_delta {
+                    out.push_str(&part.delta);
+                } else if let Some((closing, from_terminal)) = part.closing
+                    && !(from_terminal && suppress_terminal)
+                    && !(unlinked_index && has_unlinked_id_delta)
+                    && !(unlinked_id && has_unlinked_index_delta)
+                {
+                    out.push_str(&closing);
+                }
+            }
+        }
+        if !self.saw_any_delta {
+            for item_map in self.anon_closing_items {
+                for part in item_map.into_values() {
+                    if let Some((closing, _)) = part.closing {
+                        out.push_str(&closing);
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1260,81 +1517,107 @@ impl GenAIBuilder {
         Some((parts, finish_reason))
     }
 
-    /// Answer text of a finished `message` output item, or `None`.
-    ///
-    /// Mirrors `OpenAIParser::closing_message_item_text`: reasoning items
-    /// carry thinking rather than the answer and are skipped, and every
-    /// `text` part of a message item is concatenated in order.
-    fn closing_message_item_text(chunk: &serde_json::Value) -> Option<String> {
-        let item = chunk.get("item")?;
+    /// Record text and refusal parts carried by a finished `message` item.
+    fn observe_closing_message_item(
+        item: &serde_json::Value,
+        output_index: Option<u64>,
+        text_channel: &mut ResponsesChannel<u64>,
+        refusal_channel: &mut ResponsesChannel<u64>,
+        terminal: bool,
+    ) -> bool {
         if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
-            return None;
+            return false;
         }
-        let parts = item.get("content")?.as_array()?;
-        let text: String = parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
-            .collect();
-        (!text.is_empty()).then_some(text)
+        let Some(parts) = item.get("content").and_then(|c| c.as_array()) else {
+            return false;
+        };
+        let item_id = item.get("id").and_then(|v| v.as_str());
+        let saw_text = text_channel.observe_item_parts(
+            item_id,
+            output_index,
+            parts.iter().enumerate().filter_map(|(pos, part)| {
+                part.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|text| (pos as u64, text))
+            }),
+            terminal,
+        );
+        let saw_refusal = refusal_channel.observe_item_parts(
+            item_id,
+            output_index,
+            parts
+                .iter()
+                .enumerate()
+                .filter(|(_, part)| part.get("type").and_then(|t| t.as_str()) == Some("refusal"))
+                .filter_map(|(pos, part)| {
+                    part.get("refusal")
+                        .and_then(|r| r.as_str())
+                        .map(|refusal| (pos as u64, refusal))
+                }),
+            terminal,
+        );
+        saw_text || saw_refusal
     }
 
-    /// Refusal text of a finished `message` output item, or `None`.
-    ///
-    /// The answer a model declines to give is its own content part, typed
-    /// `refusal` and carrying the text in `refusal` rather than `text` — the
-    /// shape the non-streaming normalizer and the token extractor's
-    /// `read_output_item` read. A capture that attached after the refusal
-    /// deltas has this part as its only copy of the answer, so it is read
-    /// here as well; the deltas win over it, as they do for text.
-    fn closing_message_item_refusal(chunk: &serde_json::Value) -> Option<String> {
-        let item = chunk.get("item")?;
-        if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
-            return None;
+    /// Record thinking and summary parts carried by a finished `reasoning` item.
+    fn observe_closing_reasoning_item(
+        item: &serde_json::Value,
+        output_index: Option<u64>,
+        reasoning_channel: &mut ResponsesChannel<(bool, u64)>,
+        terminal: bool,
+    ) -> bool {
+        if item.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
+            return false;
         }
-        let parts = item.get("content")?.as_array()?;
-        let refusal: String = parts
-            .iter()
-            .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("refusal"))
-            .filter_map(|part| part.get("refusal").and_then(|r| r.as_str()))
-            .collect();
-        (!refusal.is_empty()).then_some(refusal)
+        let item_id = item.get("id").and_then(|v| v.as_str());
+        let mut collected = Vec::new();
+        for (field, summary) in [("content", false), ("summary", true)] {
+            if let Some(parts) = item.get(field).and_then(|c| c.as_array()) {
+                for (pos, part) in parts.iter().enumerate() {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        collected.push(((summary, pos as u64), text));
+                    }
+                }
+            }
+        }
+        reasoning_channel.observe_item_parts(item_id, output_index, collected, terminal)
     }
 
     /// Recover the complete output carried by a terminal Responses event.
     ///
     /// `response.completed` and `response.incomplete` carry the whole final
-    /// Response object, including `output[]`. A drained capture that attached
-    /// after the deltas has no other copy of the answer or of a tool call, so
-    /// read the same fields the per-event arms read. Deltas still win over
-    /// repeated text, and `ResponsesToolCalls::observe` merges a terminal item
-    /// into a call the delta path already registered.
+    /// Response object, including `output[]`. Every `message`, `reasoning`, and
+    /// tool-call item is recovered in `output_index` order without overwriting
+    /// earlier items or duplicating parts already streamed as deltas.
     fn observe_terminal_output(
         resp: &serde_json::Value,
         calls: &mut ResponsesToolCalls,
-        saw_text_delta: bool,
-        saw_refusal_delta: bool,
-        closing_text: &mut Option<String>,
-        closing_refusal: &mut Option<String>,
+        text_channel: &mut ResponsesChannel<u64>,
+        refusal_channel: &mut ResponsesChannel<u64>,
+        reasoning_channel: &mut ResponsesChannel<(bool, u64)>,
     ) {
         let Some(output) = resp.get("output").and_then(|o| o.as_array()) else {
             return;
         };
         for (index, item) in output.iter().enumerate() {
+            let output_index = Some(index as u64);
             match item.get("type").and_then(|t| t.as_str()) {
                 Some("message") => {
-                    let chunk = serde_json::json!({ "item": item });
-                    if !saw_text_delta
-                        && closing_text.is_none()
-                        && let Some(text) = Self::closing_message_item_text(&chunk)
-                    {
-                        *closing_text = Some(text);
-                    }
-                    if !saw_refusal_delta
-                        && closing_refusal.is_none()
-                        && let Some(refusal) = Self::closing_message_item_refusal(&chunk)
-                    {
-                        *closing_refusal = Some(refusal);
-                    }
+                    Self::observe_closing_message_item(
+                        item,
+                        output_index,
+                        text_channel,
+                        refusal_channel,
+                        true,
+                    );
+                }
+                Some("reasoning") => {
+                    Self::observe_closing_reasoning_item(
+                        item,
+                        output_index,
+                        reasoning_channel,
+                        true,
+                    );
                 }
                 Some("function_call" | "custom_tool_call" | "local_shell_call") => {
                     let event = serde_json::json!({
@@ -1374,21 +1657,9 @@ impl GenAIBuilder {
     pub(super) fn merge_responses_sse_chunks(
         chunks: &[serde_json::Value],
     ) -> Option<(Vec<MessagePart>, Option<String>)> {
-        let mut text_buf = String::new();
-        // Whether a non-empty text delta arrived. Closing events repeat the
-        // deltas, so they are read only when this stays false — the same
-        // delta-wins rule as `aggregate_responses_sse_chunks`.
-        let mut saw_text_delta = false;
-        // Answer text carried by a closing event, kept aside until the whole
-        // stream is read: a delta captured later supersedes it.
-        let mut closing_text: Option<String> = None;
-        let reasoning_replay = ResponsesReasoningReplay::new(chunks);
-        let mut reasoning_buf = String::new();
-        // Whether a non-empty refusal delta arrived, and the refusal a closing
-        // message item carries, on the same delta-wins rule as the text above.
-        let mut saw_refusal_delta = false;
-        let mut closing_refusal: Option<String> = None;
-        let mut refusal_buf = String::new();
+        let mut text_channel = ResponsesChannel::<u64>::new();
+        let mut refusal_channel = ResponsesChannel::<u64>::new();
+        let mut reasoning_channel = ResponsesChannel::<(bool, u64)>::new();
         let mut calls = ResponsesToolCalls::default();
         let mut saw_responses_event = false;
         // Done payloads the item router cannot attribute: the router matches a
@@ -1399,9 +1670,8 @@ impl GenAIBuilder {
         // it against the last added function_call (the router's current call)
         // and re-attach it below.
         let mut last_added: Option<(String, String)> = None;
-        let mut added_item_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut added_indexes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut added_item_ids: HashSet<String> = HashSet::new();
+        let mut added_indexes: HashSet<u64> = HashSet::new();
         let mut orphan_done: Vec<(String, String, String)> = Vec::new();
         // Set by the terminal `response.incomplete` event when the stream was
         // cut by the output cap or the safety filter, mirroring
@@ -1414,39 +1684,55 @@ impl GenAIBuilder {
         for chunk in chunks {
             calls.observe(chunk);
             let event_type = chunk.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let item_id = chunk.get("item_id").and_then(|v| v.as_str());
+            let output_index = chunk.get("output_index").and_then(|v| v.as_u64());
+            let content_index = chunk
+                .get("content_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             match event_type {
                 "response.output_text.delta" => {
                     saw_responses_event = true;
                     if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
-                        if !delta.is_empty() {
-                            saw_text_delta = true;
-                        }
-                        text_buf.push_str(delta);
+                        text_channel.observe_delta(item_id, output_index, content_index, delta);
                     }
                 }
-                // The closing event carries the finalized answer and repeats
-                // what the deltas delivered, so it is read only when no
-                // non-empty delta was captured: a capture that attached after
-                // the deltas has this event as its only copy of the text.
                 "response.output_text.done" => {
-                    if !saw_text_delta
-                        && let Some(text) = chunk
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .filter(|text| !text.is_empty())
+                    if let Some(text) = chunk.get("text").and_then(|t| t.as_str())
+                        && text_channel.observe_part_done(
+                            item_id,
+                            output_index,
+                            content_index,
+                            text,
+                        )
                     {
-                        closing_text = Some(text.to_string());
                         saw_responses_event = true;
                     }
                 }
-                // Reasoning models stream their thinking as text deltas on the
-                // same event channel (qwen3-coder via dashscope sends
-                // reasoning_text, the o-series summary_text); both become a
-                // `Reasoning` part like the live parser's reasoning_content.
-                "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                "response.reasoning_text.delta" => {
                     saw_responses_event = true;
                     if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
-                        reasoning_buf.push_str(delta);
+                        reasoning_channel.observe_delta(
+                            item_id,
+                            output_index,
+                            (false, content_index),
+                            delta,
+                        );
+                    }
+                }
+                "response.reasoning_summary_text.delta" => {
+                    saw_responses_event = true;
+                    let summary_index = chunk
+                        .get("summary_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
+                        reasoning_channel.observe_delta(
+                            item_id,
+                            output_index,
+                            (true, summary_index),
+                            delta,
+                        );
                     }
                 }
                 "response.created" => {
@@ -1459,101 +1745,91 @@ impl GenAIBuilder {
                         Self::observe_terminal_output(
                             resp,
                             &mut calls,
-                            saw_text_delta,
-                            saw_refusal_delta,
-                            &mut closing_text,
-                            &mut closing_refusal,
+                            &mut text_channel,
+                            &mut refusal_channel,
+                            &mut reasoning_channel,
                         );
                     }
                 }
                 "response.output_item.added" => {
                     saw_responses_event = true;
                     let item = chunk.get("item");
-                    if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
-                        == Some("function_call")
-                    {
-                        if let Some(id) = item.and_then(|i| i.get("id")).and_then(|v| v.as_str()) {
-                            added_item_ids.insert(id.to_string());
+                    let added_id = item.and_then(|i| i.get("id")).and_then(|v| v.as_str());
+                    match item.and_then(|i| i.get("type")).and_then(|t| t.as_str()) {
+                        Some("message") => {
+                            text_channel.link_identity(added_id, output_index);
+                            refusal_channel.link_identity(added_id, output_index);
                         }
-                        if let Some(index) = chunk.get("output_index").and_then(|v| v.as_u64()) {
-                            added_indexes.insert(index);
+                        Some("reasoning") => {
+                            reasoning_channel.link_identity(added_id, output_index);
                         }
-                        last_added = Some((
-                            item.and_then(|i| i.get("call_id"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            item.and_then(|i| i.get("name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        ));
+                        Some("function_call") => {
+                            if let Some(id) = added_id {
+                                added_item_ids.insert(id.to_string());
+                            }
+                            if let Some(index) = output_index {
+                                added_indexes.insert(index);
+                            }
+                            last_added = Some((
+                                item.and_then(|i| i.get("call_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                item.and_then(|i| i.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            ));
+                        }
+                        _ => {}
                     }
                 }
                 "response.refusal.delta" => {
                     saw_responses_event = true;
                     if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
-                        if !delta.is_empty() {
-                            saw_refusal_delta = true;
-                        }
-                        refusal_buf.push_str(delta);
+                        refusal_channel.observe_delta(item_id, output_index, content_index, delta);
                     }
                 }
                 "response.refusal.done" => {
-                    // The done event carries the finalized text; the deltas
-                    // may be missing when capture started mid-stream.
                     saw_responses_event = true;
                     if let Some(refusal) = chunk.get("refusal").and_then(|r| r.as_str()) {
-                        refusal_buf.clear();
-                        refusal_buf.push_str(refusal);
+                        refusal_channel.observe_part_done(
+                            item_id,
+                            output_index,
+                            content_index,
+                            refusal,
+                        );
                     }
                 }
                 "response.output_item.done" => {
-                    // A capture that started mid-stream may open with a done
-                    // item instead of an added one; the item router recovers
-                    // the complete call from it, so any call-shaped done item
-                    // proves this is a Responses stream with recoverable
-                    // content. A custom tool call or a Codex local shell call
-                    // is the same evidence as a function_call.
-                    if matches!(
-                        chunk
-                            .get("item")
-                            .and_then(|i| i.get("type"))
-                            .and_then(|t| t.as_str()),
-                        Some("function_call" | "custom_tool_call" | "local_shell_call")
-                    ) {
-                        saw_responses_event = true;
-                    }
-                    // A finished `message` item carries the whole answer in
-                    // its `content[]` parts and is the only copy when capture
-                    // attached after the deltas were emitted. Same delta-wins
-                    // rule as `response.output_text.done` above.
-                    if !saw_text_delta && let Some(text) = Self::closing_message_item_text(chunk) {
-                        closing_text = Some(text);
-                        saw_responses_event = true;
-                    }
-                    // A `reasoning` item carries the thinking the deltas
-                    // streamed; a capture that attached after them has the
-                    // item as its only copy. Every item is kept, in order.
-                    if let Some(text) = reasoning_replay.closing_item_text(chunk) {
-                        reasoning_buf.push_str(&text);
-                        saw_responses_event = true;
-                    }
-                    // The answer a model declines to give rides a `refusal`
-                    // part of the same item instead of a `text` part, so it is
-                    // read separately; a capture that attached after the
-                    // refusal deltas has it as the only copy.
-                    if !saw_refusal_delta
-                        && let Some(refusal) = Self::closing_message_item_refusal(chunk)
-                    {
-                        closing_refusal = Some(refusal);
-                        saw_responses_event = true;
+                    if let Some(item) = chunk.get("item") {
+                        if matches!(
+                            item.get("type").and_then(|t| t.as_str()),
+                            Some("function_call" | "custom_tool_call" | "local_shell_call")
+                        ) {
+                            saw_responses_event = true;
+                        }
+                        if Self::observe_closing_message_item(
+                            item,
+                            output_index,
+                            &mut text_channel,
+                            &mut refusal_channel,
+                            false,
+                        ) {
+                            saw_responses_event = true;
+                        }
+                        if Self::observe_closing_reasoning_item(
+                            item,
+                            output_index,
+                            &mut reasoning_channel,
+                            false,
+                        ) {
+                            saw_responses_event = true;
+                        }
                     }
                 }
                 "response.function_call_arguments.done" => {
                     if let Some(arguments) = chunk.get("arguments").and_then(|a| a.as_str()) {
-                        let item_id = chunk.get("item_id").and_then(|v| v.as_str());
-                        let output_index = chunk.get("output_index").and_then(|v| v.as_u64());
                         let identified = item_id.is_some() || output_index.is_some();
                         let routed = (item_id.is_some_and(|id| added_item_ids.contains(id)))
                             || (output_index.is_some_and(|i| added_indexes.contains(&i)));
@@ -1568,17 +1844,6 @@ impl GenAIBuilder {
                         }
                     }
                 }
-                // A capped stream terminates with response.incomplete instead
-                // of response.completed; the cap reason must surface as the
-                // chat-completions "length" finish rather than a clean "stop",
-                // and a safety-filter cut as "content_filter" — the same
-                // reason mapping the live parser's aggregator applies.
-                //
-                // Every incomplete reason is a terminal event, including
-                // `max_messages` and `steered`: leaving `completed` false made
-                // the finish fall through to None, which the detector reports
-                // as `sse_truncated` — a transport failure — for a turn the
-                // provider ended itself.
                 "response.incomplete" => {
                     saw_responses_event = true;
                     completed = true;
@@ -1596,10 +1861,9 @@ impl GenAIBuilder {
                         Self::observe_terminal_output(
                             resp,
                             &mut calls,
-                            saw_text_delta,
-                            saw_refusal_delta,
-                            &mut closing_text,
-                            &mut closing_refusal,
+                            &mut text_channel,
+                            &mut refusal_channel,
+                            &mut reasoning_channel,
                         );
                     }
                 }
@@ -1611,14 +1875,9 @@ impl GenAIBuilder {
             return None;
         }
 
-        // Deltas win; a closing event supplies the answer only when no
-        // non-empty delta was captured.
-        if !saw_text_delta && let Some(text) = closing_text {
-            text_buf = text;
-        }
-        if !saw_refusal_delta && let Some(refusal) = closing_refusal {
-            refusal_buf = refusal;
-        }
+        let reasoning_buf = reasoning_channel.finish();
+        let text_buf = text_channel.finish();
+        let refusal_buf = refusal_channel.finish();
 
         let mut tool_parts: Vec<_> = calls
             .into_calls()
@@ -3930,5 +4189,174 @@ mod tests {
         assert!(
             matches!(&output.parts[0], MessagePart::Text { content } if content == "I can't help with that.")
         );
+    }
+
+    #[test]
+    fn test_responses_sse_multi_item_closing_events_preserve_all_messages() {
+        let by_item_done = r#"[
+            {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","content":[
+                {"type":"output_text","text":"Checking logs. "}
+            ]}},
+            {"type":"response.output_item.done","output_index":2,"item":{"id":"msg_1","type":"message","content":[
+                {"type":"output_text","text":"Found root cause."}
+            ]}},
+            {"type":"response.completed","response":{"id":"resp_multi_done","status":"completed"}}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(by_item_done)
+            .expect("multi-item closing events must yield output");
+        assert!(
+            matches!(parts.as_slice(), [MessagePart::Text { content }]
+                if content == "Checking logs. Found root cause."),
+            "got {parts:?}"
+        );
+        assert_eq!(finish.as_deref(), Some("stop"));
+
+        let by_part_done = r#"[
+            {"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":"Part A. "},
+            {"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":1,"text":"Part B."},
+            {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","content":[
+                {"type":"output_text","text":"Part A. "},
+                {"type":"output_text","text":"Part B."}
+            ]}},
+            {"type":"response.completed","response":{"id":"resp_parts_done","status":"completed"}}
+        ]"#;
+        let (parts, _) = GenAIBuilder::extract_parts_from_sse_body(by_part_done)
+            .expect("multi-part closing events must yield output");
+        assert!(
+            matches!(parts.as_slice(), [MessagePart::Text { content }]
+                if content == "Part A. Part B."),
+            "got {parts:?}"
+        );
+    }
+
+    #[test]
+    fn test_responses_sse_terminal_output_preserves_reasoning_and_multiple_messages() {
+        let body = r#"[
+            {"type":"response.created","response":{"id":"resp_term_multi","model":"gpt-5"}},
+            {"type":"response.completed","response":{
+                "id":"resp_term_multi","model":"gpt-5","status":"completed",
+                "output":[
+                    {"type":"reasoning","id":"rs_0","summary":[
+                        {"type":"summary_text","text":"Inspecting trace."}
+                    ]},
+                    {"type":"message","id":"msg_0","role":"assistant","content":[
+                        {"type":"output_text","text":"Checking logs. "}
+                    ]},
+                    {"type":"function_call","id":"fc_0","call_id":"call_0",
+                     "name":"read_file","arguments":"{\"path\":\"/var/log/app.log\"}"},
+                    {"type":"message","id":"msg_1","role":"assistant","content":[
+                        {"type":"output_text","text":"Found root cause."}
+                    ]}
+                ]
+            }}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body)
+            .expect("terminal multi-item output must yield all parts");
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [
+                    MessagePart::Reasoning { content: reasoning },
+                    MessagePart::Text { content: text },
+                    MessagePart::ToolCall { id, name, arguments },
+                ] if reasoning == "Inspecting trace."
+                    && text == "Checking logs. Found root cause."
+                    && id.as_deref() == Some("call_0")
+                    && name == "read_file"
+                    && arguments.as_ref() == Some(&serde_json::json!({"path": "/var/log/app.log"}))
+            ),
+            "got {parts:?}"
+        );
+        assert_eq!(finish.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn test_responses_sse_scopes_text_replay_to_item_and_orders_terminal_recovery() {
+        let closing_then_delta = r#"[
+            {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","content":[
+                {"type":"output_text","text":"Checking logs. "}
+            ]}},
+            {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"Found root cause."},
+            {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","content":[
+                {"type":"output_text","text":"Found root cause."}
+            ]}},
+            {"type":"response.completed","response":{"id":"resp_mixed_text","status":"completed"}}
+        ]"#;
+        let (parts, _) = GenAIBuilder::extract_parts_from_sse_body(closing_then_delta)
+            .expect("mixed closing and delta text items must yield output");
+        assert!(
+            matches!(parts.as_slice(), [MessagePart::Text { content }]
+                if content == "Checking logs. Found root cause."),
+            "got {parts:?}"
+        );
+
+        let delta_then_terminal_recovery = r#"[
+            {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"Found root cause."},
+            {"type":"response.completed","response":{
+                "id":"resp_order","status":"completed",
+                "output":[
+                    {"type":"message","id":"msg_0","role":"assistant","content":[
+                        {"type":"output_text","text":"Checking logs. "}
+                    ]},
+                    {"type":"message","id":"msg_1","role":"assistant","content":[
+                        {"type":"output_text","text":"Found root cause."}
+                    ]}
+                ]
+            }}
+        ]"#;
+        let (parts, _) = GenAIBuilder::extract_parts_from_sse_body(delta_then_terminal_recovery)
+            .expect("terminal recovery must keep output_index order");
+        assert!(
+            matches!(parts.as_slice(), [MessagePart::Text { content }]
+                if content == "Checking logs. Found root cause."),
+            "got {parts:?}"
+        );
+
+        let mixed_parts_in_one_item = r#"[
+            {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"Part A. "},
+            {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","content":[
+                {"type":"output_text","text":"Part A. "},
+                {"type":"output_text","text":"Part B."}
+            ]}},
+            {"type":"response.completed","response":{"id":"resp_part_scope","status":"completed"}}
+        ]"#;
+        let (parts, _) = GenAIBuilder::extract_parts_from_sse_body(mixed_parts_in_one_item)
+            .expect("part-scoped delta suppression must preserve unstreamed sibling parts");
+        assert!(
+            matches!(parts.as_slice(), [MessagePart::Text { content }]
+                if content == "Part A. Part B."),
+            "got {parts:?}"
+        );
+    }
+
+    #[test]
+    fn test_responses_sse_multi_item_refusal_done_preserves_earlier_refusals() {
+        let body = r#"[
+            {"type":"response.refusal.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"Cannot run X. "},
+            {"type":"response.refusal.done","item_id":"msg_0","output_index":0,"content_index":0,"refusal":"Cannot run X. "},
+            {"type":"response.refusal.done","item_id":"msg_1","output_index":1,"content_index":0,"refusal":"Cannot run Y."},
+            {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","content":[
+                {"type":"refusal","refusal":"Cannot run Y."}
+            ]}},
+            {"type":"response.completed","response":{
+                "id":"resp_refusal_multi","status":"completed",
+                "output":[
+                    {"type":"message","id":"msg_0","role":"assistant","content":[
+                        {"type":"refusal","refusal":"Cannot run X. "}
+                    ]},
+                    {"type":"message","id":"msg_1","role":"assistant","content":[
+                        {"type":"refusal","refusal":"Cannot run Y."}
+                    ]}
+                ]
+            }}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body)
+            .expect("multi-item refusals must survive without overwriting earlier items");
+        assert!(
+            matches!(parts.as_slice(), [MessagePart::Text { content }]
+                if content == "Cannot run X. Cannot run Y."),
+            "got {parts:?}"
+        );
+        assert_eq!(finish.as_deref(), Some("stop"));
     }
 }

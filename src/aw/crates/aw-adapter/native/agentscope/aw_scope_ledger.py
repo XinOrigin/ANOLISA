@@ -30,9 +30,21 @@ _atexit_registered = False
 turn_scope: ContextVar["AwTaskScope | None"] = ContextVar("aw_agentscope_turn_scope", default=None)
 
 
+def _execution_uncleaned(scope: "AwTaskScope") -> bool:
+    return scope.execution is not None and (scope.execution.entered or scope.execution.failed)
+
+
+def _needs_cleanup(scope: "AwTaskScope") -> bool:
+    return (
+        (getattr(scope, "handle", None) is not None and not scope.closed)
+        or scope.reservation is not None
+        or _execution_uncleaned(scope)
+    )
+
+
 def _drop_closed_scopes() -> None:
-    """Forget scopes that cannot hold a child binding."""
-    for scope in [s for s in _unclosed_scopes if (s.closed or s.handle is None) and s.reservation is None]:
+    """Forget scopes that no longer hold a binding, reservation, or lease."""
+    for scope in [s for s in _unclosed_scopes if not _needs_cleanup(s)]:
         _unclosed_scopes.discard(scope)
         scope.invocations.clear()
 
@@ -60,7 +72,7 @@ async def _retry_unclosed_scopes() -> None:
         if scope.pid != pid:
             _unclosed_scopes.discard(scope)
             continue
-        if (scope.handle is None or scope.closed) and scope.reservation is None:
+        if not _needs_cleanup(scope):
             _drop_closed_scopes()
             continue
         if any(not task.done() for task in scope.tasks):
@@ -68,7 +80,7 @@ async def _retry_unclosed_scopes() -> None:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             break
-        if scope.reservation is not None:
+        if scope.reservation is not None or _execution_uncleaned(scope):
             try:
                 async with asyncio.timeout(remaining):
                     await close_turn_scope(scope)
@@ -77,22 +89,14 @@ async def _retry_unclosed_scopes() -> None:
         else:
             await scope._close_binding(remaining)
     _drop_closed_scopes()
-    if any(
-        scope.pid == pid and ((scope.handle is not None and not scope.closed)
-                             or scope.reservation is not None)
-        for scope in _unclosed_scopes
-    ):
+    if any(scope.pid == pid and _needs_cleanup(scope) for scope in _unclosed_scopes):
         raise CallbackFailure("aw_scope_cleanup_failed")
 
 
 def _exit_cleanup() -> None:
-    """Close every scope that may still hold a child binding."""
+    """Close every scope that may still hold a binding, reservation, or lease."""
     for scope in list(_unclosed_scopes) + ([_task_scope] if _task_scope else []):
-        if (
-            scope is None
-            or scope.pid != os.getpid()
-            or ((scope.closed or scope.handle is None) and scope.reservation is None)
-        ):
+        if scope is None or scope.pid != os.getpid() or not _needs_cleanup(scope):
             continue
         try:
             asyncio.run(close_turn_scope(scope))
@@ -173,7 +177,7 @@ async def _close_turn_scope(scope: "AwTaskScope") -> None:
                 await scope.execution.revoke()
             await scope.release()
     finally:
-        if scope.reservation is not None:
+        if _needs_cleanup(scope):
             _unclosed_scopes.add(scope)
 
 
@@ -197,19 +201,17 @@ async def open_turn_scope(config: dict[str, Any], execution_factory=None) -> "Aw
         if interrupted is not None:
             if not opening.cancelled():
                 opening.exception()
-            cleanup = asyncio.create_task(close_turn_scope(scope))
-            await wait_owned(cleanup)
-            cleanup.result()
             raise interrupted
         opening.result()
     except BaseException:
         try:
-            if scope.reservation is not None or scope.execution is not None:
+            if _needs_cleanup(scope):
                 cleanup = asyncio.create_task(close_turn_scope(scope))
                 await wait_owned(cleanup)
-                cleanup.result()
+                if not cleanup.cancelled():
+                    cleanup.exception()
         finally:
-            if (scope.handle is not None and not scope.closed) or scope.reservation is not None:
+            if _needs_cleanup(scope):
                 _unclosed_scopes.add(scope)
         raise
     scope.owner_task = asyncio.current_task()
@@ -510,7 +512,7 @@ class AwTaskScope:
             self.closed = True
             # A confirmed close releases the pending-cleanup registration and
             # the last references to this scope's local records.
-            if self.reservation is None:
+            if not _needs_cleanup(self):
                 _unclosed_scopes.discard(self)
             self.invocations.clear()
 

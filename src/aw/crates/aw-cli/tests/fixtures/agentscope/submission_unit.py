@@ -44,6 +44,7 @@ for name, members in {
     "agentscope": {}, "agentscope.agent": {"Agent": Agent},
     "agentscope.message": {"Msg": Msg, "TextBlock": TextBlock},
     "agentscope.middleware": {"MiddlewareBase": object},
+    "agentscope.tool": {"ToolChunk": object, "ToolResponse": object},
     "agentscope.event": {name: type(name, (), {}) for name in [
         "ExternalExecutionResultEvent", "UserConfirmResultEvent", "UserInterruptEvent"]},
 }.items():
@@ -399,6 +400,91 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(self.agent.reply(self.user()), other.reply(self.user()))
         self.assertEqual({scope.calls[0][1]["session_id"] for scope in self.scopes[-2:]}, {"session", "other"})
         self.assertTrue(all(scope.closed for scope in self.scopes))
+
+    @staticmethod
+    def _lease_factory(*, wait=None, fail_exit=False, log=None, tag=""):
+        from contextlib import asynccontextmanager
+        from aw_private import PrivateExecution
+
+        @asynccontextmanager
+        async def manager():
+            if wait is not None:
+                await wait.wait()
+            if log is not None:
+                log.append(f"enter:{tag}")
+            try:
+                yield PrivateExecution({}, {}, lambda v: v, {"SECRET": "v"})
+            finally:
+                if log is not None:
+                    log.append(f"exit:{tag}")
+                if fail_exit:
+                    raise RuntimeError("revoke failed")
+        return manager
+
+    @staticmethod
+    async def _scope_ok(_scope, action, *_args):
+        if action == "open":
+            return 0, b'{"binding":"task"}', b""
+        return (0, b'{"invocations_per_binding":16}', b"") if action == "enable" else (0, b"", b"")
+
+    async def test_acquisition_timeout_preserves_error_and_fences_without_reload(self):
+        import aw_execution
+        self.addCleanup(ledger._unclosed_scopes.clear)
+        gate, calls = asyncio.Event(), []
+        with patch.object(aw_execution, "LEASE_TIMEOUT", 0.02), patch.object(AwTaskScope, "_command", self._scope_ok):
+            try:
+                with self.assertRaisesRegex(CallbackFailure, "aw_private_acquisition_timeout_restart_worker"):
+                    await ledger.open_turn_scope({"hooks": []}, self._lease_factory(wait=gate))
+                self.assertEqual(len(ledger._unclosed_scopes), 1)
+                with self.assertRaisesRegex(CallbackFailure, "aw_private_cleanup_failed_restart_worker"):
+                    await ledger.open_turn_scope({"hooks": []}, self._lease_factory(log=calls, tag="next"))
+                self.assertEqual(calls, [])
+            finally:
+                gate.set()
+                await asyncio.sleep(0.01)
+
+    async def test_failed_revocation_without_reload_fences_next_scopes(self):
+        self.addCleanup(ledger._unclosed_scopes.clear)
+        with patch.object(AwTaskScope, "_command", self._scope_ok):
+            scope = await ledger.open_turn_scope({"hooks": []}, self._lease_factory(fail_exit=True))
+            with self.assertRaisesRegex(CallbackFailure, "aw_private_cleanup_failed_restart_worker"):
+                await ledger.close_turn_scope(scope)
+            self.assertIn(scope, ledger._unclosed_scopes)
+            for reopen in (ledger.open_turn_scope, ledger._ensure_task_scope):
+                with self.assertRaisesRegex(CallbackFailure, "aw_private_cleanup_failed_restart_worker"):
+                    await reopen({"hooks": []})
+
+    async def test_retry_revokes_pending_lease_after_transient_close_failure(self):
+        self.addCleanup(ledger._unclosed_scopes.clear)
+        events, codes = [], iter([1, 0, 0])
+        async def flaky_close(scope, action, *args):
+            return (next(codes), b"", b"") if action == "close" else await self._scope_ok(scope, action, *args)
+        with patch.object(AwTaskScope, "_command", flaky_close):
+            first = await ledger.open_turn_scope({"hooks": []}, self._lease_factory(log=events, tag="1"))
+            await ledger.close_turn_scope(first)
+            self.assertEqual(events, ["enter:1"])
+            second = await ledger.open_turn_scope({"hooks": []}, self._lease_factory(log=events, tag="2"))
+            self.assertEqual(events, ["enter:1", "exit:1", "enter:2"])
+            await ledger.close_turn_scope(second)
+            self.assertEqual(events, ["enter:1", "exit:1", "enter:2", "exit:2"])
+
+    async def test_cancelled_open_preserves_cancellation_when_revoke_fails(self):
+        self.addCleanup(ledger._unclosed_scopes.clear)
+        entered, unblock = asyncio.Event(), asyncio.Event()
+        async def slow_open(scope, action, *args):
+            if action == "open":
+                entered.set()
+                await unblock.wait()
+            return await self._scope_ok(scope, action, *args)
+        with patch.object(AwTaskScope, "_command", slow_open):
+            task = asyncio.create_task(ledger.open_turn_scope({"hooks": []}, self._lease_factory(fail_exit=True)))
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            unblock.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(len(ledger._unclosed_scopes), 1)
 
 
 if __name__ == "__main__":

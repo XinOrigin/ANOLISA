@@ -454,6 +454,120 @@ describe("handlers — explicit workspace", () => {
     expect(r.text).toContain("Refused");
   });
 
+  it("checkpoint refuses explicit bare workspace ID when cwd is inside registered path", async () => {
+    promisifiedMock.mockImplementation(async (_bin: string, args: string[]) => {
+      if (args[0] === "status") {
+        return {
+          stdout: JSON.stringify({
+            workspaces: [{ ws_id: "ws-explicit", path: "/registered/ws", snapshot_count: 1 }],
+          }),
+          stderr: "",
+        };
+      }
+      return { stdout: "done", stderr: "" };
+    });
+    process.cwd = () => "/registered/ws/sub";
+    const r = await handleCheckpoint(
+      JSON.stringify({ id: "snap1", workspace: "ws-explicit" }),
+    );
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("Refused");
+    expect(r.text).toContain("/registered/ws");
+    expect(promisifiedMock).toHaveBeenCalledTimes(1);
+    expect(promisifiedMock.mock.calls[0][1]).toEqual([
+      "status", "--workspace", "ws-explicit", "--format", "json",
+    ]);
+  });
+
+  it("checkpoint resolves explicit bare workspace ID and preserves selector when cwd is outside", async () => {
+    promisifiedMock.mockImplementation(async (_bin: string, args: string[]) => {
+      if (args[0] === "status") {
+        return {
+          stdout: JSON.stringify({
+            workspaces: [{ ws_id: "ws-explicit", path: "/registered/ws", snapshot_count: 1 }],
+          }),
+          stderr: "",
+        };
+      }
+      return { stdout: "done", stderr: "" };
+    });
+    const r = await handleCheckpoint(
+      JSON.stringify({ id: "snap1", workspace: "ws-explicit" }),
+    );
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain("snap1");
+    expect(promisifiedMock).toHaveBeenCalledTimes(2);
+    expect(promisifiedMock.mock.calls[1][1].slice(0, 5)).toEqual([
+      "checkpoint", "--workspace", "ws-explicit", "--snapshot", "snap1",
+    ]);
+  });
+
+  it("checkpoint fails closed when explicit bare workspace ID cannot be resolved", async () => {
+    const err: any = new Error("status unavailable");
+    err.code = 1;
+    err.stdout = "";
+    err.stderr = "status unavailable";
+    promisifiedMock.mockRejectedValue(err);
+    const r = await handleCheckpoint(
+      JSON.stringify({ id: "snap1", workspace: "ws-missing" }),
+    );
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("Cannot resolve workspace");
+    expect(promisifiedMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("checkpoint guards manager workspace instead of stale config workspace after failed setup", async () => {
+    const manager = pluginState.manager as any;
+    manager.getWorkspacePath.mockReturnValue("/active/ws");
+    manager.createCheckpoint.mockResolvedValue({ success: true, message: "created" });
+    pluginState.resolvedConfig = { workspace: "/new/failed", autoCheckpoint: false };
+    process.cwd = () => "/active/ws/sub";
+    const r = await handleCheckpoint(JSON.stringify({ id: "snap1" }));
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("Refused");
+    expect(r.text).toContain("/active/ws");
+    expect(manager.createCheckpoint).not.toHaveBeenCalled();
+  });
+
+  it("checkpoint refuses default bare workspace ID when cwd is inside registered path", async () => {
+    const manager = pluginState.manager as any;
+    manager.getWorkspacePath.mockReturnValue("ws-default");
+    manager.createCheckpoint.mockResolvedValue({ success: true, message: "created" });
+    pluginState.resolvedConfig = { workspace: "ws-default", autoCheckpoint: false };
+    promisifiedMock.mockResolvedValue({
+      stdout: JSON.stringify({
+        workspaces: [{ ws_id: "ws-default", path: "/registered/default", snapshot_count: 1 }],
+      }),
+      stderr: "",
+    });
+    process.cwd = () => "/registered/default";
+    const r = await handleCheckpoint(JSON.stringify({ id: "snap1" }));
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("Refused");
+    expect(r.text).toContain("/registered/default");
+    expect(manager.createCheckpoint).not.toHaveBeenCalled();
+  });
+
+  it("checkpoint aborts when default workspace changes during bare-ID resolution", async () => {
+    const manager = pluginState.manager as any;
+    manager.getWorkspacePath.mockReturnValue("ws-default");
+    manager.createCheckpoint.mockResolvedValue({ success: true, message: "created" });
+    pluginState.resolvedConfig = { workspace: "ws-default", autoCheckpoint: false };
+    promisifiedMock.mockImplementation(async () => {
+      manager.getWorkspacePath.mockReturnValue("/switched/ws");
+      return {
+        stdout: JSON.stringify({
+          workspaces: [{ ws_id: "ws-default", path: "/registered/default", snapshot_count: 1 }],
+        }),
+        stderr: "",
+      };
+    });
+    const r = await handleCheckpoint(JSON.stringify({ id: "snap1" }));
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("Workspace changed");
+    expect(manager.createCheckpoint).not.toHaveBeenCalled();
+  });
+
   // --- delete success ---
   it("delete success via CommandExecutor", async () => {
     promisifiedMock.mockResolvedValue({ stdout: "deleted", stderr: "" });

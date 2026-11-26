@@ -45,16 +45,35 @@ export async function handleCheckpoint(
   }
   const message = args.message?.trim() || "manual checkpoint";
   const explicitWs = (args.workspace as string | undefined)?.trim();
+  const executor = new CommandExecutor();
+  const checkpointManager = pluginState.manager;
+  const managerWorkspace = checkpointManager.getWorkspacePath?.();
+  const targetWs = explicitWs || managerWorkspace || pluginState.resolvedConfig?.workspace;
+
+  if (targetWs) {
+    let registrationPath: string;
+    try {
+      registrationPath = await executor.resolveWorkspacePath(targetWs);
+    } catch (error) {
+      return { text: error instanceof Error ? error.message : String(error), isError: true };
+    }
+    if (!explicitWs && (pluginState.manager !== checkpointManager
+        || checkpointManager.getWorkspacePath?.() !== managerWorkspace)) {
+      return {
+        text: "Workspace changed while resolving checkpoint. Retry with the intended workspace.",
+        isError: true,
+      };
+    }
+    const cwdCheck = cwdInsideWorkspace(registrationPath);
+    if (cwdCheck.inside) {
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, registrationPath), isError: true };
+    }
+  }
 
   // Explicit workspace bypasses the manager (and its workspace-bound cache),
   // mirroring the handleDelete pattern.
   if (explicitWs) {
-    const cwdCheck = cwdInsideWorkspace(explicitWs);
-    if (cwdCheck.inside) {
-      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, explicitWs), isError: true };
-    }
     try {
-      const executor = new CommandExecutor();
       const output = await executor.checkpoint(explicitWs, id, { message });
       if (output.exitCode !== 0) {
         return { text: mapErrorToLLMMessage(output.stderr, { id }), isError: true };
@@ -70,15 +89,7 @@ export async function handleCheckpoint(
     }
   }
 
-  const ws = pluginState.resolvedConfig?.workspace;
-  if (ws) {
-    const cwdCheck = cwdInsideWorkspace(ws);
-    if (cwdCheck.inside) {
-      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, ws), isError: true };
-    }
-  }
-
-  const result = await pluginState.manager.createCheckpoint({
+  const result = await checkpointManager.createCheckpoint({
     id,
     message,
   });

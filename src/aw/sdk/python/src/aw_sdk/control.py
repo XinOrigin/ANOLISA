@@ -29,17 +29,36 @@ class Controller:
 
     async def stop(self) -> None:
         if self.stopping is None:
+            self.stopped = True
+            self.wake.set()
             self.stopping = asyncio.create_task(self.finish())
+            self.stopping.add_done_callback(lambda _: setattr(self, "finished", True))
         try:
             await asyncio.shield(self.stopping)
         finally:
             if self.stopping.done():
                 self.finished = True
 
+    async def reset(self) -> None:
+        if not self.active["was_ready"]:
+            await self.instance.detach_control()
+        self.enabled = self.active["was_enabled"]
+        self.active = None
+
     async def finish(self) -> None:
         self.stopped = True
         self.wake.set()
         await self.running
+        if self.active and not self.instance.closed:
+            try:
+                await self.reset()
+            except AwError as error:
+                if not error.unavailable and error.code != "stale_service":
+                    raise
+                self.instance.connection = self.instance.retired = self.instance.pending = None
+                self.instance.state, self.instance.last_error = "detached", None
+                self.enabled = self.active["was_enabled"]
+                self.active = None
         if self.identity and self.instance.control_key:
             try:
                 await self.call({"action": "withdraw", "key": self.instance.control_key})
@@ -89,8 +108,10 @@ class Controller:
                 instance.connection["identity"], discovery["identity"]
             ):
                 instance.lost(instance.connection)
-            self.active = None
             self.identity = discovery["identity"]
+            if self.active:
+                self.active["request_id"] = object()
+                await self.reset()
         if instance.control_key is None:
             ticks = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
             instance.control_key = {
@@ -111,10 +132,7 @@ class Controller:
         if self.stopped:
             return
         if self.active and self.active["request_id"] != (request or {}).get("request_id"):
-            if not self.active["was_ready"]:
-                await instance.detach_control()
-            self.enabled = self.active["was_enabled"]
-            self.active = None
+            await self.reset()
         if request and (
             request["state"] == "pending"
             or (
@@ -131,10 +149,7 @@ class Controller:
                 }
             await self.apply(self.active)
         elif self.active:
-            if not self.active["was_ready"]:
-                await instance.detach_control()
-            self.enabled = self.active["was_enabled"]
-            self.active = None
+            await self.reset()
         elif self.enabled:
             await instance.connect()
 

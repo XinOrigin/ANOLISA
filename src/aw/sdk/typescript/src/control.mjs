@@ -17,11 +17,35 @@ export class Controller {
     });
     return this.stopping;
   }
+  async reset() {
+    if (!this.active.wasReady) await this.instance.detachControl();
+    this.enabled = this.active.wasEnabled;
+    this.active = undefined;
+  }
   async finish() {
     this.stopped = true;
     clearTimeout(this.timer);
     this.wake?.();
     await this.running;
+    if (this.active && !this.instance.closed) {
+      try {
+        await this.reset();
+      } catch (error) {
+        if (
+          !(error instanceof AwError) ||
+          (!error.unavailable && error.code !== "stale_service")
+        )
+          throw error;
+        this.instance.connection =
+          this.instance.retired =
+          this.instance.pending =
+            undefined;
+        this.instance.state = "detached";
+        this.instance.lastError = undefined;
+        this.enabled = this.active.wasEnabled;
+        this.active = undefined;
+      }
+    }
     if (this.identity && this.instance.controlKey) {
       try {
         await this.call({ action: "withdraw", key: this.instance.controlKey });
@@ -83,8 +107,11 @@ export class Controller {
       ) {
         instance.lost(instance.connection);
       }
-      this.active = undefined;
       this.identity = discovery.identity;
+      if (this.active) {
+        this.active.request_id = Symbol();
+        await this.reset();
+      }
     }
     if (!instance.controlKey) {
       const stat = await readFile("/proc/self/stat", "utf8");
@@ -109,11 +136,8 @@ export class Controller {
     instance.applicationId = snapshot.application_id;
     const request = snapshot.request;
     if (this.stopped) return;
-    if (this.active && this.active.request_id !== request?.request_id) {
-      if (!this.active.wasReady) await instance.detachControl();
-      this.enabled = this.active.wasEnabled;
-      this.active = undefined;
-    }
+    if (this.active && this.active.request_id !== request?.request_id)
+      await this.reset();
     if (
       request?.state === "pending" ||
       (this.active?.request_id === request?.request_id &&
@@ -126,9 +150,7 @@ export class Controller {
       };
       await this.apply(this.active);
     } else if (this.active) {
-      if (!this.active.wasReady) await instance.detachControl();
-      this.enabled = this.active.wasEnabled;
-      this.active = undefined;
+      await this.reset();
     } else if (this.enabled) {
       await instance.connect();
     }

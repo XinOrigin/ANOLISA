@@ -587,5 +587,111 @@ def install_guard(*, build=None):
                 sys.path[:] = old_path
 
 
+class ResidentInputTests(unittest.IsolatedAsyncioTestCase):
+    def load_resident(self):
+        class Model:
+            def __init__(self, **v): self.__dict__.update(v)
+            def model_dump(self, mode="json"): return json.loads(json.dumps(self.__dict__, default=lambda o: o.__dict__))
+            @classmethod
+            def model_validate(cls, v): return cls(**json.loads(json.dumps(v, default=lambda o: o.__dict__)))
+            def model_copy(self, deep=False): return Model.model_validate(self.model_dump())
+        def repair(raw, schema=None):
+            data = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+            props = (schema or {}).get("properties", {}) if isinstance(schema, dict) else {}
+            for k, spec in (props.items() if isinstance(data, dict) else ()):
+                if spec.get("type") == "integer" and isinstance(data.get(k), str) and data[k].isdigit():
+                    data[k] = int(data[k])
+            return data
+        tk_mod, st = types.ModuleType("agentscope.tool._toolkit"), types.SimpleNamespace(DENIED="denied", ERROR="error", INTERRUPTED="interrupted")
+        tk_mod._json_loads_with_repair = repair
+        ev = {"ReplyEndEvent": Model, "UserConfirmResultEvent": Model, "UserInterruptEvent": Model, "ExternalExecutionResultEvent": Model}
+        specs = {"agentscope": {}, "agentscope._utils": {}, "agentscope._utils._common": {"_json_loads_with_repair": repair},
+                 "agentscope.middleware": {"MiddlewareBase": object}, "agentscope.message": {"Msg": Model, "TextBlock": Model, "ToolResultState": st},
+                 "agentscope.event": ev, "agentscope.tool": {"ToolChunk": Model, "ToolResponse": Model, "_toolkit": tk_mod}, "agentscope.tool._toolkit": tk_mod.__dict__}
+        typed = {k: (tk_mod if k == "agentscope.tool._toolkit" else types.ModuleType(k)) for k in specs}
+        for k, v in specs.items(): typed[k].__dict__.update(v)
+        self.addCleanup(patch.dict(sys.modules, typed).stop)
+        patch.dict(sys.modules, typed).start()
+        pkg, qwen_dir = "aw_qwenpaw_resident_unit", ROOT / "crates/aw-adapter/native/qwenpaw"
+        spec = importlib.util.spec_from_file_location(pkg, qwen_dir / "plugin.py", submodule_search_locations=[str(qwen_dir)])
+        sys.modules[pkg] = plugin = importlib.util.module_from_spec(spec)
+        self.addCleanup(lambda: [sys.modules.pop(k, None) for k in list(sys.modules) if k == pkg or k.startswith(pkg + ".")])
+        spec.loader.exec_module(plugin)
+        class Scope:
+            def __init__(self, cfg): self.invocation_limit, self.callbacks, self.probe, self.on_failure = 4, [], None, None
+            def check(self): self.probe and self.probe()
+            async def open(self, *a, **k): pass
+            async def validate(self): self.check()
+            async def register(self, *a): self.check()
+            async def finish(self, *a): pass
+            async def close(self): pass
+            async def invoke_native(self, hook, payload):
+                self.callbacks.append((hook["event"], hook["step"], json.loads(json.dumps(payload))))
+                return await self.handler(hook, payload)
+        scope_mod = types.ModuleType(pkg + ".aw_scope")
+        scope_mod.Scope, scope_mod.ScopeTransportFailure = Scope, type("ScopeTransportFailure", (RuntimeError,), {})
+        sys.modules[pkg + ".aw_scope"] = scope_mod
+        return (plugin, importlib.import_module(pkg + ".aw_resident"), importlib.import_module(pkg + ".aw_native"),
+                importlib.import_module(pkg + ".aw_private"), Model, tk_mod)
+
+    async def execute_call(self, resident, native, Model, tk_mod, mw, call, schema, executed, mcp_seen=None):
+        class Toolkit:
+            async def check_tool_available(self, name, groups): return types.SimpleNamespace(input_schema=schema)
+            async def call_tool(self, tc, state):
+                inv = resident.current_call.get()
+                if mcp_seen is not None: mcp_seen.append(inv.mcp_dispatch.arguments if getattr(inv, "mcp_dispatch", None) else None)
+                executed.append(tk_mod._json_loads_with_repair(tc.input, schema))
+                res = await inv.owner.hooks(inv, "tool.after", Model(state="success", content=[Model(text="ok")]))
+                inv.native_done = True
+                yield res
+        async def noop(*a, **k): pass
+        agent = types.SimpleNamespace(toolkit=Toolkit(), _reply_middlewares=[mw], _acting_middlewares=[mw], reply_stream=noop, reply=noop, close=noop,
+                                      state=types.SimpleNamespace(session_id="s", tool_context=types.SimpleNamespace(activated_groups=[])))
+        agent._acting_impl = lambda tc: agent.toolkit.call_tool(tc, agent.state)
+        native.bind_agent(agent)
+        return [x async for x in mw.on_reply(agent, {}, lambda: mw.on_acting(agent, {"tool_call": call}, lambda **kw: agent._acting_impl(kw["tool_call"])))]
+
+    async def test_updated_input_propagates_across_before_steps_and_post_denial(self):
+        plugin, resident, native, _, Model, tk_mod = self.load_resident()
+        schema = {"type": "object", "properties": {"value": {"type": "integer"}}}
+        hooks = [{"event": e, "step": s, "on_error": a, "budget_ms": 1000} for e, s, a in (("tool.before", "rewrite", "block"), ("tool.before", "gate", "block"), ("tool.after", "audit", "report"))]
+        for deny_second in (False, True):
+            with self.subTest(deny_second=deny_second):
+                executed, mw = [], resident.ResidentMiddleware({"hooks": hooks}, plugin.AwToolMiddleware, types.SimpleNamespace())
+                mw.scope.handler = lambda h, p, d=deny_second: asyncio.sleep(0, (0, b'{"aw_updated_input":{"value":"42"}}', b"") if h["step"] == "rewrite" else ((2, b"", b"") if h["step"] == "gate" and d else (0, b"", b"")))
+                out = await self.execute_call(resident, native, Model, tk_mod, mw, Model(id="c1", name="tool", input='{"value":1}'), schema, executed)
+                self.assertEqual([(e, s, json.loads(p["tool_call"]["input"])) for e, s, p in mw.scope.callbacks],
+                                 [("tool.before", "rewrite", {"value": 1}), ("tool.before", "gate", {"value": 42}), ("tool.after", "audit", {"value": 42})])
+                self.assertEqual((executed, out[-1].state), (([] if deny_second else [{"value": 42}]), ("denied" if deny_second else "success")))
+
+    async def test_updated_input_enforces_mutation_mcp_and_credential_guards(self):
+        from contextlib import asynccontextmanager
+        from dataclasses import dataclass
+        plugin, resident, native, private, Model, tk_mod = self.load_resident()
+        FakeMcp = dataclass(frozen=True)(type("FakeMcp", (), {"__annotations__": {"arguments": str}, "payload": lambda s: {"arguments": s.arguments}}))
+        @asynccontextmanager
+        async def lease_factory():
+            yield private.PrivateExecution({}, {}, lambda v: json.loads(json.dumps(v).replace("secret-token", "[redacted]")), {"SECRET": "secret-token"})
+        hooks = [{"event": "tool.before", "step": "rewrite", "on_error": "block", "budget_ms": 1000}]
+        for case in ("mutated_call", "secret_input", "mcp_sync"):
+            with self.subTest(case=case):
+                executed, mcp_seen, ctx = [], [], types.SimpleNamespace(aw_execution_factory=lease_factory, aw_environment_version=1)
+                mw, call = resident.ResidentMiddleware({"hooks": hooks}, plugin.AwToolMiddleware, ctx), Model(id="c1", name="tool", input='{"value":"clean"}')
+                async def handler(hook, payload):
+                    inv = next(iter(mw.active.values()))
+                    inv.mcp_dispatch = FakeMcp(inv.arguments)
+                    if case == "mutated_call": call.input = '{"value":"tampered"}'
+                    val = "secret-token" if case == "secret_input" else "approved"
+                    return 0, f'{{"aw_updated_input":{{"value":"{val}"}}}}'.encode(), b""
+                mw.scope.handler = handler
+                if case in ("mutated_call", "secret_input"):
+                    with self.assertRaises(resident.ResidentFailure):
+                        await self.execute_call(resident, native, Model, tk_mod, mw, call, {}, executed, mcp_seen)
+                    self.assertEqual((executed, call.input if case == "secret_input" else None), ([], '{"value": "clean"}' if case == "secret_input" else None))
+                else:
+                    await self.execute_call(resident, native, Model, tk_mod, mw, call, {}, executed, mcp_seen)
+                    self.assertEqual((executed, mcp_seen), ([{"value": "approved"}], ['{"value": "approved"}']))
+
+
 if __name__ == "__main__":
     unittest.main()

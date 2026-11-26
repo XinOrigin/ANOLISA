@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import logging
 import os
@@ -180,6 +180,33 @@ class Invocation:
         if response is not None:
             result["tool_response"] = self.owner.lease.redact(result["tool_response"])
         return result
+
+    def update_input(self, updated: Any, *, call: Any = None, tool: Any = None) -> None:
+        self.check(call)
+        if not isinstance(updated, dict):
+            self.failure = self.owner.failed = True
+            raise ResidentFailure("AW updated tool input must be a JSON object")
+        schema = getattr(tool, "input_schema", None) if tool is not None else None
+        try:
+            encoded = frozen(updated)
+            arguments = _json_loads_with_repair(encoded, schema)
+            if not isinstance(arguments, dict):
+                raise ValueError("repaired input is not a JSON object")
+            canonical = frozen(arguments)
+        except Exception as error:
+            self.failure = self.owner.failed = True
+            raise ResidentFailure("AW updated tool input is invalid") from error
+        if frozen(self.owner.lease.redact(arguments)) != canonical:
+            self.failure = self.owner.failed = True
+            raise ResidentFailure("AW credentials must stay outside authorization-bearing tool input")
+        if call is not None:
+            call.input = canonical
+        self.call.input = canonical
+        self.arguments = canonical
+        self.updated_input = arguments
+        if getattr(self, "mcp_dispatch", None) is not None:
+            self.mcp_dispatch = replace(self.mcp_dispatch, arguments=canonical)
+        self.payload("tool.before")
 
 
 class ResidentMiddleware(MiddlewareBase):
@@ -461,19 +488,25 @@ class ResidentMiddleware(MiddlewareBase):
                                    and self.selected(h, call)
                                    for h in self.config["hooks"])
 
-    async def hooks(self, invocation, event, response=None):
-        invocation.check()
+    async def hooks(self, invocation, event, response=None, *, call=None, tool=None):
+        invocation.check(call)
         hooks = [h for h in self.config["hooks"] if h["event"] == event]
         if event == "tool.after":
             hooks.reverse()
         for hook in hooks:
+            invocation.check(call)
             middleware = self.evaluate(self.config, hook)
             middleware.scope = self.scope
             replacement = await middleware._run(invocation.payload(event, response))
-            if isinstance(replacement, dict) and "aw_updated_input" in replacement:
-                invocation.updated_input = replacement["aw_updated_input"]
+            invocation.check(call)
+            if event == "tool.before" and isinstance(replacement, dict) and "aw_updated_input" in replacement:
+                invocation.update_input(replacement["aw_updated_input"], call=call, tool=tool)
                 continue
             if replacement is not None:
+                if self.lease is not None:
+                    replacement = type(replacement).model_validate(
+                        self.lease.redact(replacement.model_dump(mode="json"))
+                    )
                 if event == "tool.before":
                     return replacement
                 response = replacement
@@ -535,14 +568,9 @@ class ResidentMiddleware(MiddlewareBase):
         stream = None
         terminal = None
         try:
-            denied = await self.hooks(invocation, "tool.before")
-            updated = invocation.updated_input
-            if denied is None and updated is not None:
-                call.input = frozen(updated)
-                invocation.call.input = call.input
-                invocation.arguments = frozen(updated)
+            denied = await self.hooks(invocation, "tool.before", call=call, tool=tool)
             if denied is not None:
-                response = await self.hooks(invocation, "tool.after", denied)
+                response = await self.hooks(invocation, "tool.after", denied, call=call, tool=tool)
                 invocation.native_done = True
                 terminal = response
             else:

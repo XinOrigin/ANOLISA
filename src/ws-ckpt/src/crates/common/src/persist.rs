@@ -121,19 +121,89 @@ pub struct WorkspaceEntry {
 
 /// Load DaemonStateFile from state_dir/state.json.
 ///
-/// - File does not exist: returns `Ok(None)`
-/// - File exists but format error: returns `Err`
+/// - File is genuinely absent: returns `Ok(None)`
+/// - File (or an ancestor) is a dangling symlink, unreadable, invalid JSON, or
+///   carries an unsupported schema `version`: returns `Err`
 pub fn load_state(state_dir: &Path) -> Result<Option<DaemonStateFile>> {
     let path = state_dir.join(STATE_FILE);
     match fs::read_to_string(&path) {
         Ok(content) => {
             let state: DaemonStateFile = serde_json::from_str(&content)
                 .with_context(|| format!("Failed to parse state file: {}", path.display()))?;
+            anyhow::ensure!(
+                state.version == DAEMON_STATE_VERSION,
+                "Unsupported state file schema version {} (expected {}): {}",
+                state.version,
+                DAEMON_STATE_VERSION,
+                path.display()
+            );
             Ok(Some(state))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => confirm_state_file_absent(&path, e),
         Err(e) => Err(e).with_context(|| format!("Failed to read state file: {}", path.display())),
     }
+}
+
+fn confirm_state_file_absent(
+    path: &Path,
+    read_err: std::io::Error,
+) -> Result<Option<DaemonStateFile>> {
+    for ancestor in path.ancestors() {
+        let probe = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match fs::symlink_metadata(probe) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    match fs::metadata(probe) {
+                        Ok(target_meta) if probe != path && target_meta.is_dir() => {
+                            return Ok(None);
+                        }
+                        Ok(_) => {
+                            return Err(read_err).with_context(|| {
+                                format!("Failed to read state file: {}", path.display())
+                            });
+                        }
+                        Err(target_err) => {
+                            return Err(target_err).with_context(|| {
+                                format!(
+                                    "State file path involves dangling symlink {}: {}",
+                                    probe.display(),
+                                    path.display()
+                                )
+                            });
+                        }
+                    }
+                }
+                if probe != path && meta.is_dir() {
+                    return Ok(None);
+                }
+                return Err(read_err)
+                    .with_context(|| format!("Failed to read state file: {}", path.display()));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if matches!(
+                    probe.components().next_back(),
+                    Some(std::path::Component::ParentDir)
+                ) {
+                    return Err(read_err)
+                        .with_context(|| format!("Failed to read state file: {}", path.display()));
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to inspect state path {}: {}",
+                        probe.display(),
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Atomically write `bytes` to `<dir>/<name>` via tmp+fsync+rename+parent-
@@ -319,6 +389,103 @@ mod tests {
         fs::write(&path, "not valid json {{{").unwrap();
         let result = load_state(dir.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_state_rejects_unsupported_schema_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+
+        for unsupported_version in [0, DAEMON_STATE_VERSION + 1, u32::MAX] {
+            let mut value = serde_json::to_value(sample_state()).unwrap();
+            value["version"] = serde_json::json!(unsupported_version);
+            value["future_schema_field"] = serde_json::json!({"preserve": true});
+            let raw = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&path, &raw).unwrap();
+
+            let err = load_state(dir.path()).expect_err(
+                "unsupported schema version must fail closed instead of silently downgrading",
+            );
+            assert!(
+                format!("{err:#}").contains(&format!(
+                    "Unsupported state file schema version {unsupported_version}"
+                )),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), raw);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_state_rejects_dangling_symlinks_while_allowing_healthy_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+
+        // 1. Dangling state.json symlink must return Err, never Ok(None).
+        let state_dir = temp.path().join("dangling-file");
+        fs::create_dir_all(&state_dir).unwrap();
+        symlink(
+            temp.path().join("unmounted-target.json"),
+            state_dir.join(STATE_FILE),
+        )
+        .unwrap();
+        let err = load_state(&state_dir)
+            .expect_err("dangling state.json symlink must not be treated as fresh install");
+        assert!(
+            format!("{err:#}").contains("dangling symlink"),
+            "unexpected error: {err:#}"
+        );
+
+        // 2. Chained dangling state.json symlink and dangling state_dir symlink return Err.
+        let chained_dir = temp.path().join("chained-dangling");
+        fs::create_dir_all(&chained_dir).unwrap();
+        let hop = temp.path().join("intermediate-hop.json");
+        symlink(temp.path().join("missing-leaf.json"), &hop).unwrap();
+        symlink(&hop, chained_dir.join(STATE_FILE)).unwrap();
+        let chained_err = load_state(&chained_dir)
+            .expect_err("chained dangling symlink must not be treated as fresh install");
+        assert!(
+            format!("{chained_err:#}").contains("dangling symlink"),
+            "unexpected error: {chained_err:#}"
+        );
+
+        let dangling_dir = temp.path().join("dangling-state-dir");
+        symlink(temp.path().join("unmounted-state-root"), &dangling_dir).unwrap();
+        let dir_err = load_state(&dangling_dir)
+            .expect_err("dangling state_dir symlink must not be treated as fresh install");
+        assert!(
+            format!("{dir_err:#}").contains("dangling symlink"),
+            "unexpected error: {dir_err:#}"
+        );
+
+        // 3. Valid symlinked state_dir without state.json (and uncreated subdir) returns Ok(None),
+        //    whereas '..' across a missing component must not silently cancel into Ok(None).
+        let real_empty_dir = temp.path().join("real-empty-dir");
+        fs::create_dir_all(&real_empty_dir).unwrap();
+        let linked_empty_dir = temp.path().join("linked-empty-dir");
+        symlink(&real_empty_dir, &linked_empty_dir).unwrap();
+        assert!(load_state(&linked_empty_dir).unwrap().is_none());
+        assert!(load_state(&real_empty_dir.join("not-yet-created"))
+            .unwrap()
+            .is_none());
+        assert!(load_state(&real_empty_dir.join("missing/..")).is_err());
+
+        // 4. Valid symlinked state.json pointing at a v1 manifest loads normally.
+        let backing_dir = temp.path().join("backing");
+        save_state(&backing_dir, &sample_state()).unwrap();
+        let linked_file_dir = temp.path().join("linked-file-dir");
+        fs::create_dir_all(&linked_file_dir).unwrap();
+        symlink(
+            backing_dir.join(STATE_FILE),
+            linked_file_dir.join(STATE_FILE),
+        )
+        .unwrap();
+        let loaded = load_state(&linked_file_dir)
+            .unwrap()
+            .expect("healthy state.json symlink should load");
+        assert_eq!(loaded.version, DAEMON_STATE_VERSION);
     }
 
     #[test]

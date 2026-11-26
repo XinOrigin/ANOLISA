@@ -23,17 +23,28 @@ export class TaskScope extends Scope {
   async release() {}
 
   async open(cwd, environment) {
-    this.admission = new Admission(this.instance, {
+    if (this.opening || this.admission || this.handle || this.closed || this.failed || this.pid !== process.pid)
+      throw new Error("AW task cannot be reopened");
+    const admission = new Admission(this.instance, {
       events: Object.keys(this.instance.options.capabilities.events),
       timeoutMs: this.timeoutMs,
       cwd,
       environment,
       deferAcknowledgement: true,
     });
-    await this.admission.prepare();
-    this.task = this.admission.task;
-    this.handle = this.task.binding;
-    this.check();
+    this.admission = admission;
+    this.opening = (async () => {
+      await admission.prepare();
+      this.task = admission.task;
+      this.handle = this.task?.binding ?? null;
+      this.check();
+    })();
+    try {
+      await this.opening;
+    } catch (error) {
+      await this.close().catch(() => {});
+      throw error;
+    }
   }
 
   check() {
@@ -47,10 +58,25 @@ export class TaskScope extends Scope {
   }
 
   async acknowledge() {
-    await this.task.acknowledge();
-    const { invocations_per_binding } = await this.call("enable_invocations");
-    this.invocationLimit = invocations_per_binding;
-    await this.watch(await this.call("watch_scope", { pid: this.pid }));
+    this.check();
+    if (this.policyRevision) throw new Error("AW task already acknowledged");
+    try {
+      await this.task.acknowledge();
+      this.check();
+      const { invocations_per_binding } = await this.call("enable_invocations");
+      if (!Number.isInteger(invocations_per_binding) || invocations_per_binding < 1)
+        throw new Error("AW invocation limit is invalid");
+      this.invocationLimit = invocations_per_binding;
+      const watch = await this.call("watch_scope", { pid: this.pid });
+      if (!watch || typeof watch !== "object")
+        throw new Error("AW scope watch response is invalid");
+      if (watch.policy_revision !== this.task.routes?.policy_revision)
+        throw new Error("AW Scope revision changed during admission");
+      await this.watch(watch);
+    } catch (error) {
+      await this.close().catch(() => {});
+      throw error;
+    }
   }
 
   async emit(event, payload, signal) {
@@ -111,10 +137,19 @@ export class TaskScope extends Scope {
   }
 
   async closeOwned() {
+    if (this.closed) {
+      if (this.releaseError) throw this.releaseError;
+      return;
+    }
+    if (this.pid !== process.pid) throw new Error("Cannot close an inherited AW task");
     this.closed = true;
     clearTimeout(this.monitorTimer);
+    this.monitorTimer = undefined;
     this.monitorAbort?.abort();
     await this.monitor;
-    await this.admission?.close();
+    this.admission?.cancel();
+    await this.opening?.catch(() => {});
+    try { await this.admission?.close(); }
+    catch (error) { this.releaseError = error; throw error; }
   }
 }

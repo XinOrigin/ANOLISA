@@ -43,6 +43,7 @@ function resultDigest(block) {
 export function createToolGate(records, invoke) {
   const receipts = new Map();
   return async (body, signal) => {
+    signal?.throwIfAborted();
     if (Buffer.byteLength(body) > 16 * 1024 * 1024) throw Error('AW model request exceeds limit');
     const request = JSON.parse(body);
     const session = JSON.parse(request.metadata?.user_id ?? '{}').session_id;
@@ -53,6 +54,7 @@ export function createToolGate(records, invoke) {
     const calls = new Map();
     const seen = new Set();
     const checked = [];
+    const pending = [];
     for (const message of request.messages) {
       if (!Array.isArray(message.content)) continue;
       for (const block of message.content) {
@@ -73,7 +75,7 @@ export function createToolGate(records, invoke) {
         }
         seen.add(id);
         const call = calls.get(id);
-        const native = identities[id];
+        const native = Object.hasOwn(identities, id) ? identities[id] : undefined;
         const nativeDigest = digest(native);
         checked.push({ block, id, nativeDigest });
         const key = JSON.stringify([session, id]);
@@ -90,7 +92,7 @@ export function createToolGate(records, invoke) {
         }
         let allowed = text && native && call && native.session_id === session &&
           native.tool_name === call.name && isDeepStrictEqual(native.tool_input, call.input) &&
-          !native.ambiguous && receipts.size < 1024;
+          !native.ambiguous && receipts.size + pending.length < 1024;
         if (allowed) {
           const payload = { ...native, hook_event_name: 'AWFinalToolResult',
             tool_response: { content: typeof block.content === 'string'
@@ -98,17 +100,31 @@ export function createToolGate(records, invoke) {
             isError: block.is_error === true } };
           try { allowed = await invoke(payload, signal); }
           catch { allowed = false; }
+          // Abort before mutating or caching so cancelled checks never poison retries.
+          signal?.throwIfAborted();
         }
         if (!allowed) block.content = WITHHELD;
-        if (receipts.size < 1024) receipts.set(key, {
-          call: digest(call), native: nativeDigest, source: hash,
-          delivered: resultDigest(block), withheld: !allowed,
+        if (receipts.size + pending.length < 1024) pending.push({
+          key, block, id, nativeDigest, call: digest(call), source: hash, withheld: !allowed,
         });
       }
     }
+    signal?.throwIfAborted();
     const current = records();
+    const invalidated = new Set();
     for (const { block, id, nativeDigest } of checked) {
-      if (digest(current[id]) !== nativeDigest) block.content = WITHHELD;
+      const latest = Object.hasOwn(current, id) ? current[id] : undefined;
+      if (digest(latest) !== nativeDigest) {
+        block.content = WITHHELD;
+        invalidated.add(id);
+      }
+    }
+    for (const entry of pending) {
+      if (invalidated.has(entry.id) || receipts.size >= 1024) continue;
+      receipts.set(entry.key, {
+        call: entry.call, native: entry.nativeDigest, source: entry.source,
+        delivered: resultDigest(entry.block), withheld: entry.withheld,
+      });
     }
     return JSON.stringify(request);
   };

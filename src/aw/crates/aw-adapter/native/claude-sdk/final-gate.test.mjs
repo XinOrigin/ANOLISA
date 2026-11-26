@@ -67,6 +67,48 @@ test('receipts bind bytes and tool identity across history and retries', async (
       assert.equal(calls, 1);
     }
   }
+  for (const rejectOnAbort of [false, true]) {
+    let calls = 0;
+    const controller = new AbortController();
+    const records = {
+      'call-1': { ...native, tool_use_id: 'call-1' },
+      'call-2': { ...native, tool_use_id: 'call-2' },
+    };
+    const multi = {
+      metadata: { user_id: JSON.stringify({ session_id: 'session' }) },
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'tool_use', id: 'call-1', name: 'Bash', input: native.tool_input },
+          { type: 'tool_use', id: 'call-2', name: 'Bash', input: native.tool_input },
+        ] },
+        { role: 'user', content: [
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'first-safe' },
+          { type: 'tool_result', tool_use_id: 'call-2', content: 'second-safe' },
+        ] },
+      ],
+    };
+    const abortedGate = createToolGate(() => records, async (_payload, signal) => {
+      calls++;
+      if (calls === 2) {
+        controller.abort(Error('cancelled'));
+        if (rejectOnAbort) throw signal.reason;
+        return false;
+      }
+      return true;
+    });
+    await assert.rejects(abortedGate(JSON.stringify(multi), controller.signal), /cancelled/);
+    const retried = JSON.parse(await abortedGate(JSON.stringify(multi)));
+    assert.equal(retried.messages[1].content[0].content, 'first-safe');
+    assert.equal(retried.messages[1].content[1].content, 'second-safe');
+    assert.equal(calls, 4);
+  }
+  const preAborted = new AbortController();
+  preAborted.abort(Error('early'));
+  let abortChecks = 0;
+  const retryGate = createToolGate(() => ({ call: native }), async () => { abortChecks++; return true; });
+  await assert.rejects(retryGate(JSON.stringify(request()), preAborted.signal), /early/);
+  assert.equal(result(await retryGate(JSON.stringify(request()))), 'safe');
+  assert.equal(abortChecks, 1);
 });
 
 test('identity changes during asynchronous policy checking invalidate delivery', async () => {
@@ -77,6 +119,17 @@ test('identity changes during asynchronous policy checking invalidate delivery',
   });
   assert.equal(result(await gate(JSON.stringify(request()))), WITHHELD);
   assert.equal(result(await gate(JSON.stringify(request()))), WITHHELD);
+  let snapshot = { call: native };
+  let calls = 0;
+  const transient = createToolGate(() => structuredClone(snapshot), async () => {
+    calls++;
+    if (calls === 1) snapshot = {};
+    return true;
+  });
+  assert.equal(result(await transient(JSON.stringify(request()))), WITHHELD);
+  snapshot = { call: native };
+  assert.equal(result(await transient(JSON.stringify(request()))), 'safe');
+  assert.equal(calls, 2);
 });
 
 test('validated cache annotations may move without changing approved or withheld history', async () => {

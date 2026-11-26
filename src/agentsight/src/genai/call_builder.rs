@@ -352,71 +352,11 @@ impl GenAIBuilder {
             }
         }
 
-        // Extract error message from response body when status_code >= 400
+        // Extract error message from HTTP 4xx/5xx payloads (raw or compact) and
+        // structured HTTP 200 SSE error chunks.
         drop(first_user_raw);
         drop(last_user_raw);
-        let error = if http.status_code >= 400 {
-            http.response_body.as_ref().and_then(|body| {
-                /// Strip HTTP chunked transfer encoding (e.g. "b6\r\n{json}\r\n0\r\n\r\n")
-                /// and return the JSON object substring.
-                fn strip_chunked(body: &str) -> &str {
-                    // Find the first '{' — everything before it may be chunk-size hex + CRLF
-                    let start = match body.find('{') {
-                        Some(idx) => idx,
-                        None => return body,
-                    };
-                    // Find the last '}' — everything after it is chunked trailer.
-                    // A body can also contain a '}' before the first '{' (proxy
-                    // noise, a truncated or binary error page); slicing with an
-                    // end before the start panicked, so that shape keeps the
-                    // remainder and lets the JSON parse fail on its own.
-                    let end = match body.rfind('}') {
-                        Some(idx) if idx >= start => idx + 1,
-                        _ => return &body[start..],
-                    };
-                    &body[start..end]
-                }
-
-                /// Try to extract `message` from a JSON value (handles nested / escaped JSON)
-                fn extract_message(v: &serde_json::Value) -> Option<String> {
-                    if let Some(e) = v.get("error") {
-                        if e.is_object() {
-                            // {"error":{"message":"..."}}
-                            if let Some(msg) = e.get("message").and_then(|m| m.as_str()) {
-                                return Some(msg.to_string());
-                            }
-                        } else if let Some(s) = e.as_str() {
-                            // {"error": "{\"error\":{\"message\":\"...\"}}"}  — escaped JSON string
-                            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
-                                if let Some(msg) = inner.get("message").and_then(|m| m.as_str()) {
-                                    return Some(msg.to_string());
-                                }
-                                if let Some(inner_e) = inner.get("error") {
-                                    if let Some(msg) =
-                                        inner_e.get("message").and_then(|m| m.as_str())
-                                    {
-                                        return Some(msg.to_string());
-                                    }
-                                }
-                            }
-                            return Some(s.to_string());
-                        }
-                    }
-                    // Top-level {"message":"..."}
-                    v.get("message")
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string())
-                }
-
-                let json_str = strip_chunked(body);
-                serde_json::from_str::<serde_json::Value>(json_str)
-                    .ok()
-                    .and_then(|v| extract_message(&v))
-                    .or_else(|| Some(body.clone()))
-            })
-        } else {
-            None
-        };
+        let error = extract_call_error(http, context);
 
         Some(LLMCall {
             call_id,
@@ -1242,6 +1182,195 @@ impl GenAIBuilder {
     }
 }
 
+/// Extract a structured error summary from HTTP 4xx/5xx responses (raw or compact)
+/// or from explicit error chunks inside an HTTP 200 SSE stream.
+fn extract_call_error(
+    http: &HttpRecord,
+    context: Option<&crate::analyzer::HttpContext>,
+) -> Option<String> {
+    if http.status_code >= 400 {
+        if let Some(body) = http.response_body.as_deref() {
+            let json_str = strip_chunked_json_envelope(body);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str)
+                && let Some(msg) = extract_structured_error_value(&value, true)
+            {
+                return Some(msg);
+            }
+            if let Some(sse_err) = extract_sse_error_from_body(body) {
+                return Some(sse_err);
+            }
+            return Some(body.to_string());
+        }
+        return context
+            .and_then(|ctx| ctx.response.as_ref())
+            .and_then(|value| {
+                extract_structured_error_value(value, true).or_else(|| match value {
+                    serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+                    serde_json::Value::Null => None,
+                    other => Some(other.to_string()),
+                })
+            });
+    }
+
+    if !http.is_sse {
+        return None;
+    }
+
+    context
+        .and_then(|ctx| ctx.response.as_ref())
+        .and_then(|value| extract_structured_error_value(value, false))
+        .or_else(|| {
+            http.response_body
+                .as_deref()
+                .and_then(extract_sse_error_from_body)
+        })
+}
+
+/// Strip HTTP chunked transfer encoding framing (`<hex>\r\n...\r\n0\r\n\r\n`)
+/// when a JSON object or array is embedded inside a raw response body.
+fn strip_chunked_json_envelope(body: &str) -> &str {
+    let obj_start = body.find('{');
+    let arr_start = body.find('[');
+    let (start, close) = match (obj_start, arr_start) {
+        (Some(o), Some(a)) if a < o => (a, ']'),
+        (Some(o), _) => (o, '}'),
+        (None, Some(a)) => (a, ']'),
+        (None, None) => return body,
+    };
+    // Guard against stray closing delimiters before `start` (proxy noise or truncated HTML).
+    match body.rfind(close) {
+        Some(idx) if idx >= start => &body[start..idx + 1],
+        _ => &body[start..],
+    }
+}
+
+fn summarize_error_payload(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(raw) => {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw) {
+                if let Some(msg) = inner.get("message").and_then(serde_json::Value::as_str)
+                    && !msg.trim().is_empty()
+                {
+                    return Some(msg.to_string());
+                }
+                if let Some(inner_err) = inner.get("error")
+                    && let Some(msg) = summarize_error_payload(inner_err)
+                {
+                    return Some(msg);
+                }
+            }
+            (!raw.trim().is_empty()).then(|| raw.to_string())
+        }
+        serde_json::Value::Object(map) => {
+            let parts: Vec<&str> = ["type", "code", "message"]
+                .iter()
+                .filter_map(|key| map.get(*key).and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn extract_structured_error_value(
+    value: &serde_json::Value,
+    allow_top_level_message: bool,
+) -> Option<String> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|item| extract_structured_error_value(item, allow_top_level_message)),
+        serde_json::Value::Object(map) => {
+            if let Some(err) = map.get("error")
+                && !err.is_null()
+                && let Some(summary) = summarize_error_payload(err)
+            {
+                return Some(summary);
+            }
+            if let Some(err) = map.get("response").and_then(|resp| resp.get("error"))
+                && !err.is_null()
+                && let Some(summary) = summarize_error_payload(err)
+            {
+                return Some(summary);
+            }
+            let is_error_event = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| {
+                    kind == "error" || kind.ends_with(".failed") || kind.ends_with(".error")
+                });
+            if allow_top_level_message || is_error_event {
+                if let Some(msg) = map.get("message").and_then(serde_json::Value::as_str)
+                    && !msg.trim().is_empty()
+                {
+                    return Some(msg.to_string());
+                }
+                if is_error_event {
+                    return summarize_error_payload(value);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_sse_error_from_body(body: &str) -> Option<String> {
+    let json_str = strip_chunked_json_envelope(body);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str)
+        && let Some(err) = extract_structured_error_value(&value, false)
+    {
+        return Some(err);
+    }
+
+    let mut event_data = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !event_data.is_empty() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event_data)
+                    && let Some(err) = extract_structured_error_value(&value, false)
+                {
+                    return Some(err);
+                }
+                event_data.clear();
+            }
+            continue;
+        }
+        let payload = if let Some(rest) = trimmed.strip_prefix("data:") {
+            rest.trim_start()
+        } else if trimmed.starts_with(':')
+            || trimmed.starts_with("id:")
+            || trimmed.starts_with("retry:")
+            || trimmed.starts_with("event:")
+        {
+            continue;
+        } else {
+            trimmed
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
+            && let Some(err) = extract_structured_error_value(&value, false)
+        {
+            return Some(err);
+        }
+        if !event_data.is_empty() {
+            event_data.push('\n');
+        }
+        event_data.push_str(payload);
+    }
+    if !event_data.is_empty()
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&event_data)
+    {
+        return extract_structured_error_value(&value, false);
+    }
+    None
+}
+
 /// Split a Host / `:authority` value into the address and an optional port.
 ///
 /// An IPv6 literal is bracketed (`[::1]:8443`): splitting at the last colon
@@ -1821,6 +1950,134 @@ mod tests {
         let http = make_http("/v1/chat/completions", Some(body), None);
         let call = build_call(&builder, &[http_result(http)]).unwrap();
         assert!(call.error.is_none());
+    }
+
+    #[test]
+    fn test_build_llm_call_compact_http_error_extracts_error_message() {
+        let builder = GenAIBuilder::new();
+        let mut http = make_http("/v1/chat/completions", None, None);
+        http.status_code = 429;
+        let call = build_call(
+            &builder,
+            &[AnalysisResult::HttpContext(crate::analyzer::HttpContext {
+                http,
+                request: None,
+                response: Some(serde_json::json!({
+                    "error": {"message": "rate limit exceeded"}
+                })),
+                retain_raw: false,
+            })],
+        )
+        .unwrap();
+        assert_eq!(call.error.as_deref(), Some("rate limit exceeded"));
+
+        let mut overflow_http = make_http("/v1/chat/completions", None, None);
+        overflow_http.status_code = 400;
+        let overflow_call = build_call(
+            &builder,
+            &[AnalysisResult::HttpContext(crate::analyzer::HttpContext {
+                http: overflow_http,
+                request: None,
+                response: Some(serde_json::json!([{
+                    "error": {"message": "This model's context_length_exceeded"}
+                }])),
+                retain_raw: false,
+            })],
+        )
+        .unwrap();
+        assert_eq!(
+            overflow_call.error.as_deref(),
+            Some("This model's context_length_exceeded")
+        );
+        let events = crate::interruption::InterruptionDetector::new(
+            crate::interruption::DetectorConfig::default(),
+        )
+        .detect(&overflow_call);
+        assert!(
+            events.iter().any(|e| matches!(
+                e.interruption_type,
+                crate::interruption::InterruptionType::ContextOverflow
+            )),
+            "compact HTTP 400 context overflow must reach InterruptionDetector: {events:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_llm_call_http_200_sse_error_chunk_extracts_error_without_false_positives() {
+        let builder = GenAIBuilder::new();
+
+        // Compact 200 SSE stream carrying an Anthropic overloaded error event
+        let mut compact_http = make_http("/v1/messages", None, None);
+        compact_http.is_sse = true;
+        compact_http.status_code = 200;
+        let compact_call = build_call(
+            &builder,
+            &[AnalysisResult::HttpContext(crate::analyzer::HttpContext {
+                http: compact_http,
+                request: None,
+                response: Some(serde_json::json!([
+                    {"type": "message_start", "message": {"id": "msg_1", "role": "assistant", "content": []}},
+                    {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+                ])),
+                retain_raw: false,
+            })],
+        )
+        .unwrap();
+        let err = compact_call
+            .error
+            .as_deref()
+            .expect("200 SSE error chunk must populate call.error in compact mode");
+        assert!(
+            err.contains("overloaded_error") && err.contains("Overloaded"),
+            "{err}"
+        );
+        let events = crate::interruption::InterruptionDetector::new(
+            crate::interruption::DetectorConfig::default(),
+        )
+        .detect(&compact_call);
+        assert!(
+            events.iter().any(|e| matches!(
+                e.interruption_type,
+                crate::interruption::InterruptionType::ServiceUnavailable
+            )),
+            "compact 200 SSE overloaded_error must trigger ServiceUnavailable: {events:?}"
+        );
+
+        // Raw 200 SSE stream carrying a Responses API response.failed chunk
+        let mut raw_http = make_http(
+            "/v1/responses",
+            None,
+            Some(r#"[{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}}]"#.to_string()),
+        );
+        raw_http.is_sse = true;
+        raw_http.status_code = 200;
+        let raw_call = build_call(&builder, &[http_result(raw_http)]).unwrap();
+        let raw_err = raw_call
+            .error
+            .as_deref()
+            .expect("200 SSE response.failed chunk must populate call.error");
+        assert!(
+            raw_err.contains("rate_limit_exceeded") && raw_err.contains("Too many requests"),
+            "{raw_err}"
+        );
+
+        // Normal 200 SSE assistant content quoting an error JSON must NOT set call.error
+        let mut benign_http = make_http("/v1/chat/completions", None, None);
+        benign_http.is_sse = true;
+        benign_http.status_code = 200;
+        let benign_call = build_call(
+            &builder,
+            &[AnalysisResult::HttpContext(crate::analyzer::HttpContext {
+                http: benign_http,
+                request: None,
+                response: Some(serde_json::json!([
+                    {"choices": [{"delta": {"content": r#"{"error":{"message":"quoted"}}"#}, "finish_reason": "stop"}]}
+                ])),
+                retain_raw: false,
+            })],
+        )
+        .unwrap();
+        assert!(benign_call.error.is_none());
     }
 
     /// A Gemini generation call whose usage was not parsed carries no token

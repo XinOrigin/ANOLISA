@@ -381,3 +381,109 @@ class TestCronLineBreakGuard:
         assert result is False
         mock_read.assert_not_called()
         mock_write.assert_not_called()
+
+
+class TestCronValidationAndCrontabSafety:
+    """Cron expressions, workspace paths, and commented lines must fail closed."""
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "0 * * * *\n",
+            "\n0 * * * *",
+            "0 * * * *\r",
+            "0 * * *\ntouch",
+            "0 * * *\rtouch",
+            "0 * * *\vtouch",
+            "0 * * *\ftouch",
+            "0\x00 * * * *",
+            "0%2 * * * *",
+            "0 * * * *;id",
+            "0 * * * *$(id)",
+            "0 * * * *`id`",
+            "0 * * * *|cat",
+            "0 * * * *#comment",
+        ],
+    )
+    def test_validate_cron_expr_rejects_control_percent_and_shell_chars(self, expr):
+        assert validate_cron_expr(expr) is False
+
+    @pytest.mark.parametrize(
+        "expr",
+        ["0 9 * * MON-FRI", "0 0 1 JAN,JUL *", "  0\t*\t*\t*\t*  "],
+    )
+    def test_validate_cron_expr_accepts_standard_named_and_tabbed_fields(self, expr):
+        assert validate_cron_expr(expr) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'set ["0 * * * *\\n"]',
+            'set ["0 * * *\\ntouch"]',
+            "set [123]",
+            "set [true]",
+            "set [null]",
+            'add "0 * * * *;id"',
+            'add "0%2 * * * *"',
+        ],
+    )
+    def test_parse_schedules_update_rejects_unsafe_or_non_string_entries(self, command):
+        result, err = parse_schedules_update(command, [])
+        assert result is None
+        assert err is not None
+
+    def test_parse_schedules_update_normalizes_whitespace_for_add_and_set(self):
+        added, err = parse_schedules_update('add "  0   * \t * * *  "', [])
+        assert err is None
+        assert added == ["0 * * * *"]
+        removed, err = parse_schedules_update("remove 0 * * * *", added)
+        assert err is None
+        assert removed == []
+
+        replaced, err = parse_schedules_update('set ["  5  4 * * *  "]', [])
+        assert err is None
+        assert replaced == ["5 4 * * *"]
+
+    @pytest.mark.parametrize("workspace", ["", "/tmp/100%data", "/tmp/proj%20name", "/tmp/a\x00b"])
+    def test_sync_fails_closed_on_percent_null_or_empty_workspace(self, workspace):
+        with (
+            patch.object(CrontabManager, "_with_lock", side_effect=lambda action: action()),
+            patch("hermes.cron._read_crontab") as mock_read,
+            patch("hermes.cron._write_crontab") as mock_write,
+        ):
+            assert CrontabManager.sync(workspace, ["0 * * * *"]) is False
+            mock_read.assert_not_called()
+            mock_write.assert_not_called()
+
+    @pytest.mark.parametrize("schedule", ["0 * * * *;id", "0%2 * * * *", "0 * * * *\n", "bad"])
+    def test_sync_fails_closed_on_invalid_schedule(self, schedule):
+        with (
+            patch.object(CrontabManager, "_with_lock", side_effect=lambda action: action()),
+            patch("hermes.cron._read_crontab") as mock_read,
+            patch("hermes.cron._write_crontab") as mock_write,
+        ):
+            assert CrontabManager.sync("/ws", [schedule]) is False
+            mock_read.assert_not_called()
+            mock_write.assert_not_called()
+
+    def test_sync_normalizes_schedule_whitespace(self):
+        with (
+            patch.object(CrontabManager, "_with_lock", side_effect=lambda action: action()),
+            patch("hermes.cron._read_crontab", return_value=[]),
+            patch("hermes.cron._write_crontab", return_value=True) as mock_write,
+        ):
+            assert CrontabManager.sync("/ws", ["  0   * * * *  "]) is True
+            assert mock_write.call_args[0][0][0].startswith("0 * * * * /usr/bin/ws-ckpt ")
+
+    def test_commented_crontab_entries_are_ignored(self):
+        commented = "# 0 * * * * /usr/bin/ws-ckpt checkpoint -w '/ws' -s x"
+        assert _extract_workspace(commented) is None
+        assert _match_workspace(commented, "/ws") is False
+        with (
+            patch.object(CrontabManager, "_with_lock", side_effect=lambda action: action()),
+            patch("hermes.cron._read_crontab", return_value=[commented]),
+            patch("hermes.cron._write_crontab", return_value=True) as mock_write,
+        ):
+            assert CrontabManager.list_installed("/ws") == []
+            assert CrontabManager.remove("/ws") is True
+            mock_write.assert_called_once_with([commented])

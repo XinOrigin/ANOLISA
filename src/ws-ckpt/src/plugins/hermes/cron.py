@@ -14,9 +14,15 @@ from typing import List, Optional
 _LOCK_PATH = os.path.join(tempfile.gettempdir(), "ws-ckpt-cron.lock")
 
 # Match: ws-ckpt checkpoint ... -w '<path>' or -w <path>
-_CRON_RE = re.compile(r"^\S+\s+\S+\s+\S+\s+\S+\s+\S+$")
+_CONTROL_WS_RE = re.compile(r"[\n\r\v\f\x00]")
+_CRON_RE = re.compile(r"^[A-Za-z0-9*,/-]+(?:[ \t]+[A-Za-z0-9*,/-]+){4}$")
 _MARKER_RE = re.compile(r"ws-ckpt['\"]?\s+checkpoint\s+.*?-w\s+'((?:[^']|'\\'')*)'(?=\s|$)")
 _MARKER_RE_UNQUOTED = re.compile(r"ws-ckpt['\"]?\s+checkpoint\s+.*?-w\s+(\S+)")
+
+
+def _normalize_cron_expr(expr: str) -> str:
+    """Collapse horizontal whitespace in a validated cron expression."""
+    return " ".join(expr.strip(" \t").split())
 
 
 def _build_cron_line(workspace: str, schedule: str, binary: str) -> str:
@@ -62,6 +68,8 @@ def _write_crontab(lines: List[str]) -> bool:
 
 
 def _extract_workspace(line: str) -> Optional[str]:
+    if line.lstrip(" \t").startswith("#"):
+        return None
     m = _MARKER_RE.search(line)
     if m:
         return m.group(1).replace("'\\''", "'")
@@ -76,8 +84,10 @@ def _match_workspace(line: str, workspace: str) -> bool:
 
 
 def validate_cron_expr(expr: str) -> bool:
-    """Return True if expr looks like a valid 5-field cron expression."""
-    return bool(_CRON_RE.match(expr.strip()))
+    """Return True if expr is a safe, single-line 5-field cron expression."""
+    if not isinstance(expr, str) or _CONTROL_WS_RE.search(expr):
+        return False
+    return bool(_CRON_RE.match(expr.strip(" \t")))
 
 
 def parse_schedules_update(value: str, current: List[str]) -> tuple[Optional[List[str]], Optional[str]]:
@@ -99,12 +109,16 @@ def parse_schedules_update(value: str, current: List[str]) -> tuple[Optional[Lis
             return None, "add requires a cron expression"
         if not validate_cron_expr(sub_val):
             return None, f'Invalid cron expression: "{sub_val}". Expected 5 fields, e.g. "0 * * * *"'
-        if sub_val not in result:
-            result.append(sub_val)
+        normalized = _normalize_cron_expr(sub_val)
+        if normalized not in result:
+            result.append(normalized)
     elif sub_action == "remove":
         if not sub_val:
             return None, "remove requires a cron expression"
-        if sub_val in result:
+        normalized = _normalize_cron_expr(sub_val) if validate_cron_expr(sub_val) else sub_val
+        if normalized in result:
+            result.remove(normalized)
+        elif sub_val in result:
             result.remove(sub_val)
         else:
             return None, f'"{sub_val}" not found in current schedules'
@@ -113,10 +127,12 @@ def parse_schedules_update(value: str, current: List[str]) -> tuple[Optional[Lis
             parsed = _json.loads(sub_val)
             if not isinstance(parsed, list):
                 raise ValueError
+            normalized_list: List[str] = []
             for e in parsed:
-                if not validate_cron_expr(str(e)):
+                if not isinstance(e, str) or not validate_cron_expr(e):
                     return None, f'Invalid cron expression in array: "{e}"'
-            result = [str(e) for e in parsed]
+                normalized_list.append(_normalize_cron_expr(e))
+            result = normalized_list
         except (ValueError, _json.JSONDecodeError):
             return None, "set requires a JSON array, e.g. '[\"0 * * * *\"]'"
     else:
@@ -145,26 +161,32 @@ class CrontabManager:
     def sync(workspace: str, schedules: List[str]) -> bool:
         def _do():
             # Fail closed: never touch the crontab when an interpolated
-            # value could split a line (see _build_cron_line).
-            if "\n" in workspace or "\r" in workspace or any(
-                "\n" in s or "\r" in s for s in schedules
-            ):
+            # value could split a line, truncate at '%', or inject syntax
+            # (see _build_cron_line).
+            if not workspace or any(ch in workspace for ch in ("\n", "\r", "\x00")):
                 return False
+            normalized_schedules: List[str] = []
             binary = ""
             if schedules:
+                if "%" in workspace:
+                    return False
+                for schedule in schedules:
+                    if not validate_cron_expr(schedule):
+                        return False
+                    normalized_schedules.append(_normalize_cron_expr(schedule))
                 executable = shutil.which("ws-ckpt")
                 if executable is None:
                     return False
                 # Save the discovered absolute command: cron has a restricted
                 # PATH, and resolving a launcher symlink would pin an old release.
                 binary = os.path.abspath(executable)
-                if any(character in binary for character in ("\n", "\r", "%")):
+                if any(character in binary for character in ("\n", "\r", "%", "\x00")):
                     return False
             lines = _read_crontab()
             if lines is None:
                 return False
             kept = [l for l in lines if not _match_workspace(l, workspace)]
-            for s in schedules:
+            for s in normalized_schedules:
                 kept.append(_build_cron_line(workspace, s, binary))
             return _write_crontab(kept)
         return CrontabManager._with_lock(_do)

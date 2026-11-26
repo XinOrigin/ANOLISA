@@ -263,7 +263,7 @@ fn text_has_tool_error_signal(text: &str) -> bool {
         || lower.contains("eacces")
         || lower.contains("eperm")
         || lower.contains("\"status\": \"error\"")
-        || lower.contains("\"status\":") && lower.contains("\"error\"")
+        || lower.contains("\"status\":\"error\"")
 }
 
 /// Whether the text opens with a JVM or SQL exception class name.
@@ -403,43 +403,39 @@ fn tool_response_failure_text(value: &serde_json::Value) -> Option<String> {
                 .and_then(|value| value.as_str())
                 .is_some_and(|status| status.eq_ignore_ascii_case("error"));
 
+            // Precedence matches `agentsight_atif::declared_tool_failure` and
+            // `grader::evidence::declared_failure`: `is_error` / `isError`
+            // first, then `success`, with `status == "error"` overriding either
+            // polarity towards failure.
+            let declared_error = if let Some(is_error) = map
+                .get("is_error")
+                .or_else(|| map.get("isError"))
+                .and_then(|value| value.as_bool())
+            {
+                Some(is_error || status_is_error)
+            } else if let Some(success) = map.get("success").and_then(|value| value.as_bool()) {
+                Some(!success || status_is_error)
+            } else {
+                status_is_error.then_some(true)
+            };
+
             // An explicit success flag settles the question. The content of a
             // successful result is free-form output that may legitimately
             // mention an exit code, a traceback or a missing path, so it must
             // not be read as a failure. Only an error status can contradict
             // the flag.
-            let explicit_success = map
-                .get("is_error")
-                .or_else(|| map.get("isError"))
-                .and_then(|value| value.as_bool())
-                .is_some_and(|is_error| !is_error)
-                || map
-                    .get("success")
-                    .and_then(|value| value.as_bool())
-                    .is_some_and(|success| success);
-            if explicit_success {
-                return if status_is_error {
-                    Some(value.to_string())
-                } else {
-                    None
-                };
+            if declared_error == Some(false) {
+                return None;
             }
 
-            let explicit_error = map
-                .get("is_error")
-                .or_else(|| map.get("isError"))
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-                || map
-                    .get("success")
-                    .and_then(|value| value.as_bool())
-                    .is_some_and(|success| !success)
-                || status_is_error;
+            let explicit_error = declared_error == Some(true);
 
-            let nested_error = ["error", "message", "content", "response", "details"]
-                .iter()
-                .filter_map(|key| map.get(*key))
-                .find_map(tool_response_failure_text);
+            let nested_error = [
+                "error", "message", "content", "output", "response", "details",
+            ]
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .find_map(tool_response_failure_text);
 
             if let Some(error) = nested_error {
                 return Some(error);
@@ -460,17 +456,23 @@ fn traced_tool_failure(call: &LLMCall) -> Option<(&'static str, Option<String>, 
     // call answers. Earlier results stay in the replayed history, and scanning
     // them blamed every later call for a failure that was already handled
     // (unified stamps each call's interruption_type from this event).
-    let request_parts = call
+    // Slice the trailing run in forward chronological order so multi-message
+    // parallel tool batches (OpenAI `role: "tool"` and Responses
+    // `function_call_output`) report the first failing tool in the turn rather
+    // than the last.
+    let trailing_start = call
         .request
         .messages
         .iter()
-        .rev()
-        .take_while(|message| {
-            message
+        .rposition(|message| {
+            !message
                 .parts
                 .iter()
                 .any(|part| matches!(part, MessagePart::ToolCallResponse { .. }))
         })
+        .map_or(0, |idx| idx + 1);
+    let request_parts = call.request.messages[trailing_start..]
+        .iter()
         .flat_map(|message| message.parts.iter());
     let response_parts = call
         .response
@@ -3687,6 +3689,193 @@ mod tests {
         assert!(
             detector.detect(&normal).is_empty(),
             "a normal last choice must not inherit the first choice's safety stop"
+        );
+    }
+
+    #[test]
+    fn test_trailing_multi_message_tool_failures_preserve_turn_order() {
+        // OpenAI Chat Completions (`role: "tool"`) and the Responses API
+        // (`function_call_output`) emit parallel tool results in a single turn
+        // as consecutive `InputMessage` items rather than packing them into one
+        // message's `parts`. Scanning the trailing run in reverse order blamed
+        // the last tool message (`call_b`, generic ToolFailure) first and hid
+        // the earlier permission failure (`call_a`, UnauthorizedAction).
+        let detector = InterruptionDetector::default();
+        let mut call = make_base_call();
+        call.request.messages = vec![
+            InputMessage {
+                role: "user".to_string(),
+                parts: vec![MessagePart::Text {
+                    content: "update config and check temp file".to_string(),
+                }],
+                name: None,
+            },
+            InputMessage {
+                role: "assistant".to_string(),
+                parts: vec![
+                    MessagePart::ToolCall {
+                        id: Some("call_a".to_string()),
+                        name: "write".to_string(),
+                        arguments: None,
+                    },
+                    MessagePart::ToolCall {
+                        id: Some("call_b".to_string()),
+                        name: "read".to_string(),
+                        arguments: None,
+                    },
+                ],
+                name: None,
+            },
+            InputMessage {
+                role: "tool".to_string(),
+                parts: vec![MessagePart::ToolCallResponse {
+                    id: Some("call_a".to_string()),
+                    response: serde_json::json!({
+                        "is_error": true,
+                        "content": "Permission denied: cannot write to /etc/hosts"
+                    }),
+                }],
+                name: None,
+            },
+            InputMessage {
+                role: "tool".to_string(),
+                parts: vec![MessagePart::ToolCallResponse {
+                    id: Some("call_b".to_string()),
+                    response: serde_json::json!({
+                        "is_error": true,
+                        "content": "ENOENT: no such file or directory, open '/tmp/missing'"
+                    }),
+                }],
+                name: None,
+            },
+        ];
+        call.response.messages = vec![OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "handling failures".to_string(),
+            }],
+            name: None,
+            finish_reason: Some("stop".to_string()),
+        }];
+
+        let events = detector.detect(&call);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].interruption_type,
+            InterruptionType::UnauthorizedAction
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(events[0].detail.as_ref().unwrap()).unwrap();
+        assert_eq!(detail["tool_use_id"], "call_a");
+    }
+
+    #[test]
+    fn test_non_json_status_ok_with_null_error_is_not_a_tool_failure() {
+        // Multi-line tool output (such as a header line followed by a JSON
+        // health payload) is not a single standalone JSON document, so it
+        // reaches `text_has_tool_error_signal`. Matching any co-occurrence of
+        // `"status":` and `"error"` falsely flagged healthy payloads such as
+        // `{"status": "ok", "error": null}`.
+        let detector = InterruptionDetector::default();
+        let mut call = make_base_call();
+        call.request.messages = vec![InputMessage {
+            role: "tool".to_string(),
+            parts: vec![MessagePart::ToolCallResponse {
+                id: Some("call_health".to_string()),
+                response: serde_json::json!("GET /healthz\n{\"status\": \"ok\", \"error\": null}"),
+            }],
+            name: None,
+        }];
+        call.response.messages = vec![OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "service is healthy".to_string(),
+            }],
+            name: None,
+            finish_reason: Some("stop".to_string()),
+        }];
+
+        let events = detector.detect(&call);
+        assert!(
+            events.is_empty(),
+            "a non-error status in mixed tool output must not report ToolFailure: {events:?}"
+        );
+
+        // Compact `"status":"error"` in mixed tool output still signals failure.
+        call.request.messages[0].parts = vec![MessagePart::ToolCallResponse {
+            id: Some("call_health".to_string()),
+            response: serde_json::json!(
+                "GET /healthz\n{\"status\":\"error\",\"detail\":\"backend down\"}"
+            ),
+        }];
+        let events = detector.detect(&call);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].interruption_type, InterruptionType::ToolFailure);
+    }
+
+    #[test]
+    fn test_tool_result_envelope_honors_is_error_precedence_and_output_key() {
+        // Aligns with `agentsight_atif::declared_tool_failure` and
+        // `grader::evidence::declared_failure`: `is_error` takes precedence
+        // over `success`, `status: "error"` overrides a false flag, and
+        // `"output"` is unwrapped alongside `"content"` / `"error"`.
+        let detector = InterruptionDetector::default();
+        let mut call = make_base_call();
+        call.request.messages = vec![InputMessage {
+            role: "tool".to_string(),
+            parts: vec![MessagePart::ToolCallResponse {
+                id: Some("call_contradict".to_string()),
+                response: serde_json::json!({
+                    "is_error": true,
+                    "success": true,
+                    "output": "Permission denied: cannot write to /etc/shadow"
+                }),
+            }],
+            name: None,
+        }];
+        call.response.messages = vec![OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "denied".to_string(),
+            }],
+            name: None,
+            finish_reason: Some("stop".to_string()),
+        }];
+
+        let events = detector.detect(&call);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].interruption_type,
+            InterruptionType::UnauthorizedAction
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(events[0].detail.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            detail["error"],
+            "Permission denied: cannot write to /etc/shadow"
+        );
+
+        // An `error` status overriding `is_error: false` must also unwrap the
+        // nested error text before falling back to the raw object string.
+        call.request.messages[0].parts = vec![MessagePart::ToolCallResponse {
+            id: Some("call_status_override".to_string()),
+            response: serde_json::json!({
+                "is_error": false,
+                "status": "error",
+                "output": "Permission denied: cannot write to /etc/shadow"
+            }),
+        }];
+        let events = detector.detect(&call);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].interruption_type,
+            InterruptionType::UnauthorizedAction
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(events[0].detail.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            detail["error"],
+            "Permission denied: cannot write to /etc/shadow"
         );
     }
 }

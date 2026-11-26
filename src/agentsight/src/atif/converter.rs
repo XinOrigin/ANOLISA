@@ -625,48 +625,43 @@ fn build_agent_step(
     }
 }
 
-/// Extract only the latest-round tool responses from a full message history.
-/// In an agentic loop the pattern is:
-///   ... | assistant(tool_calls) | tool | tool | ... | assistant(tool_calls) | tool | tool
-/// The tool responses for the *current* step are the `tool`-role messages that
-/// follow the last `assistant` message which contains ToolCall parts.
+/// Narrow a request history to the round whose tool responses it carries.
+///
+/// In a replayed agentic loop (`... | assistant(tool_calls) | tool/user(results)`),
+/// the current step's responses sit after the last `assistant` message carrying
+/// a `ToolCall`. Two shapes depart from that baseline:
+///
+/// * If no `assistant` message carries a `ToolCall` (stateful `/v1/responses`
+///   continuations, or incremental slices where the result rides on a `user`
+///   turn or precedes a `user` interjection), the scan starts at the beginning
+///   rather than after the last `user` message — slicing after `user` drops
+///   both user-carried results and any `function_call_output` preceding an
+///   interjection.
+/// * If a non-trailing `assistant` message appears later in that slice (for
+///   example `assistant("Done.")` followed by a new `user` turn), any earlier
+///   tool responses belong to a completed prior round rather than an unanswered
+///   current call; advancing past that `assistant` message keeps prior-round
+///   outputs from answering the current step while leaving a trailing assistant
+///   prefill (`[..., tool_result, assistant("{")]`) intact.
 fn latest_round_messages(messages: &[InputMessage]) -> &[InputMessage] {
-    // Find the last assistant message that contains a ToolCall part.
-    let last_assistant_with_tc = messages.iter().rposition(|m| {
-        m.role == "assistant"
-            && m.parts
-                .iter()
-                .any(|p| matches!(p, MessagePart::ToolCall { .. }))
-    });
+    let after_last_tool_call = messages
+        .iter()
+        .rposition(|m| {
+            m.role == "assistant"
+                && m.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::ToolCall { .. }))
+        })
+        .map_or(messages, |idx| &messages[idx + 1..]);
 
-    if let Some(idx) = last_assistant_with_tc {
-        // Return messages after that assistant message (the tool responses).
-        &messages[idx + 1..]
+    if let Some(later_assistant) = after_last_tool_call
+        .iter()
+        .enumerate()
+        .rposition(|(pos, m)| m.role == "assistant" && pos + 1 < after_last_tool_call.len())
+    {
+        &after_last_tool_call[later_assistant + 1..]
     } else {
-        // No assistant-with-tool-call found; fall back to messages after last user.
-        if let Some(idx) = messages.iter().rposition(|m| m.role == "user") {
-            &messages[idx + 1..]
-        } else {
-            messages
-        }
-    }
-}
-
-/// The tail of a replayed history from its last tool call on — the round whose
-/// responses that history carries. Unlike [`latest_round_messages`] there is no
-/// user-message fallback: a column that carries only the responses themselves
-/// (the measured live shape, where the result rides on the user turn) holds no
-/// assistant turn and must be scanned whole.
-fn messages_after_the_last_tool_call(messages: &[InputMessage]) -> &[InputMessage] {
-    let last_tool_call = messages.iter().rposition(|m| {
-        m.role == "assistant"
-            && m.parts
-                .iter()
-                .any(|p| matches!(p, MessagePart::ToolCall { .. }))
-    });
-    match last_tool_call {
-        Some(idx) => &messages[idx + 1..],
-        None => messages,
+        after_last_tool_call
     }
 }
 
@@ -727,7 +722,7 @@ fn build_observation(
         if results.len() == inline_count {
             if let Some(ref json) = next_event.input_messages {
                 if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json) {
-                    let latest = messages_after_the_last_tool_call(&msgs);
+                    let latest = latest_round_messages(&msgs);
                     collect_tool_responses(latest, &tc_ids, &mut results, &mut matched_by_id);
                 }
             }
@@ -2916,5 +2911,343 @@ pub(crate) mod tests {
             e.model = None;
         }
         assert_eq!(most_frequent_model(&none), None);
+    }
+
+    fn semantic_event_json(
+        id: i64,
+        start_ns: u64,
+        request_messages: Vec<InputMessage>,
+        response_messages: Vec<OutputMessage>,
+    ) -> String {
+        let mut call = call_with_tools(serde_json::json!([]));
+        call.call_id = format!("call-{id}");
+        call.start_timestamp_ns = start_ns;
+        call.end_timestamp_ns = start_ns + 1_000_000_000;
+        call.duration_ns = 1_000_000_000;
+        call.request.tools = None;
+        call.request.messages = request_messages;
+        call.response.messages = response_messages;
+        serde_json::to_string(&GenAISemanticEvent::LLMCall(call)).unwrap()
+    }
+
+    fn in_msg(role: &str, part: MessagePart) -> InputMessage {
+        InputMessage {
+            role: role.into(),
+            parts: vec![part],
+            name: None,
+        }
+    }
+
+    fn in_text(role: &str, text: &str) -> InputMessage {
+        in_msg(
+            role,
+            MessagePart::Text {
+                content: text.into(),
+            },
+        )
+    }
+
+    fn in_resp(role: &str, id: Option<&str>, text: &str) -> InputMessage {
+        in_msg(
+            role,
+            MessagePart::ToolCallResponse {
+                id: id.map(str::to_string),
+                response: serde_json::json!(text),
+            },
+        )
+    }
+
+    fn turn_ev(
+        id: i64,
+        conv: &str,
+        query: Option<&str>,
+        req: Option<Vec<InputMessage>>,
+        resp: Option<Vec<OutputMessage>>,
+        typed: bool,
+    ) -> TraceEventDetail {
+        let start_ns = id * 1_000_000_000;
+        let resp_id = format!("resp-{id}");
+        let mut ev = event_with_ids(
+            id,
+            start_ns,
+            Some(conv),
+            Some(&resp_id),
+            query,
+            resp.clone(),
+            req.clone(),
+        );
+        if typed {
+            ev.event_json = Some(semantic_event_json(
+                id,
+                start_ns as u64,
+                req.unwrap_or_default(),
+                resp.unwrap_or_default(),
+            ));
+        }
+        ev
+    }
+
+    #[test]
+    fn typed_late_result_survives_interjection_without_replayed_assistant_turn() {
+        use crate::grounding::{
+            evidence::{Grounding, build_index},
+            outcome::CallStatus,
+        };
+
+        for session_export in [false, true] {
+            let first = turn_ev(
+                1,
+                "conv-a",
+                Some("read /tmp/port.cfg"),
+                None,
+                Some(tool_call_turn("tc-late")),
+                true,
+            );
+            // Stateful `/v1/responses` continuation: `latest_round_input_messages`
+            // keeps only the trailing text user turn in `input_messages`, leaving
+            // `event_json` as the sole copy of `function_call_output`.
+            let second_req = vec![
+                in_resp("tool", Some("tc-late"), "Observed port: 24816"),
+                in_text("user", "actually, hold on"),
+            ];
+            let second_out = vec![OutputMessage {
+                role: "assistant".into(),
+                parts: vec![MessagePart::Text {
+                    content: "Pausing; the configured port is 24816.".into(),
+                }],
+                name: None,
+                finish_reason: Some("stop".into()),
+            }];
+            let incremental_json = serde_json::to_string(
+                &crate::genai::semantic::latest_round_input_messages(&second_req),
+            )
+            .unwrap();
+            let mut second = turn_ev(
+                2,
+                "conv-b",
+                Some("actually, hold on"),
+                Some(second_req),
+                Some(second_out),
+                true,
+            );
+            second.input_messages = Some(incremental_json);
+
+            let doc = if session_export {
+                convert_session_to_atif("session-typed-late", vec![first, second]).unwrap()
+            } else {
+                convert_trace_to_atif("trace-typed-late", vec![first, second]).unwrap()
+            };
+            doc.validate_step_ids().unwrap();
+
+            let agents: Vec<&Step> = doc
+                .steps
+                .iter()
+                .filter(|s| s.source == StepSource::Agent)
+                .collect();
+            let results = &agents[0]
+                .observation
+                .as_ref()
+                .expect("typed late tool result must attach to its calling step")
+                .results;
+            assert_eq!(results[0].source_call_id.as_deref(), Some("tc-late"));
+            assert_eq!(
+                results[0].content.as_ref().and_then(|v| v.as_str()),
+                Some("Observed port: 24816")
+            );
+            assert!(agents[1].observation.is_none());
+
+            let index = build_index(&doc, 0..doc.steps.len());
+            assert_eq!(index.call_verdicts[0].verdict.status, CallStatus::Ok);
+            assert_eq!(index.unresolved_count(), 0);
+            assert!(index.claims.iter().all(|c| matches!(
+                &c.grounding,
+                Grounding::Grounded { source_call_id: Some(id), .. } if id == "tc-late"
+            )));
+        }
+    }
+
+    #[test]
+    fn typed_user_carried_tool_result_survives_without_replayed_assistant_turn() {
+        for session_export in [false, true] {
+            let first = turn_ev(
+                1,
+                "conv-1",
+                Some("inspect file"),
+                None,
+                Some(tool_call_turn("tc-user")),
+                true,
+            );
+            let mut second = turn_ev(
+                2,
+                "conv-1",
+                None,
+                Some(vec![in_resp(
+                    "user",
+                    Some("tc-user"),
+                    "user-carried output",
+                )]),
+                None,
+                true,
+            );
+            second.input_messages = None;
+
+            let doc = if session_export {
+                convert_session_to_atif("session-user-role", vec![first, second]).unwrap()
+            } else {
+                convert_trace_to_atif("trace-user-role", vec![first, second]).unwrap()
+            };
+            let agent = doc
+                .steps
+                .iter()
+                .find(|s| s.source == StepSource::Agent)
+                .unwrap();
+            let results = &agent
+                .observation
+                .as_ref()
+                .expect("user-carried tool result in event_json must survive")
+                .results;
+            assert_eq!(results[0].source_call_id.as_deref(), Some("tc-user"));
+            assert_eq!(
+                results[0].content.as_ref().and_then(|v| v.as_str()),
+                Some("user-carried output")
+            );
+        }
+    }
+
+    #[test]
+    fn completed_assistant_turn_blocks_earlier_round_result_on_unanswered_call() {
+        use crate::grounding::{evidence::build_index, outcome::CallStatus};
+
+        for typed in [false, true] {
+            for call_id in [None, Some("call_0")] {
+                for session_export in [false, true] {
+                    let make_call = |name: &str| {
+                        vec![OutputMessage {
+                            role: "assistant".into(),
+                            parts: vec![MessagePart::ToolCall {
+                                id: call_id.map(str::to_string),
+                                name: name.into(),
+                                arguments: Some(serde_json::json!({"target": name})),
+                            }],
+                            name: None,
+                            finish_reason: Some("tool_call".into()),
+                        }]
+                    };
+                    let checked_reply = vec![OutputMessage {
+                        role: "assistant".into(),
+                        parts: vec![MessagePart::Text {
+                            content: "Checked.".into(),
+                        }],
+                        name: None,
+                        finish_reason: Some("stop".into()),
+                    }];
+                    let round1_replay = vec![
+                        in_text("user", "check config"),
+                        in_msg(
+                            "assistant",
+                            MessagePart::ToolCall {
+                                id: call_id.map(str::to_string),
+                                name: "Read".into(),
+                                arguments: Some(serde_json::json!({"target": "Read"})),
+                            },
+                        ),
+                        in_resp("tool", call_id, "turn-1 output"),
+                    ];
+                    let mut turn3_replay = round1_replay.clone();
+                    turn3_replay.push(in_text("assistant", "Checked."));
+                    turn3_replay.push(in_text("user", "abort deploy"));
+
+                    let batch = vec![
+                        turn_ev(
+                            1,
+                            "conv-1",
+                            Some("check config"),
+                            None,
+                            Some(make_call("Read")),
+                            typed,
+                        ),
+                        turn_ev(
+                            2,
+                            "conv-1",
+                            None,
+                            Some(round1_replay),
+                            Some(checked_reply),
+                            typed,
+                        ),
+                        turn_ev(
+                            3,
+                            "conv-2",
+                            Some("deploy"),
+                            None,
+                            Some(make_call("Bash")),
+                            typed,
+                        ),
+                        turn_ev(
+                            4,
+                            "conv-3",
+                            Some("abort deploy"),
+                            Some(turn3_replay),
+                            None,
+                            typed,
+                        ),
+                    ];
+                    let doc = if session_export {
+                        convert_session_to_atif("session-stale", batch).unwrap()
+                    } else {
+                        convert_trace_to_atif("trace-stale", batch).unwrap()
+                    };
+                    let acting: Vec<&Step> =
+                        doc.steps.iter().filter(|s| s.has_tool_calls()).collect();
+                    assert_eq!(acting.len(), 2);
+                    assert_eq!(
+                        acting[0]
+                            .observation
+                            .as_ref()
+                            .and_then(|o| o.results[0].content.as_ref())
+                            .and_then(|v| v.as_str()),
+                        Some("turn-1 output")
+                    );
+                    assert!(
+                        acting[1].observation.is_none(),
+                        "unanswered call must not inherit an earlier round's result (typed={typed}, id={call_id:?}, session={session_export})"
+                    );
+                    let index = build_index(&doc, 0..doc.steps.len());
+                    assert_eq!(index.call_verdicts[0].verdict.status, CallStatus::Ok);
+                    assert_eq!(index.call_verdicts[1].verdict.status, CallStatus::Unknown);
+                }
+            }
+        }
+
+        // Trailing assistant prefill (`[..., tool_result, assistant("{")]`) still
+        // belongs to the in-flight round and must keep the tool observation.
+        let prefill_req = vec![
+            in_msg(
+                "assistant",
+                MessagePart::ToolCall {
+                    id: Some("tc-prefill".into()),
+                    name: "Read".into(),
+                    arguments: Some(serde_json::json!({"file_path": "/tmp/a"})),
+                },
+            ),
+            in_resp("user", Some("tc-prefill"), "prefill-ok"),
+            in_text("assistant", "{"),
+        ];
+        let first = turn_ev(
+            1,
+            "conv-p",
+            Some("format json"),
+            None,
+            Some(tool_call_turn("tc-prefill")),
+            true,
+        );
+        let second = turn_ev(2, "conv-p", None, Some(prefill_req), None, true);
+        let doc = convert_trace_to_atif("trace-prefill", vec![first, second]).unwrap();
+        assert_eq!(
+            doc.steps[1].observation.as_ref().unwrap().results[0]
+                .content
+                .as_ref()
+                .and_then(|v| v.as_str()),
+            Some("prefill-ok")
+        );
     }
 }

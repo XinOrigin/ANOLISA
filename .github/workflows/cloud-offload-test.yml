@@ -1,0 +1,35 @@
+name: Cloud Offload Test (skillfs)
+on:
+  push:
+    branches: ['ci/offload-**']
+permissions:
+  contents: read
+concurrency:
+  group: offload-${{ github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  linux-vm-test:
+    name: Ubuntu 24.04 VM (skillfs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          workspaces: src/skillfs
+      - name: Install Linux kernel & FUSE3 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config clang llvm libssl-dev libseccomp-dev bubblewrap
+          grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+          ls -l /dev/fuse
+      - name: Run Offloaded Test Suite
+        working-directory: src/skillfs
+        run: |
+          set -euxo pipefail
+          ls -l /dev/fuse && cargo check -p skillfs-fuse --all-targets && cargo test -p skillfs-fuse --lib -- --test-threads=4

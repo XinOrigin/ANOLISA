@@ -498,6 +498,27 @@ fn validate_snapshot_target(raw: &str) -> Result<PathBuf, LedgerError> {
             reason: "must not contain NUL".to_string(),
         });
     }
+    if raw.contains('\\') {
+        return Err(LedgerError::InvalidField {
+            field: "target",
+            reason: format!("must not contain backslash separators: '{raw}'"),
+        });
+    }
+    // `Path::components()` normalizes away non-leading `.` segments and
+    // repeated `/` separators while `path.to_path_buf()` preserves `raw`
+    // verbatim, so inspect raw segments before `Path` component traversal.
+    if raw.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(LedgerError::InvalidField {
+            field: "target",
+            reason: format!("must not contain '.' or '..' components: '{raw}'"),
+        });
+    }
+    if raw.contains("//") {
+        return Err(LedgerError::InvalidField {
+            field: "target",
+            reason: format!("must not contain empty path components: '{raw}'"),
+        });
+    }
     let path = Path::new(raw);
     if path.is_absolute() {
         return Err(LedgerError::InvalidField {
@@ -697,18 +718,13 @@ pub struct DecisionCommand {
 impl DecisionCommand {
     /// Parse a whitespace-separated command prefix.
     pub fn parse(raw: &str) -> Result<Self, LedgerError> {
-        if raw.trim().is_empty() {
+        let mut tokens = raw.split_whitespace();
+        let Some(program) = tokens.next() else {
             return Err(LedgerError::InvalidField {
                 field: "decision-command",
                 reason: "must be non-empty (got empty or whitespace-only)".to_string(),
             });
-        }
-        let mut tokens = raw.split_whitespace();
-        // `split_whitespace` yields at least one non-empty token after the
-        // trim-check above; the unwrap mirrors the invariant.
-        let program = tokens
-            .next()
-            .expect("split_whitespace yields at least one token after non-empty trim");
+        };
         let fixed_args: Vec<String> = tokens.map(|s| s.to_string()).collect();
         Ok(Self {
             program: PathBuf::from(program),
@@ -855,18 +871,32 @@ fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Captured subprocess result with explicit truncation tracking.
+struct BoundedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+}
+
 /// One bounded, non-blocking drain pass over a piped stream.
 ///
 /// Reads until the stream reports no more immediately-available bytes, the
 /// writer closes it, or `limit` bytes were consumed — whichever comes
 /// first, so a pass never waits on another process. At most
 /// [`MAX_CAPTURED_OUTPUT_BYTES`] are retained; the rest of the pass still
-/// drains so a flooding writer does not block on a full pipe.
+/// drains so a flooding writer does not block on a full pipe, while setting
+/// `*truncated = true` whenever bytes beyond the capture cap are observed.
 ///
 /// Returns `true` when at least one byte was consumed, and replaces the
 /// reader with `None` once the stream reached EOF (or errored) so the
 /// caller can drop it.
-fn drain_pass<R: Read + AsRawFd>(pipe: &mut Option<R>, buf: &mut Vec<u8>, limit: usize) -> bool {
+fn drain_pass<R: Read + AsRawFd>(
+    pipe: &mut Option<R>,
+    buf: &mut Vec<u8>,
+    truncated: &mut bool,
+    limit: usize,
+) -> bool {
     let mut consumed = 0usize;
     let mut progress = false;
     let mut scratch = [0u8; 8192];
@@ -883,8 +913,12 @@ fn drain_pass<R: Read + AsRawFd>(pipe: &mut Option<R>, buf: &mut Vec<u8>, limit:
                     consumed += n;
                     progress = true;
                     let room = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(buf.len());
-                    if room > 0 {
-                        buf.extend_from_slice(&scratch[..n.min(room)]);
+                    let keep = n.min(room);
+                    if keep > 0 {
+                        buf.extend_from_slice(&scratch[..keep]);
+                    }
+                    if n > keep {
+                        *truncated = true;
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -908,7 +942,7 @@ fn run_with_timeout(
     args: &[OsString],
     timeout: Duration,
     kind: &'static str,
-) -> Result<std::process::Output, LedgerError> {
+) -> Result<BoundedOutput, LedgerError> {
     let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
@@ -942,25 +976,48 @@ fn run_with_timeout(
 
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+    let pass_limit = MAX_CAPTURED_OUTPUT_BYTES + 1;
     let deadline = std::time::Instant::now() + timeout;
 
     loop {
-        let drained_stdout =
-            drain_pass(&mut stdout_pipe, &mut stdout_buf, MAX_CAPTURED_OUTPUT_BYTES);
-        let drained_stderr =
-            drain_pass(&mut stderr_pipe, &mut stderr_buf, MAX_CAPTURED_OUTPUT_BYTES);
+        let drained_stdout = drain_pass(
+            &mut stdout_pipe,
+            &mut stdout_buf,
+            &mut stdout_truncated,
+            pass_limit,
+        );
+        let drained_stderr = drain_pass(
+            &mut stderr_pipe,
+            &mut stderr_buf,
+            &mut stderr_truncated,
+            pass_limit,
+        );
 
         match child.try_wait() {
             Ok(Some(status)) => {
                 // One more bounded pass picks up whatever the child wrote
-                // before exiting; a writer that outlived it can add no more
-                // than one pipe buffer and never extends the call.
-                drain_pass(&mut stdout_pipe, &mut stdout_buf, MAX_CAPTURED_OUTPUT_BYTES);
-                drain_pass(&mut stderr_pipe, &mut stderr_buf, MAX_CAPTURED_OUTPUT_BYTES);
-                return Ok(std::process::Output {
+                // before exiting; reading up to `MAX_CAPTURED_OUTPUT_BYTES + 1`
+                // ensures a single post-exit drain pass also detects overflow
+                // past the capture cap while never extending the call.
+                drain_pass(
+                    &mut stdout_pipe,
+                    &mut stdout_buf,
+                    &mut stdout_truncated,
+                    pass_limit,
+                );
+                drain_pass(
+                    &mut stderr_pipe,
+                    &mut stderr_buf,
+                    &mut stderr_truncated,
+                    pass_limit,
+                );
+                return Ok(BoundedOutput {
                     status,
                     stdout: stdout_buf,
                     stderr: stderr_buf,
+                    stdout_truncated,
                 });
             }
             Ok(None) => {
@@ -1007,6 +1064,13 @@ impl LedgerAdapter for CliLedgerAdapter {
                 status: output.status.code().unwrap_or(-1),
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        if output.stdout_truncated {
+            return Err(LedgerError::InvalidJson {
+                reason: format!(
+                    "stdout exceeded maximum captured size of {MAX_CAPTURED_OUTPUT_BYTES} bytes"
+                ),
             });
         }
         let stdout = std::str::from_utf8(&output.stdout).map_err(|e| LedgerError::InvalidJson {
@@ -1987,5 +2051,97 @@ mod tests {
         adapter
             .scan(Path::new("/srv/skills/demo-weather"))
             .expect("scan recovers after the failure is consumed");
+    }
+
+    #[test]
+    fn fallback_target_rejects_embedded_dot_and_backslash_segments() {
+        for bad in [
+            ".skill-meta/./versions/v000001.snapshot",
+            ".skill-meta/versions/./v000001.snapshot",
+            ".skill-meta/versions/v000001.snapshot/.",
+            ".skill-meta//versions/v000001.snapshot",
+            ".skill-meta/versions//v000001.snapshot",
+            ".skill-meta/versions/..\\..\\etc\\passwd",
+            ".skill-meta/versions/v000001\\..\\evil.snapshot",
+        ] {
+            let json = serde_json::json!({
+                "schemaVersion": 1,
+                "skillName": "demo-weather",
+                "status": "deny",
+                "decision": "fallback",
+                "target": bad,
+                "targetKind": "relative_to_skill_dir",
+            })
+            .to_string();
+            let err = LedgerResolveResult::from_json_str(&json)
+                .expect_err("embedded '.', '//', or backslash segment must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    LedgerError::InvalidField {
+                        field: "target",
+                        ..
+                    }
+                ),
+                "expected InvalidField(target) for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_adapter_resolve_rejects_stdout_exceeding_capture_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid_json = valid_current_json();
+
+        // Exact-cap payload (MAX_CAPTURED_OUTPUT_BYTES of valid JSON + spaces) must succeed.
+        let exact_path = dir.path().join("exact.txt");
+        let mut exact_raw = valid_json.as_bytes().to_vec();
+        exact_raw.resize(MAX_CAPTURED_OUTPUT_BYTES, b' ');
+        std::fs::write(&exact_path, &exact_raw).unwrap();
+
+        let exact_script = dir.path().join("emit_exact.sh");
+        std::fs::write(
+            &exact_script,
+            format!("#!/bin/sh\nexec /bin/cat '{}'\n", exact_path.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exact_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exact_cmd =
+            DecisionCommand::parse(&format!("/bin/sh {}", exact_script.display())).unwrap();
+        let exact_adapter = CliLedgerAdapter::with_timeout(exact_cmd, Duration::from_secs(5));
+        let exact_res = exact_adapter
+            .resolve(Path::new("/srv/skills/demo-weather"))
+            .expect("resolve at exact MAX_CAPTURED_OUTPUT_BYTES must succeed");
+        assert_eq!(exact_res.decision, LedgerDecision::Current);
+
+        // Oversized payload (valid JSON padded to cap + trailing bytes) must fail on resolve.
+        let payload_path = dir.path().join("oversized.txt");
+        let mut raw = valid_json.as_bytes().to_vec();
+        raw.resize(MAX_CAPTURED_OUTPUT_BYTES, b' ');
+        raw.extend_from_slice(b"TRAILING_GARBAGE_PAST_CAPTURE_CAP\n");
+        std::fs::write(&payload_path, &raw).unwrap();
+
+        let script = dir.path().join("emit_oversized.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec /bin/cat '{}'\n", payload_path.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cmd = DecisionCommand::parse(&format!("/bin/sh {}", script.display())).unwrap();
+        let adapter = CliLedgerAdapter::with_timeout(cmd, Duration::from_secs(5));
+
+        adapter
+            .scan(Path::new("/srv/skills/demo-weather"))
+            .expect("scan ignores oversized stdout when exit status is 0");
+
+        let err = adapter
+            .resolve(Path::new("/srv/skills/demo-weather"))
+            .expect_err("resolve must reject stdout truncated at MAX_CAPTURED_OUTPUT_BYTES");
+        assert!(
+            matches!(err, LedgerError::InvalidJson { .. }),
+            "expected InvalidJson for truncated resolve stdout, got {err:?}"
+        );
     }
 }

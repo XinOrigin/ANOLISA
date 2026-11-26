@@ -1,6 +1,7 @@
 """Exercise managed handler ownership without installing a native SDK or model."""
 import asyncio
 from dataclasses import dataclass
+import gc
 import importlib.util
 import json
 from pathlib import Path
@@ -73,6 +74,7 @@ class Scope:
         pass
 
     async def invoke(self, hook, payload):
+        json.dumps(payload, ensure_ascii=False, allow_nan=False)
         self.events.append(copy_json(payload))
         if payload["event"] == "tool.before" and self.identity_after_before:
             self.identity = True
@@ -85,6 +87,8 @@ class Scope:
             if self.fail_after == "validity":
                 self.failed = True
                 raise RuntimeError("fixture scope validity failure")
+            if isinstance(self.fail_after, bytes):
+                return 0, self.fail_after
             return self.fail_after, b""
         if (payload["event"] == "tool.before" and self.deny
                 and (payload["server"], payload["tool_name"]) == ("local", "touch")):
@@ -95,11 +99,11 @@ class Scope:
         return 0, b"{}"
 
 
-def claim(tool, scope, on_error="report"):
+def claim(tool, scope, on_error="report", replace_result=False):
     managed = mcp.create_sdk_mcp_server("business", tools=[tool])
     bridge = SimpleNamespace(scope=scope, failure=None, mcp_servers=set(), config={"hooks": [
         {"event": "tool.before", "step": "check", "on_error": "block", "replace_result": False},
-        {"event": "tool.after", "step": "record", "on_error": on_error, "replace_result": False},
+        {"event": "tool.after", "step": "record", "on_error": on_error, "replace_result": replace_result},
     ]})
 
     async def stop():
@@ -151,6 +155,10 @@ class HandlerOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(managed.claimed)
         with self.assertRaises(ValueError):
             managed.claim("retry", owner)
+        unclaimed = mcp.create_sdk_mcp_server("direct")
+        with self.assertRaises(ValueError):
+            unclaimed.claim("ambiguous__key", owner)
+        self.assertFalse(unclaimed.claimed)
 
     async def test_batch_failure_preserves_fresh_server_and_existing_owner(self):
         fresh = mcp.create_sdk_mcp_server("fresh")
@@ -167,6 +175,13 @@ class HandlerOwnershipTests(unittest.IsolatedAsyncioTestCase):
         retry = SimpleNamespace(mcp_names=set(), mcp_servers=set())
         self.assertEqual(mcp.claim_servers({"fresh": fresh}, retry), [fresh])
         self.assertIs(fresh.bridge, retry)
+        snapshotted = mcp.snapshot_servers({"ephemeral": mcp.create_sdk_mcp_server("ephemeral")})
+        gc.collect()
+        adopted = SimpleNamespace(mcp_names=set(), mcp_servers=set())
+        claimed = mcp.claim_servers({**snapshotted, "raw": {"type": "sdk", "instance": {}}}, adopted)
+        self.assertEqual((len(claimed), adopted.mcp_servers), (1, {"ephemeral"}))
+        with self.assertRaises(ValueError):
+            mcp.claim_servers(snapshotted, SimpleNamespace(mcp_names=set(), mcp_servers=set()))
 
     async def test_invalid_batch_never_consumes_a_claim(self):
         for alias in ("second", "ambiguous__key", "invalid key"):
@@ -277,6 +292,21 @@ class HandlerOwnershipTests(unittest.IsolatedAsyncioTestCase):
                         pending.cancel()
                     await asyncio.gather(pending, return_exceptions=True)
                     managed.release()
+        for original, directive in (
+            ({"content": [{"type": "text", "text": None}]},
+             b'{"aw_mcp_result":{"content":[{"type":"text","text":"replaced"}]}}'),
+            ({"content": [{"type": "text", "text": "checked"}]}, b'["aw_mcp_result"]'),
+            ({"content": [{"type": "text", "text": "checked"}]}, b'{"aw_mcp_result":{"content":[null]}}'),
+        ):
+            with self.subTest(directive=directive):
+                async def ineligible(arguments, result=original):
+                    return copy_json(result)
+                managed, invoke = claim(SdkMcpTool("touch", "Check", {}, ineligible),
+                                        Scope(fail_after=directive), "block", True)
+                with self.assertRaises(bridge_module.CallbackFailure):
+                    await invoke({})
+                self.assertEqual(managed.bridge.failure, "stopped")
+                managed.release()
 
     async def test_report_faults_keep_the_checked_result_and_client(self):
         for fault in (3, "raise"):
@@ -293,6 +323,16 @@ class HandlerOwnershipTests(unittest.IsolatedAsyncioTestCase):
                                  ["tool.before", "tool.after"])
                 self.assertIsNone(bridge.failure)
                 managed.release()
+
+        async def non_finite(arguments):
+            return {"content": [{"type": "text", "text": "checked"}], "score": float("nan")}
+
+        scope = Scope()
+        managed, invoke = claim(SdkMcpTool("touch", "Invalid float", {}, non_finite), scope)
+        with self.assertRaisesRegex(bridge_module.CallbackFailure, "invalid handler result"):
+            await invoke({})
+        self.assertEqual((managed.bridge.failure, len(scope.events)), ("stopped", 1))
+        managed.release()
 
     async def test_block_before_identity_and_validity_faults_still_stop_the_task(self):
         for on_error, fault, scope, ran in (
@@ -318,6 +358,32 @@ class HandlerOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bridge.failure, "stopped")
                 self.assertEqual(calls, [{"value": "fixture"}] if ran else [])
                 managed.release()
+
+        entered = asyncio.Event()
+        async def interrupted(arguments):
+            entered.set()
+            await asyncio.Event().wait()
+        managed, _ = claim(SdkMcpTool("touch", "Interrupted", {}, interrupted), Scope())
+        ledger = managed.bridge.invocations
+        ledger.begin()
+        entry = ledger.produce("mcp__local__touch")
+        await ledger.register(entry, {"value": "fixture"})
+        token = dispatch.set(ledger.reserve("native-request", entry.call_id, "mcp:local"))
+        task = asyncio.create_task(managed["instance"].tools[0].handler({"value": "fixture"}))
+        dispatch.reset(token)
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            body = {"messages": [{"content": [{"type": "tool_result",
+                "tool_use_id": entry.call_id, "is_error": True}]}]}
+            with self.assertRaisesRegex(bridge_module.CallbackFailure, "precedes tool result"):
+                await ledger.check_model_request(body)
+            self.assertEqual(entry.phase, "before")
+        finally:
+            await ledger.drain()
+            managed.release()
 
 
 if __name__ == "__main__":

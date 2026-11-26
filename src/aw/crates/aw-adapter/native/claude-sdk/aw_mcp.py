@@ -19,6 +19,22 @@ SOURCE = "claude-sdk-mcp/v1"
 _servers = weakref.WeakKeyDictionary()
 
 
+def _copy_strict_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+
+
+def _has_single_text_block(result: Any) -> bool:
+    blocks = result.get("content") if isinstance(result, dict) else None
+    return (isinstance(blocks, list) and len(blocks) == 1 and isinstance(blocks[0], dict)
+            and blocks[0].get("type") == "text" and isinstance(blocks[0].get("text"), str))
+
+
+def _server_key(value: str) -> str:
+    if "__" in identifier(value):
+        raise ValueError("Managed MCP configurations forbid ambiguous server keys containing __")
+    return value
+
+
 def identifier(value: str) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None:
         raise ValueError(
@@ -64,7 +80,10 @@ class ManagedServer(dict):
 
             wrapped.append(replace(tool, handler=handler))
         super().__init__(sdk_server(name, version, wrapped))
-        _servers[self["instance"]] = weakref.ref(self)
+        instance = self["instance"]
+        if hasattr(instance, "__dict__"):
+            setattr(instance, "_aw_managed_server", self)
+        _servers[instance] = weakref.ref(self)
 
     @property
     def claimed(self) -> bool:
@@ -85,7 +104,7 @@ class ManagedServer(dict):
     def claim(self, key: str, bridge: Any) -> set[str]:
         if self.claimed:
             raise ValueError("Create a fresh AW MCP server for each task client")
-        self._claim = _Claim(identifier(key), bridge)
+        self._claim = _Claim(_server_key(key), bridge)
         bridge.mcp_servers.add(self._claim.key)
         return {f"mcp__{self._claim.key}__{name}" for name in self._names}
 
@@ -136,25 +155,21 @@ class ManagedServer(dict):
                 directive = json.loads(output or b"{}")
                 if directive == {}:
                     continue
-                if not hook["replace_result"] or set(directive) != {"aw_mcp_result"}:
+                if (payload["event"] != "tool.after" or not hook["replace_result"]
+                        or not isinstance(directive, dict) or set(directive) != {"aw_mcp_result"}):
                     raise CallbackFailure("MCP Hook returned an unsupported directive")
                 original = payload["tool_result"]
                 result = directive["aw_mcp_result"]
-                if payload["is_error"] or "structuredContent" in original:
+                if (payload["is_error"] or "structuredContent" in original
+                        or not _has_single_text_block(original)):
                     raise CallbackFailure("MCP result is not eligible for replacement")
-                blocks = result.get("content") if isinstance(result, dict) else None
-                if (
-                    not isinstance(blocks, list)
-                    or len(blocks) != 1
-                    or blocks[0].get("type") != "text"
-                    or not isinstance(blocks[0].get("text"), str)
-                ):
+                if not _has_single_text_block(result):
                     raise CallbackFailure("MCP replacement requires one text block")
-                compared = _copy_json(result)
+                compared = _copy_strict_json(result)
                 compared["content"][0]["text"] = original["content"][0]["text"]
                 if compared != original:
                     raise CallbackFailure("MCP replacement changed the native result envelope")
-                return result
+                return _copy_strict_json(result)
             return None
         except Exception:
             bridge.failure_reply(payload["event"], {})
@@ -191,17 +206,17 @@ class ManagedServer(dict):
             "invocation_id": entry.call_id,
             "server": claim.key,
             "tool_name": tool.name,
-            "tool_input": _copy_json(arguments),
+            "tool_input": _copy_strict_json(arguments),
         }
         denial = await self.steps(payload)
         if denial is not None:
             await bridge.invocations.finish(entry)
             return denial
         await bridge.scope.validate()
-        entry.phase = "allowed"
         try:
-            result = await tool.handler(_copy_json(arguments))
+            result = await tool.handler(_copy_strict_json(arguments))
         except Exception as error:
+            entry.phase = "allowed"
             bridge.invocations.claim(entry.call_id, entry.name, arguments, "after")
             await self.steps(
                 {
@@ -217,7 +232,7 @@ class ManagedServer(dict):
             await bridge.invocations.finish(entry)
             raise
         try:
-            snapshot = _copy_json(result)
+            snapshot = _copy_strict_json(result)
             if (
                 not isinstance(snapshot, dict)
                 or "isError" in snapshot
@@ -230,6 +245,7 @@ class ManagedServer(dict):
             raise CallbackFailure(
                 "AW stopped the MCP task after an invalid handler result"
             ) from None
+        entry.phase = "allowed"
         bridge.invocations.claim(entry.call_id, entry.name, arguments, "after")
         replacement = await self.steps(
             {
@@ -260,33 +276,32 @@ def snapshot_servers(servers: Any) -> Any:
     }
 
 
+def _lookup_managed(server: Any) -> ManagedServer | None:
+    if not isinstance(server, dict) or server.get("type") != "sdk":
+        return None
+    try:
+        reference = _servers.get(server.get("instance"))
+    except TypeError:
+        return None
+    return reference() if reference is not None else None
+
+
 def claim_servers(servers: Any, bridge: Any) -> list[ManagedServer]:
     pending = []
     seen = set()
     if isinstance(servers, dict):
         # Delimiter-bearing server keys can alias another server's tool namespace.
-        managed_present = any(
-            isinstance(value, dict)
-            and value.get("type") == "sdk"
-            and _servers.get(value.get("instance")) is not None
-            for value in servers.values()
-        )
+        managed_present = any(_lookup_managed(value) is not None for value in servers.values())
         if managed_present:
             for key in servers:
-                identifier(key)
-                if "__" in key:
-                    raise ValueError(
-                        "Managed MCP configurations forbid ambiguous server keys containing __"
-                    )
+                _server_key(key)
         for key, server in servers.items():
-            if isinstance(server, dict) and server.get("type") == "sdk":
-                reference = _servers.get(server.get("instance"))
-                managed = reference() if reference is not None else None
-                if managed is not None:
-                    if managed.claimed or id(managed) in seen:
-                        raise ValueError("Create a fresh AW MCP server for each task client")
-                    seen.add(id(managed))
-                    pending.append((key, managed))
+            managed = _lookup_managed(server)
+            if managed is not None:
+                if managed.claimed or id(managed) in seen:
+                    raise ValueError("Create a fresh AW MCP server for each task client")
+                seen.add(id(managed))
+                pending.append((key, managed))
     # Complete synchronous validation before consuming any server's one-use claim.
     for key, managed in pending:
         bridge.mcp_names.update(managed.claim(key, bridge))

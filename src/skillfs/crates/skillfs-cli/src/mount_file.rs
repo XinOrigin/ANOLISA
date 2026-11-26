@@ -1,7 +1,9 @@
 //! Explicit mount sources and deterministic, whole-skill precedence.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use skillfs_core::{ParseConfig, store::SkillStore};
@@ -95,18 +97,7 @@ impl MountFile {
         if !self.mountpoint.is_absolute() || self.sources.iter().any(|p| !p.is_absolute()) {
             return Err("mount config sources and mountpoint must be absolute paths".into());
         }
-        // Resolve existing ancestors even when the mount directory is new.
-        let mut ancestor = self.mountpoint.as_path();
-        let mut suffix = Vec::new();
-        while !ancestor.exists() {
-            suffix.push(ancestor.file_name().ok_or("invalid mountpoint")?);
-            ancestor = ancestor.parent().ok_or("invalid mountpoint parent")?;
-        }
-        let mut mountpoint = ancestor.canonicalize()?;
-        for part in suffix.into_iter().rev() {
-            mountpoint.push(part);
-        }
-        self.mountpoint = super::lexical_absolute(&mountpoint)?;
+        self.mountpoint = resolve_mountpoint(&self.mountpoint)?;
         observer.mountpoint(&self.mountpoint);
         let mut roots = Vec::new();
         for source in self.sources {
@@ -130,6 +121,83 @@ impl MountFile {
         self.sources = roots;
         Ok(self)
     }
+}
+
+const MAX_SYMLINK_DEPTH: usize = 40;
+
+enum PathPart {
+    RootDir,
+    ParentDir,
+    Normal(OsString),
+}
+
+fn push_components(stack: &mut Vec<PathPart>, path: &Path) {
+    let start = stack.len();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::CurDir => {}
+            Component::RootDir => stack.push(PathPart::RootDir),
+            Component::ParentDir => stack.push(PathPart::ParentDir),
+            Component::Normal(name) => stack.push(PathPart::Normal(name.to_os_string())),
+        }
+    }
+    stack[start..].reverse();
+}
+
+/// Resolve an absolute mountpoint component-by-component without `Path::exists()`
+/// so dangling symlinks, loops, non-directories, and I/O errors are not masked.
+fn resolve_mountpoint(path: &Path) -> Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    let mut pending = Vec::new();
+    push_components(&mut pending, path);
+    let (mut missing_depth, mut symlink_hops) = (0usize, 0usize);
+    let fail = |msg: &dyn std::fmt::Display| -> Box<dyn std::error::Error> {
+        format!("cannot resolve mountpoint '{}': {msg}", path.display()).into()
+    };
+    while let Some(part) = pending.pop() {
+        match part {
+            PathPart::RootDir => {
+                resolved.clear();
+                resolved.push(Path::new("/"));
+                missing_depth = 0;
+            }
+            PathPart::ParentDir => {
+                if missing_depth > 0 {
+                    return Err(fail(&"parent traversal through non-existent directory"));
+                }
+                resolved.pop();
+            }
+            PathPart::Normal(name) => {
+                if missing_depth > 0 {
+                    resolved.push(name);
+                    missing_depth += 1;
+                    continue;
+                }
+                let candidate = resolved.join(&name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        symlink_hops += 1;
+                        if symlink_hops > MAX_SYMLINK_DEPTH {
+                            return Err(fail(&"too many levels of symbolic links"));
+                        }
+                        let target = std::fs::read_link(&candidate).map_err(|e| fail(&e))?;
+                        push_components(&mut pending, &target);
+                    }
+                    Ok(meta) if meta.file_type().is_dir() => resolved = candidate,
+                    Ok(_) => return Err(fail(&"not a directory")),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                        missing_depth = 1;
+                    }
+                    Err(e) => return Err(fail(&e)),
+                }
+            }
+        }
+    }
+    if resolved.as_os_str().is_empty() {
+        return Err("invalid mountpoint".into());
+    }
+    Ok(resolved)
 }
 
 /// Merge complete skills by directory name without changing source files.
@@ -586,5 +654,60 @@ mod tests {
             err.contains("demo/SKILL.md"),
             "confirmed unreadable SKILL.md must still abort mount, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    fn validate_with(mountpoint: PathBuf, root: &Path) -> Result<MountFile> {
+        MountFile {
+            mountpoint,
+            sources: vec![root.to_path_buf()],
+        }
+        .validate()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_mountpoint_symlinks_resolve_and_enforce_overlap() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let canon_temp = temp.path().canonicalize().unwrap();
+        let (root, sub) = (temp.path().join("source"), temp.path().join("sub"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        let (direct, rel) = (temp.path().join("direct-link"), sub.join("rel-link"));
+        let (alias, chained) = (temp.path().join("alias"), temp.path().join("chained-link"));
+        symlink(root.join("new-mount"), &direct).unwrap();
+        symlink("../source/missing", &rel).unwrap();
+        symlink(&root, &alias).unwrap();
+        symlink(alias.join("new-mount"), &chained).unwrap();
+        for mountpoint in [direct, rel.join("mount"), chained] {
+            let err = validate_with(mountpoint, &root).unwrap_err().to_string();
+            assert!(err.contains("must not overlap"), "got: {err}");
+        }
+        let safe = temp.path().join("safe-link");
+        symlink(temp.path().join("outside/new-mount"), &safe).unwrap();
+        let validated = validate_with(safe, &root).unwrap();
+        assert_eq!(validated.mountpoint, canon_temp.join("outside/new-mount"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mountpoint_rejects_symlink_loops_and_non_directory_components() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        let (loop_a, loop_b) = (temp.path().join("loop-a"), temp.path().join("loop-b"));
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        let err = validate_with(loop_a, &root).unwrap_err().to_string();
+        assert!(err.contains("symbolic links"), "got: {err}");
+        let file = temp.path().join("regular-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        for mountpoint in [file.clone(), file.join("child")] {
+            let err = validate_with(mountpoint, &root).unwrap_err().to_string();
+            assert!(err.contains("not a directory"), "got: {err}");
+        }
+        assert!(validate_with(temp.path().join("missing/../mount"), &root).is_err());
     }
 }

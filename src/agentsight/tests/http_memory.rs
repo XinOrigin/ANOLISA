@@ -997,3 +997,130 @@ fn stacked_sse_codings_preserve_http1_capture() {
         }
     }
 }
+
+#[test]
+fn server_side_compact_sse_matches_response_direction_and_ignores_opposite_rw() {
+    let chunk = |payload: &[u8]| -> Vec<u8> {
+        [
+            format!("{:x}\r\n", payload.len()).into_bytes(),
+            payload.to_vec(),
+            b"\r\n".to_vec(),
+        ]
+        .concat()
+    };
+    let part1 = record(json!({
+        "id": "srv-compact", "object": "chat.completion.chunk", "model": "fixture",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": "complete "},
+            "finish_reason": null}]
+    }));
+    let part2 = common::make_openai_sse_chunk("srv-compact", "fixture", "answer", 12, 8);
+
+    let mut aggregator = Aggregator::new();
+    assert!(
+        feed(
+            &mut aggregator,
+            1,
+            0,
+            &common::make_openai_request_bytes("fixture", "hello", true)
+        )
+        .is_empty()
+    );
+    assert!(
+        feed(
+            &mut aggregator,
+            1,
+            1,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_empty()
+    );
+
+    // Opposite-direction rw=0 reads (both raw bytes and SSE-like terminators)
+    // must not abort, corrupt, or prematurely complete the rw=1 stream.
+    assert!(feed(&mut aggregator, 1, 0, b"client-keepalive\r\n").is_empty());
+    assert!(feed(&mut aggregator, 1, 0, b"data: [DONE]\n\n").is_empty());
+    assert!(feed(&mut aggregator, 1, 0, b"0\r\n\r\n").is_empty());
+
+    assert!(feed(&mut aggregator, 1, 1, &chunk(&part1)).is_empty());
+    assert!(feed(&mut aggregator, 1, 1, &chunk(&part2)).is_empty());
+    assert!(aggregator.has_pending());
+
+    let results = feed(&mut aggregator, 1, 1, b"0\r\n\r\n");
+    let [AggregatedResult::SseComplete(pair)] = results.as_slice() else {
+        panic!("expected SseComplete for server-side rw=1 stream, got {results:?}");
+    };
+    assert_eq!(pair.response.captured_sse_event_count, Some(2));
+    assert!(pair.response.sse_continuation_bytes.is_none());
+
+    let captured = calls(&results);
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].call_id, "srv-compact");
+    assert_eq!(captured[0].model, "fixture");
+    assert_eq!(captured[0].token_usage.as_ref().unwrap().total_tokens, 20);
+    assert!(
+        matches!(captured[0].response.messages[0].parts.as_slice(), [agentsight::genai::MessagePart::Text { content }] if content == "complete answer")
+    );
+    assert!(!aggregator.has_pending());
+
+    let stacked_plain = [part1, part2, common::make_sse_done()].concat();
+    let encoded = compressed("gzip, br", &stacked_plain);
+    let wire = [
+        format!("{:x}\r\n", encoded.len()).into_bytes(),
+        encoded.clone(),
+        b"\r\n0\r\n\r\n".to_vec(),
+    ]
+    .concat();
+    for raw in [false, true] {
+        for fragment_size in [1, 17, wire.len()] {
+            let mut aggregator = Aggregator::with_limits(
+                4,
+                &RuntimeLimits {
+                    retain_raw_sse: raw,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                feed(
+                    &mut aggregator,
+                    2,
+                    0,
+                    &common::make_openai_request_bytes("fixture", "hello", true)
+                )
+                .is_empty()
+            );
+            assert!(
+                feed(
+                    &mut aggregator,
+                    2,
+                    1,
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip, br\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .is_empty()
+            );
+            assert!(feed(&mut aggregator, 2, 0, b"0\r\n\r\n").is_empty());
+            let mut results = Vec::new();
+            for fragment in wire.chunks(fragment_size) {
+                results.extend(feed(&mut aggregator, 2, 1, fragment));
+            }
+            let captured = calls(&results);
+            assert_eq!(
+                captured.len(),
+                1,
+                "raw={raw}, fragment={fragment_size}: {results:?}"
+            );
+            assert_eq!(captured[0].call_id, "srv-compact");
+            assert_eq!(captured[0].token_usage.as_ref().unwrap().total_tokens, 20);
+            let [AggregatedResult::SseComplete(pair)] = results.as_slice() else {
+                panic!("expected SseComplete result");
+            };
+            assert!(pair.response.sse_continuation_bytes.is_none());
+            if raw {
+                assert_eq!(pair.response.sse_events.len(), 3);
+            }
+            assert!(
+                matches!(captured[0].response.messages[0].parts.as_slice(), [agentsight::genai::MessagePart::Text { content }] if content == "complete answer")
+            );
+            assert!(!aggregator.has_pending());
+        }
+    }
+}

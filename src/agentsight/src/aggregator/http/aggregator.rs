@@ -1000,6 +1000,9 @@ impl HttpConnectionAggregator {
         if self.accepts_response_bytes(ssl_event) || self.starts_response(ssl_event) {
             return self.process_response_bytes(ssl_event);
         }
+        if self.ignores_legacy_sse(&connection_id, ssl_event.rw) {
+            return None;
+        }
         let state = self.connections.pop(&connection_id)?;
 
         match state {
@@ -1234,6 +1237,9 @@ impl HttpConnectionAggregator {
         connection_id: &ConnectionId,
         mut sse_event: ParsedSseEvent,
     ) -> Option<AggregatedResult> {
+        if self.ignores_legacy_sse(connection_id, sse_event.source_event().rw) {
+            return None;
+        }
         let state = self.connections.pop(connection_id)?;
 
         match state {

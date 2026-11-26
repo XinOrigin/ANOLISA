@@ -101,11 +101,24 @@ impl HttpConnectionAggregator {
         }
     }
 
+    fn active_sse_direction(&self, id: &ConnectionId) -> Option<i32> {
+        match self.connections.peek(id) {
+            Some(ConnectionState::SseActive {
+                response_headers, ..
+            }) => Some(response_headers.source_event.rw),
+            _ => None,
+        }
+    }
+
     pub(crate) fn accepts_compact_sse_bytes(&self, event: &SslEvent) -> bool {
-        event.rw == 0
-            && self
-                .sse_streams
-                .contains(&ConnectionId::from_ssl_event(event))
+        let id = ConnectionId::from_ssl_event(event);
+        self.sse_streams.contains(&id) && self.active_sse_direction(&id) == Some(event.rw)
+    }
+
+    /// Ignore reads when `SseStream` owns the stream or the read belongs to the opposite direction.
+    pub(super) fn ignores_legacy_sse(&self, id: &ConnectionId, rw: i32) -> bool {
+        self.active_sse_direction(id)
+            .is_some_and(|response_rw| self.sse_streams.contains(id) || response_rw != rw)
     }
 
     pub(crate) fn accepts_unmatched_sse(&self, event: &SslEvent) -> bool {
@@ -176,5 +189,150 @@ fn reason(error: &std::io::Error) -> RemoveReason {
         RemoveReason::OverBudget
     } else {
         RemoveReason::ProtocolError
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::http::ParsedRequest;
+    use std::collections::HashMap;
+
+    fn ssl_event(ssl_ptr: u64, rw: i32, timestamp_ns: u64, bytes: &[u8]) -> Rc<SslEvent> {
+        Rc::new(SslEvent {
+            source: 0,
+            timestamp_ns,
+            delta_ns: 0,
+            pid: std::process::id(),
+            tid: 1,
+            uid: 0,
+            len: bytes.len() as u32,
+            rw,
+            comm: "fixture".into(),
+            buf: bytes.to_vec(),
+            is_handshake: false,
+            ssl_ptr,
+        })
+    }
+
+    fn post_request(ssl_ptr: u64, rw: i32) -> ParsedRequest {
+        let body = b"{}";
+        ParsedRequest {
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            version: 11,
+            headers: HashMap::from([("content-length".into(), body.len().to_string())]),
+            body_offset: 0,
+            body_len: body.len(),
+            source_event: ssl_event(ssl_ptr, rw, 1_000, body),
+            reassembled_body: None,
+        }
+    }
+
+    fn chunked_sse_headers(ssl_ptr: u64, rw: i32) -> ParsedResponse {
+        ParsedResponse {
+            version: 11,
+            status_code: 200,
+            reason: "OK".into(),
+            headers: HashMap::from([
+                ("content-type".into(), "text/event-stream".into()),
+                ("transfer-encoding".into(), "chunked".into()),
+            ]),
+            body_offset: 0,
+            body_len: 0,
+            source_event: ssl_event(ssl_ptr, rw, 1_500, b""),
+        }
+    }
+
+    fn chunk(payload: &[u8]) -> Vec<u8> {
+        let mut framed = format!("{:x}\r\n", payload.len()).into_bytes();
+        framed.extend_from_slice(payload);
+        framed.extend_from_slice(b"\r\n");
+        framed
+    }
+
+    #[test]
+    fn compact_sse_accepts_server_side_response_direction() {
+        let mut http = HttpConnectionAggregator::new();
+        http.set_compact_sse(true);
+        http.process_request(post_request(7, 0));
+        assert!(http.process_response(chunked_sse_headers(7, 1)).is_none());
+
+        let delta = chunk(
+            b"data: {\"id\":\"srv\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+        );
+        let delta_ev = ssl_event(7, 1, 2_000, &delta);
+        assert!(http.accepts_compact_sse_bytes(&delta_ev));
+        assert!(http.process_raw_body_data(&delta_ev).is_none());
+
+        let end_ev = ssl_event(7, 1, 3_000, b"0\r\n\r\n");
+        assert!(http.accepts_compact_sse_bytes(&end_ev));
+        let Some(AggregatedResult::SseComplete(pair)) = http.process_raw_body_data(&end_ev) else {
+            panic!("server-side compact SSE stream must complete on chunk terminator");
+        };
+        assert_eq!(pair.response.captured_sse_event_count, Some(1));
+        assert_eq!(pair.response.completion_timestamp_ns, Some(3_000));
+        assert!(pair.response.body_string().contains("hello"));
+        assert!(!http.accepts_compact_sse_bytes(&end_ev));
+        assert!(http.take_ready().is_empty());
+    }
+
+    #[test]
+    fn compact_sse_rejects_opposite_direction_bytes_on_server_side_stream() {
+        let mut http = HttpConnectionAggregator::new();
+        http.set_compact_sse(true);
+        http.process_request(post_request(8, 0));
+        assert!(http.process_response(chunked_sse_headers(8, 1)).is_none());
+
+        let opposite = ssl_event(
+            8,
+            0,
+            2_000,
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            !http.accepts_compact_sse_bytes(&opposite),
+            "opposite-direction bytes must not be fed into a server-side SSE stream"
+        );
+        assert!(http.process_raw_body_data(&opposite).is_none());
+        assert!(
+            http.take_ready().is_empty(),
+            "opposite-direction bytes must not abort the active SSE stream"
+        );
+
+        let payload = chunk(
+            b"data: {\"id\":\"srv2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"intact\"}}]}\n\n",
+        );
+        let mut final_bytes = payload;
+        final_bytes.extend_from_slice(b"0\r\n\r\n");
+        let end_ev = ssl_event(8, 1, 3_500, &final_bytes);
+        let Some(AggregatedResult::SseComplete(pair)) = http.process_raw_body_data(&end_ev) else {
+            panic!("server-side compact SSE stream must remain intact");
+        };
+        assert!(pair.response.body_string().contains("intact"));
+        assert!(pair.response.sse_continuation_bytes.is_none());
+    }
+
+    #[test]
+    fn compact_sse_preserves_client_side_direction_matching() {
+        let mut http = HttpConnectionAggregator::new();
+        http.set_compact_sse(true);
+        http.process_request(post_request(9, 1));
+        assert!(http.process_response(chunked_sse_headers(9, 0)).is_none());
+
+        let req_dir = ssl_event(9, 1, 2_000, b"POST /next HTTP/1.1\r\n\r\n");
+        assert!(!http.accepts_compact_sse_bytes(&req_dir));
+
+        let mut payload = chunk(
+            b"data: {\"id\":\"cli\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        );
+        payload.extend_from_slice(b"0\r\n\r\n");
+        let resp_dir = ssl_event(9, 0, 2_500, &payload);
+        assert!(http.accepts_compact_sse_bytes(&resp_dir));
+        let Some(AggregatedResult::SseComplete(pair)) = http.process_raw_body_data(&resp_dir)
+        else {
+            panic!("client-side compact SSE stream must complete");
+        };
+        assert!(pair.response.body_string().contains("ok"));
     }
 }

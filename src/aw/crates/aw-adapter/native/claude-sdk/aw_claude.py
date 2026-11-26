@@ -350,7 +350,12 @@ class Bridge:
             )
         hooks = {event: list(matchers) for event, matchers in (options.hooks or {}).items()}
         final_enforcing = self.final is not None and self.final.enforcing
-        before = final_enforcing or any(hook["event"] == "tool.before" for hook in self.config["hooks"])
+        resident = hasattr(self, "invocations")
+        before = (
+            final_enforcing
+            or resident
+            or any(hook["event"] == "tool.before" for hook in self.config["hooks"])
+        )
         if before:
             if options.permission_prompt_tool_name is not None:
                 raise ValueError("AW tool.before does not support permission_prompt_tool_name")
@@ -373,26 +378,38 @@ class Bridge:
                     safe_callbacks.append(checked)
                 safe_matchers.append(replace(matcher, hooks=safe_callbacks))
             hooks["PreToolUse"] = safe_matchers
-        if any(hook["replace_result"] for hook in self.config["hooks"]):
-            matchers = []
-            for matcher in hooks.get("PostToolUse", []):
-                callbacks = []
-                for callback in matcher.hooks:
+        replace_result = any(hook["replace_result"] for hook in self.config["hooks"])
+        after = (
+            replace_result
+            or self.final is not None
+            or resident
+            or any(hook["event"] == "tool.after" for hook in self.config["hooks"])
+        )
+        if after:
+            for native in ("PostToolUse", "PostToolUseFailure"):
+                matchers = []
+                for matcher in hooks.get(native, []):
+                    callbacks = []
+                    for callback in matcher.hooks:
 
-                    async def observed(
-                        payload: Any, call_id: Any, context: Any, callback: Any = callback
-                    ) -> Any:
-                        result = await callback(_copy_json(payload), call_id, context)
-                        specific = result.get("hookSpecificOutput", {})
-                        if "updatedToolOutput" in specific or "updatedMCPToolOutput" in specific:
-                            raise ValueError(
-                                "Native output rewriting is unsupported with AW result replacement"
-                            )
-                        return result
+                        async def observed(
+                            payload: Any,
+                            call_id: Any,
+                            context: Any,
+                            callback: Any = callback,
+                            check_rewrite: bool = replace_result and native == "PostToolUse",
+                        ) -> Any:
+                            result = await callback(_copy_json(payload), call_id, context)
+                            specific = result.get("hookSpecificOutput", {}) if check_rewrite else {}
+                            if "updatedToolOutput" in specific or "updatedMCPToolOutput" in specific:
+                                raise ValueError(
+                                    "Native output rewriting is unsupported with AW result replacement"
+                                )
+                            return result
 
-                    callbacks.append(observed)
-                matchers.append(replace(matcher, hooks=callbacks))
-            hooks["PostToolUse"] = matchers
+                        callbacks.append(observed)
+                    matchers.append(replace(matcher, hooks=callbacks))
+                hooks[native] = matchers
         for event, native_events in (
             ("tool.before", ["PreToolUse"]),
             ("tool.after", ["PostToolUse", "PostToolUseFailure"]),

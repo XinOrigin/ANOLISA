@@ -1570,12 +1570,24 @@ impl NotifyController {
     /// block the calling thread on socket send or activation reload poll.
     /// The worker picks it up on its next iteration.
     pub fn enqueue_immediate(&self, skill_id: &str, kind: MutationKind, paths: Vec<String>) {
+        if !is_notify_eligible(skill_id) {
+            return;
+        }
+        let had_paths = !paths.is_empty();
+        let filtered_paths: HashSet<String> = paths
+            .into_iter()
+            .filter(|path| !path.is_empty() && !is_skill_meta_path(Path::new(path)))
+            .collect();
+        if had_paths && filtered_paths.is_empty() {
+            return;
+        }
+
         let event_kind = NotifyEventKind::from_mutation_kind(kind);
         let reconcile_generation = self.inner.endpoint_retry.lock().generation;
         self.inner.merge_pending(NotifyPendingState {
             skill_id: skill_id.to_string(),
             event_kind,
-            paths: paths.into_iter().collect(),
+            paths: filtered_paths,
             fire_at: Instant::now(),
             attempts: 0,
             reconcile_generation,
@@ -1669,6 +1681,15 @@ impl NotifyInner {
                 }
                 if incoming.reconcile_generation > existing.reconcile_generation {
                     *existing = incoming;
+                    return false;
+                }
+                if existing.event_kind == NotifyEventKind::Reconcile
+                    && incoming.event_kind != NotifyEventKind::Reconcile
+                {
+                    // A queued reconcile is already a full rescan with empty
+                    // `paths`, so an incoming mutation is subsumed and must
+                    // not disturb the reconcile's backoff deadline or retry
+                    // state.
                     return false;
                 }
                 existing.fire_at = incoming.fire_at;
@@ -2027,13 +2048,12 @@ impl NotifyInner {
                 || business_request_not_sent);
 
         // A3: poll-after-notify activation reload.
-        if let Some(reload) = self
-            .reload_controller
-            .as_ref()
-            .filter(|_| !skip_reload_poll)
-        {
-            let baseline = pre_notify_freshness
-                .expect("reload_controller presence implies freshness was captured");
+        if let (Some(reload), Some(baseline)) = (
+            self.reload_controller
+                .as_ref()
+                .filter(|_| !skip_reload_poll),
+            pre_notify_freshness,
+        ) {
             debug!(
                 skill = %state.skill_id,
                 "notify: starting activation reload poll"
@@ -3880,6 +3900,91 @@ mod tests {
             after_mutation, backed_off,
             "a mutation must leave a backed-off reconcile deadline alone"
         );
+        ctrl.shutdown();
+    }
+
+    #[test]
+    fn enqueue_immediate_does_not_disturb_a_backed_off_reconcile_deadline() {
+        let client = Arc::new(ScriptedNotifyClient::always_failing(
+            ScriptedNotifyFailure::ConnectionRefused,
+        ));
+        let ctrl = retry_controller(client);
+
+        ctrl.enqueue_startup_reconcile(&["alpha".to_string()]);
+        assert_eq!(ctrl.flush_for_testing(), 1);
+        let backed_off = ctrl.inner.pending.lock().get("alpha").unwrap().fire_at;
+
+        ctrl.enqueue_immediate("alpha", MutationKind::Rename, vec!["SKILL.md".to_string()]);
+
+        let (after_fire_at, after_kind, after_paths_empty, after_attempts) = {
+            let pending = ctrl.inner.pending.lock();
+            let entry = pending.get("alpha").expect("alpha still pending");
+            (
+                entry.fire_at,
+                entry.event_kind,
+                entry.paths.is_empty(),
+                entry.attempts,
+            )
+        };
+        assert_eq!(
+            after_fire_at, backed_off,
+            "enqueue_immediate must preserve a backed-off reconcile deadline"
+        );
+        assert_eq!(after_kind, NotifyEventKind::Reconcile);
+        assert!(after_paths_empty);
+        assert_eq!(after_attempts, 1);
+        assert!(
+            ctrl.inner.drain_due(Instant::now()).is_empty(),
+            "backed-off reconcile must not become immediately due after enqueue_immediate"
+        );
+        ctrl.shutdown();
+    }
+
+    #[test]
+    fn enqueue_immediate_filters_ineligible_skills_and_skill_meta_paths() {
+        let client = Arc::new(InMemoryNotifyClient::new());
+        let ctrl = retry_controller(client.clone());
+
+        for name in [
+            "skill-discover",
+            ".staging",
+            ".certified",
+            ".quarantine",
+            ".archive",
+            "",
+        ] {
+            ctrl.enqueue_immediate(name, MutationKind::Rename, Vec::new());
+        }
+        ctrl.enqueue_immediate(
+            "alpha",
+            MutationKind::Write,
+            vec![".skill-meta/manifest.json".to_string()],
+        );
+        assert_eq!(
+            ctrl.pending_len(),
+            0,
+            "ineligible skills and metadata-only paths must be filtered"
+        );
+
+        ctrl.enqueue_immediate(
+            "beta",
+            MutationKind::Write,
+            vec![
+                "SKILL.md".to_string(),
+                ".skill-meta/activation.json".to_string(),
+                String::new(),
+            ],
+        );
+        ctrl.enqueue_immediate("gamma", MutationKind::Rename, Vec::new());
+        assert_eq!(ctrl.flush_until_delivered_for_testing(4), 2);
+
+        let mut events = client.events();
+        events.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].skill_id, "beta");
+        assert_eq!(events[0].paths, vec!["SKILL.md"]);
+        assert_eq!(events[1].skill_id, "gamma");
+        assert!(events[1].paths.is_empty());
         ctrl.shutdown();
     }
 

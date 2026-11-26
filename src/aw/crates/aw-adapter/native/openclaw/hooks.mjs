@@ -129,8 +129,13 @@ function registerFinalGate(api, handlers) {
     if (typeof id !== 'string' || !id || !context.sessionId || !context.runId) return;
     // A repeated in-flight ID cannot be bound to one final message.
     const identity = pendingKeyFor(context.sessionId, id);
-    receipts.delete(identity);
-    receipts.delete(pendingKeyFor(context.sessionId, normalizedCall(id)));
+    const normalizedId = normalizedCall(id);
+    for (const key of receipts.keys()) {
+      const [receiptSession, receiptCall] = JSON.parse(key);
+      if (receiptSession === context.sessionId && normalizedCall(receiptCall) === normalizedId) {
+        receipts.delete(key);
+      }
+    }
     const previous = pending.get(identity);
     previous?.controller.abort();
     if (previous) pending.set(identity, { ...structuredClone({ event, context }), ambiguous: true, controller: new AbortController() });
@@ -176,11 +181,14 @@ function registerFinalGate(api, handlers) {
       if (cursor === original.length) throw Error('AW context transform changed a model-visible message');
       cursor++;
     }
+    const sourceResults = sourceMessages.filter(message => message.role === 'toolResult');
     const projected = messages.filter(message => message.role === 'toolResult');
-    for (const source of sourceMessages.filter(message => message.role === 'toolResult')) {
-      if (!projected.some(message => message.toolCallId === source.toolCallId && message.toolName === source.toolName)) {
-        throw Error('AW model result projection changed a tool result identity');
-      }
+    if (projected.length !== sourceResults.length ||
+        sourceResults.some(source => !projected.some(
+          message => message.toolCallId === source.toolCallId && message.toolName === source.toolName)) ||
+        projected.some(message => !sourceResults.some(
+          source => source.toolCallId === message.toolCallId && source.toolName === message.toolName))) {
+      throw Error('AW model result projection changed a tool result identity');
     }
     if (projected.some(message => !supported(message) || !message.toolCallId)) {
       throw Error('AW model result projection contains an unsupported result');
@@ -224,17 +232,20 @@ function registerFinalGate(api, handlers) {
       if (message.role !== 'tool') { checked.push(() => message); continue; }
       const id = message.tool_call_id;
       const source = sourceResults[sourceIndex++];
-      if (typeof id !== 'string' || !id || seen.has(id) ||
-          normalizedCall(source.toolCallId) !== normalizedCall(id)) {
+      const normalizedId = typeof id === 'string' ? normalizedCall(id) : '';
+      if (typeof id !== 'string' || !id || !normalizedId || seen.has(id) || seen.has(normalizedId) ||
+          normalizedCall(source.toolCallId) !== normalizedId) {
         throw Error('AW provider request has an ambiguous tool result');
       }
       seen.add(id);
+      seen.add(normalizedId);
       const identity = pendingKeyFor(sessionId, source.toolCallId);
-      const candidates = pending.has(identity) ? [identity] : [...pending].filter(([, value]) =>
-        value.context.sessionId === sessionId && value.event?.toolName === source.toolName &&
-        normalizedCall(value.event.toolCallId) === source.toolCallId).map(([key]) => key);
+      const candidates = [...pending].filter(([, value]) =>
+        value.context.sessionId === sessionId &&
+        normalizedCall(value.event?.toolCallId ?? '') === normalizedId).map(([key]) => key);
       const recordKey = candidates.length === 1 ? candidates[0] : undefined;
-      const record = recordKey ? pending.get(recordKey) : undefined;
+      const candidate = recordKey ? pending.get(recordKey) : undefined;
+      const record = candidate?.event?.toolName === source.toolName ? candidate : undefined;
       const digest = createHash('sha256').update(JSON.stringify(message.content)).digest('hex');
       const receipt = receipts.get(identity);
       const cached = !record && receipt?.digest === digest &&

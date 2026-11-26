@@ -413,3 +413,91 @@ test('request and session cancellation reap the active check without dispatching
       assert.equal(readFileSync(join(f.root, 'cleanup.jsonl'), 'utf8').trim().split('\n').length, 1);
     }
   });
+
+test('normalized call-ID collisions fail closed even with an exact key or cross-tool match',
+  { timeout: 10000 }, async t => {
+    for (const [firstTool, firstId, secondId, sourceId] of [
+      ['exec', 'call-1', 'call1', 'call1'],
+      ['read', 'call-1', 'call1', 'call1'],
+      ['exec', 'call-1', 'call_1', 'call-1'],
+    ]) {
+      const f = setup(t, [], [], true, ['first']);
+      globalThis[Symbol.for('aw.openclaw.finalPatched')] = true;
+      globalThis[Symbol.for('aw.openclaw.providerPatched')] = true;
+      t.after(() => {
+        delete globalThis[Symbol.for('aw.openclaw.finalPatched')];
+        delete globalThis[Symbol.for('aw.openclaw.providerPatched')];
+      });
+      f.middlewares[0]({ toolName: firstTool, toolCallId: firstId, args: {} }, context);
+      f.middlewares[0]({ toolName: 'exec', toolCallId: secondId, args: {} }, context);
+      const tool = { role: 'tool', tool_call_id: 'call1', content: 'secret' };
+      const source = { role: 'toolResult', toolCallId: sourceId, toolName: 'exec',
+        content: [{ type: 'text', text: 'secret' }] };
+      const gate = globalThis[Symbol.for('aw.openclaw.payloadGate')];
+      const reply = await gate({ messages: [tool] }, context.sessionId, { messages: [tool] }, [source], 'openai-completions');
+      assert.match(reply.messages[0].content, /AW withheld/);
+      assert.equal(existsSync(join(f.root, 'calls.jsonl')), false);
+      f.middlewares[0]({ toolName: 'exec', toolCallId: 'call1', args: {} }, context);
+      const next = await gate({ messages: [{ role: 'tool', tool_call_id: 'call1', content: 'safe' }] },
+        context.sessionId, { messages: [{ role: 'tool', tool_call_id: 'call1', content: 'safe' }] },
+        [{ role: 'toolResult', toolCallId: 'call1', toolName: 'exec', content: [{ type: 'text', text: 'safe' }] }],
+        'openai-completions');
+      assert.equal(next.messages[0].content, 'safe');
+    }
+  });
+
+test('punctuation-variant calls resolve uniquely, clear prior receipts, and reject in-batch duplicates',
+  { timeout: 10000 }, async t => {
+    const f = setup(t, [], [], true, ['first']);
+    globalThis[Symbol.for('aw.openclaw.finalPatched')] = true;
+    globalThis[Symbol.for('aw.openclaw.providerPatched')] = true;
+    t.after(() => {
+      delete globalThis[Symbol.for('aw.openclaw.finalPatched')];
+      delete globalThis[Symbol.for('aw.openclaw.providerPatched')];
+    });
+    const gate = globalThis[Symbol.for('aw.openclaw.payloadGate')];
+    f.middlewares[0]({ toolName: 'exec', toolCallId: 'call_1', args: {} }, context);
+    const messages = [{ role: 'tool', tool_call_id: 'call1', content: 'safe' }];
+    const source = [{ role: 'toolResult', toolCallId: 'call-1', toolName: 'exec',
+      content: [{ type: 'text', text: 'safe' }] }];
+    assert.equal((await gate({ messages }, context.sessionId, { messages }, source, 'openai-completions')).messages[0].content, 'safe');
+    assert.equal(f.rows().filter(row => row.phase === 'start').length, 1);
+
+    // Fill pending to capacity so the new punctuation-variant call has no pending record,
+    // then verify the prior 'call-1' receipt was invalidated and in-batch duplicates reject.
+    for (let index = 0; index < 128; index++) {
+      f.middlewares[0]({ toolName: 'exec', toolCallId: `cap-${index}`, args: {} }, context);
+    }
+    f.middlewares[0]({ toolName: 'exec', toolCallId: 'call_1', args: {} }, context);
+    const replayed = await gate({ messages }, context.sessionId, { messages }, source, 'openai-completions');
+    assert.match(replayed.messages[0].content, /AW withheld/);
+    assert.equal(f.rows().filter(row => row.phase === 'start').length, 1);
+    await assert.rejects(gate(
+      { messages: [{ role: 'tool', tool_call_id: 'call-1', content: 'a' }, { role: 'tool', tool_call_id: 'call_1', content: 'b' }] },
+      context.sessionId,
+      { messages: [{ role: 'tool', tool_call_id: 'call-1', content: 'a' }, { role: 'tool', tool_call_id: 'call_1', content: 'b' }] },
+      [{ role: 'toolResult', toolCallId: 'call-1', toolName: 'exec' }, { role: 'toolResult', toolCallId: 'call_1', toolName: 'exec' }],
+      'openai-completions'), /ambiguous tool result/);
+  });
+
+test('model gate rejects context transforms and converters that inject tool results', async t => {
+  setup(t, [], [], true, ['first']);
+  const gate = globalThis[Symbol.for('aw.openclaw.modelGate')];
+  globalThis[Symbol.for('aw.openclaw.finalPatched')] = true;
+  globalThis[Symbol.for('aw.openclaw.providerPatched')] = true;
+  t.after(() => {
+    delete globalThis[Symbol.for('aw.openclaw.finalPatched')];
+    delete globalThis[Symbol.for('aw.openclaw.providerPatched')];
+  });
+  const source = [{ role: 'toolResult', toolName: 'exec', toolCallId: 'call-1',
+    content: [{ type: 'text', text: 'safe' }] }];
+  const injected = { role: 'toolResult', toolName: 'exec', toolCallId: 'call-2',
+    content: [{ type: 'text', text: 'injected secret' }] };
+  const config = { sessionId: 'session-1', model: { api: 'openai-completions' },
+    convertToLlm: messages => messages };
+  await assert.rejects(gate(source, { ...config, transformContext: messages => [...messages, injected] },
+    undefined, messages => messages), /changed a tool result identity/);
+  await assert.rejects(gate(source, { ...config, convertToLlm: messages =>
+    messages.some(message => message.role === 'toolResult') ? [...messages, injected] : messages },
+    undefined, messages => messages), /changed a tool result identity/);
+});

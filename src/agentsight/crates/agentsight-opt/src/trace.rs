@@ -72,25 +72,66 @@ const SYSTEM_MARKER_SCAN_LIMIT: usize = 200;
 /// System command suffixes injected by QoderWork at the end of text blocks.
 const SYSTEM_TEXT_SUFFIXES: &[&str] = &["Please reflect and reorganize the target file."];
 
+/// Return the smallest UTF-8 character boundary at or after `byte_limit`
+/// (clamped to `text.len()`).
+fn char_boundary_at_or_after(text: &str, byte_limit: usize) -> usize {
+    if byte_limit >= text.len() {
+        return text.len();
+    }
+    let mut end = byte_limit;
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    end
+}
+
+/// Strip XML-tagged system blocks left-to-right by earliest opening tag so an
+/// unclosed mention of one tag inside another closed block does not truncate
+/// the outer closing tag and following user text.
+fn strip_system_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let next = SYSTEM_TAGS
+            .iter()
+            .filter_map(|&(open, close)| rest.find(open).map(|rel| (rel, open, close)))
+            .min_by_key(|&(rel, _, _)| rel);
+
+        let Some((rel, open, close)) = next else {
+            out.push_str(rest);
+            break;
+        };
+
+        out.push_str(&rest[..rel]);
+        let after_open = cursor + rel + open.len();
+        if let Some(close_rel) = text[after_open..].find(close) {
+            cursor = after_open + close_rel + close.len();
+        } else {
+            // An unclosed system tag swallows the remainder of the message.
+            break;
+        }
+    }
+
+    out
+}
+
 /// Check whether a text block is entirely system-injected context
 /// (e.g., a QoderWork MEMORY.md dump with no real user message).
 pub fn is_system_only_text(text: &str) -> bool {
     let trimmed = text.trim();
-    // Check if any system marker appears within the first N bytes
-    // Use char-boundary-safe slicing for multi-byte UTF-8 (Chinese, emoji, etc.)
-    let scan_end = trimmed
-        .char_indices()
-        .take_while(|(i, _)| *i < SYSTEM_MARKER_SCAN_LIMIT)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let scan_window = &trimmed[..scan_end];
-    for marker in SYSTEM_TEXT_MARKERS {
-        if scan_window.contains(marker) {
-            return true;
-        }
-    }
-    false
+    // Allow markers that start before SYSTEM_MARKER_SCAN_LIMIT to finish past
+    // the boundary without scanning the rest of a large message.
+    SYSTEM_TEXT_MARKERS.iter().any(|marker| {
+        let scan_end = char_boundary_at_or_after(
+            trimmed,
+            SYSTEM_MARKER_SCAN_LIMIT.saturating_add(marker.len()),
+        );
+        trimmed[..scan_end]
+            .find(marker)
+            .is_some_and(|pos| pos < SYSTEM_MARKER_SCAN_LIMIT)
+    })
 }
 
 /// Remove system-injected context blocks from message text.
@@ -103,24 +144,13 @@ pub fn is_system_only_text(text: &str) -> bool {
 /// Both formats are stripped. For plain-text injections, any trailing
 /// system commands (e.g., "Please reflect and reorganize...") are also removed.
 pub fn strip_system_context(text: &str) -> String {
-    // Phase 1: If the text is entirely a system-injected block, return empty
-    if is_system_only_text(text) {
+    // Phase 1: Strip XML tags first so markers inside a reminder do not wipe a
+    // genuine user turn, and leading tags do not hide a plain-text system dump.
+    let mut result = strip_system_tags(text);
+
+    // Phase 2: If the remaining text is entirely a system-injected block, return empty
+    if is_system_only_text(&result) {
         return String::new();
-    }
-
-    let mut result = text.to_string();
-
-    // Phase 2: Strip XML tags
-    for &(open, close) in SYSTEM_TAGS {
-        while let Some(start) = result.find(open) {
-            if let Some(end) = result[start..].find(close) {
-                let end = start + end + close.len();
-                result.replace_range(start..end, "");
-            } else {
-                result.truncate(start);
-                break;
-            }
-        }
     }
 
     // Phase 3: Strip trailing system command lines
@@ -627,5 +657,68 @@ mod tests {
         ));
         assert!(!inv.tool_calls[0].err);
         assert!(inv.tool_calls[1].err);
+    }
+
+    #[test]
+    fn strip_system_tags_before_checking_system_only_markers() {
+        let user_with_tagged_marker = "<system-reminder>[SYSTEM NOTIFICATION - NOT USER INPUT]\nWorkspace indexed.</system-reminder>\nFix the parser bug";
+        assert_eq!(
+            strip_system_context(user_with_tagged_marker),
+            "Fix the parser bug"
+        );
+
+        let dump_after_tag = format!(
+            "<system-reminder>{}</system-reminder>\nTarget file this round: MEMORY.md\nDump",
+            "x".repeat(SYSTEM_MARKER_SCAN_LIMIT + 50)
+        );
+        assert_eq!(strip_system_context(&dump_after_tag), "");
+    }
+
+    #[test]
+    fn strip_nested_unclosed_tag_mention_preserves_following_user_text() {
+        let stdout = "<local-command-stdout>Hint: ignore <system-reminder> tags</local-command-stdout>\nExplain the output";
+        assert_eq!(strip_system_context(stdout), "Explain the output");
+
+        let notes = "<current_notes_content>Example <system-reminder> header</current_notes_content>\nRefactor trace.rs";
+        assert_eq!(strip_system_context(notes), "Refactor trace.rs");
+    }
+
+    #[test]
+    fn is_system_only_text_respects_marker_start_offset_across_utf8_boundary() {
+        // 27 * 7 bytes ("路径/") + '\n' = 190 bytes (< 200); marker ends past byte 200.
+        let near_limit = format!(
+            "{}\nTarget file this round: MEMORY.md\n{}",
+            "路径/".repeat(27),
+            "正文".repeat(100)
+        );
+        assert!(is_system_only_text(&near_limit));
+        assert_eq!(strip_system_context(&near_limit), "");
+
+        let at_limit = format!(
+            "{}Target file this round: example",
+            "a".repeat(SYSTEM_MARKER_SCAN_LIMIT)
+        );
+        assert!(!is_system_only_text(&at_limit));
+    }
+
+    #[test]
+    fn build_inventory_keeps_tagged_user_turns_and_skips_prefixed_system_dumps() {
+        let pad = "r".repeat(SYSTEM_MARKER_SCAN_LIMIT + 40);
+        let steps = format!(
+            r#"[
+            {{"step_id":1,"source":"user","timestamp":"2025-01-01T00:00:00Z",
+              "message":"<system-reminder>[SYSTEM NOTIFICATION] ready</system-reminder>\nFirst question"}},
+            {{"step_id":2,"source":"agent","timestamp":"2025-01-01T00:00:01Z","message":"First answer"}},
+            {{"step_id":3,"source":"user","timestamp":"2025-01-01T00:00:02Z",
+              "message":"<system-reminder>{pad}</system-reminder>\nTarget file this round: MEMORY.md\nDump"}},
+            {{"step_id":4,"source":"user","timestamp":"2025-01-01T00:00:03Z",
+              "message":"<current_notes_content>note <system-reminder></current_notes_content>\nFollow-up"}}
+        ]"#
+        );
+        let inv = build_inventory(&traj(&steps));
+        assert_eq!(inv.user_turns.len(), 2);
+        assert_eq!(inv.user_turns[0].text, "First question");
+        assert_eq!(inv.user_turns[1].text, "Follow-up");
+        assert_eq!(inv.final_answer, "");
     }
 }

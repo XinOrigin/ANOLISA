@@ -1157,6 +1157,38 @@ const SYSTEM_TAG_PAIRS: &[(&str, &str)] = &[
     ("<local-command-stderr>", "</local-command-stderr>"),
 ];
 
+/// Strip [`SYSTEM_TAG_PAIRS`] blocks left-to-right by earliest opening tag so an
+/// unclosed literal mention of one tag inside another closed block does not
+/// truncate the outer closing tag and following user text.
+fn strip_system_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let next = SYSTEM_TAG_PAIRS
+            .iter()
+            .filter_map(|&(open, close)| rest.find(open).map(|rel| (rel, open, close)))
+            .min_by_key(|&(rel, _, _)| rel);
+
+        let Some((rel, open, close)) = next else {
+            out.push_str(rest);
+            break;
+        };
+
+        out.push_str(&rest[..rel]);
+        let after_open = cursor + rel + open.len();
+        if let Some(close_rel) = text[after_open..].find(close) {
+            cursor = after_open + close_rel + close.len();
+        } else {
+            // An unclosed system tag swallows the remainder of the message.
+            break;
+        }
+    }
+
+    out
+}
+
 /// Remove system-injected tag blocks from a user message. An unterminated
 /// opening tag swallows the rest of the text (matches AgentOpt semantics).
 /// Public because preference analysis needs the same cleaning when it reads
@@ -1167,18 +1199,7 @@ const SYSTEM_TAG_PAIRS: &[(&str, &str)] = &[
 /// verbatim, apart from collapsing the blank runs the removal leaves behind
 /// and trimming the edges.
 pub fn strip_system_context(text: &str) -> String {
-    let mut result = text.to_string();
-    for &(open, close) in SYSTEM_TAG_PAIRS {
-        while let Some(start) = result.find(open) {
-            if let Some(end_rel) = result[start..].find(close) {
-                let end = start + end_rel + close.len();
-                result.replace_range(start..end, "");
-            } else {
-                result.truncate(start);
-                break;
-            }
-        }
-    }
+    let mut result = strip_system_tags(text);
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
     }
@@ -1755,6 +1776,58 @@ mod tests {
             "<system-reminder>ctx</system-reminder>follow up"
         ));
         assert!(has_user_authored_text("keep <command-name>unclosed"));
+    }
+
+    #[test]
+    fn test_strip_system_context_nested_unclosed_tag_preserves_following_user_text() {
+        let stdout = "<local-command-stdout>Hint: ignore <system-reminder> tags</local-command-stdout>\nExplain the output";
+        assert_eq!(strip_system_context(stdout), "Explain the output");
+        assert!(has_user_authored_text(stdout));
+
+        let notes = "<current_notes_content>Example <system-reminder> header</current_notes_content>\nRefactor trace.rs";
+        assert_eq!(strip_system_context(notes), "Refactor trace.rs");
+
+        let unclosed =
+            "keep\n<command-name>unclosed\n<system-reminder>closed</system-reminder>\nlater";
+        assert_eq!(strip_system_context(unclosed), "keep");
+
+        let atif = serde_json::json!({
+            "steps": [
+                {"step_id": 1, "source": "user", "message": stdout}
+            ]
+        })
+        .to_string();
+        assert_eq!(
+            extract_user_message_previews(&atif),
+            (
+                Some("Explain the output".to_string()),
+                Some("Explain the output".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_strip_system_context_utf8_boundaries() {
+        let mixed = "前缀🚀<local-command-stdout>中文提示 <system-reminder> 标记</local-command-stdout>后缀✨\n继续说明";
+        assert_eq!(strip_system_context(mixed), "前缀🚀后缀✨\n继续说明");
+
+        let unclosed_utf8 = "保留中文🎯<system-reminder>未闭合";
+        assert_eq!(strip_system_context(unclosed_utf8), "保留中文🎯");
+
+        let long_tail = "中🎉".repeat(150);
+        let msg = format!(
+            "<local-command-stdout>说明 <system-reminder> 内嵌</local-command-stdout>\n{long_tail}"
+        );
+        let atif = serde_json::json!({
+            "steps": [
+                {"step_id": 1, "source": "user", "message": msg}
+            ]
+        })
+        .to_string();
+        let (first, last) = extract_user_message_previews(&atif);
+        let expected: String = long_tail.chars().take(MESSAGE_PREVIEW_CHARS).collect();
+        assert_eq!(first.as_deref(), Some(expected.as_str()));
+        assert_eq!(last.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

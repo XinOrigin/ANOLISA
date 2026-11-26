@@ -643,48 +643,43 @@ const SYSTEM_TAG_PAIRS: &[(&str, &str)] = &[
 ];
 
 /// Strip injected context while dropping lines that contain nothing else.
+///
+/// Scans left-to-right by earliest opening tag so an unclosed mention of an
+/// earlier tag inside another closed block does not truncate the outer
+/// closing tag and following user text.
 fn strip_system_context(text: &str) -> String {
-    let mut current = text.to_string();
-    for &(open, close) in SYSTEM_TAG_PAIRS {
-        if current.contains(open) {
-            current = strip_tag_pair(&current, open, close);
-        }
-    }
-    current.trim().to_string()
-}
+    let mut result = String::with_capacity(text.len());
+    let mut active_close: Option<&'static str> = None;
 
-fn strip_tag_pair(text: &str, open: &str, close: &str) -> String {
-    let mut result = String::new();
-    let mut in_block = false;
     for line in text.lines() {
         let mut rest = line;
         let mut kept = String::new();
-        let mut saw_block = in_block;
+        let mut saw_block = active_close.is_some();
+
         while !rest.is_empty() {
-            if in_block {
+            if let Some(close) = active_close {
                 saw_block = true;
-                match rest.find(close) {
-                    Some(idx) => {
-                        in_block = false;
-                        rest = &rest[idx + close.len()..];
-                    }
-                    None => break,
+                if let Some(idx) = rest.find(close) {
+                    active_close = None;
+                    rest = &rest[idx + close.len()..];
+                } else {
+                    break;
                 }
+            } else if let Some((idx, open, close)) = SYSTEM_TAG_PAIRS
+                .iter()
+                .filter_map(|&(open, close)| rest.find(open).map(|idx| (idx, open, close)))
+                .min_by_key(|&(idx, _, _)| idx)
+            {
+                kept.push_str(&rest[..idx]);
+                saw_block = true;
+                active_close = Some(close);
+                rest = &rest[idx + open.len()..];
             } else {
-                match rest.find(open) {
-                    Some(idx) => {
-                        kept.push_str(&rest[..idx]);
-                        saw_block = true;
-                        in_block = true;
-                        rest = &rest[idx + open.len()..];
-                    }
-                    None => {
-                        kept.push_str(rest);
-                        break;
-                    }
-                }
+                kept.push_str(rest);
+                break;
             }
         }
+
         if saw_block && kept.is_empty() {
             continue;
         }
@@ -693,7 +688,8 @@ fn strip_tag_pair(text: &str, open: &str, close: &str) -> String {
         }
         result.push_str(&kept);
     }
-    result
+
+    result.trim().to_string()
 }
 
 /// UTF-8 safe string truncation
@@ -817,6 +813,53 @@ mod tests {
                 "{transcript} must not count as human text"
             );
         }
+    }
+
+    #[test]
+    fn test_strip_system_context_nested_unclosed_tag_preserves_following_user_text() {
+        let stdout = "<local-command-stdout>Hint: ignore <system-reminder> tags</local-command-stdout>\nExplain the output";
+        assert_eq!(strip_system_context(stdout), "Explain the output");
+
+        let multiline = "<local-command-stdout>\nHint: ignore <system-reminder> tags\n</local-command-stdout>\nExplain the output";
+        assert_eq!(strip_system_context(multiline), "Explain the output");
+
+        let notes = "<current_notes_content>Example <system-reminder> header</current_notes_content>\nRefactor trace.rs";
+        assert_eq!(strip_system_context(notes), "Refactor trace.rs");
+
+        let unclosed =
+            "keep\n<command-name>unclosed\n<system-reminder>closed</system-reminder>\nlater";
+        assert_eq!(strip_system_context(unclosed), "keep");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested-tag.jsonl");
+        let record = serde_json::json!({
+            "type": "user",
+            "sessionId": "sess-nested",
+            "message": {"role": "user", "content": stdout}
+        });
+        fs::write(&path, format!("{record}\n")).unwrap();
+        let session = parse_session_file(&path, &SESSION_SOURCES[0], "test")
+            .expect("following user text keeps session listed");
+        assert_eq!(session.first_message, "Explain the output");
+    }
+
+    #[test]
+    fn test_strip_system_context_and_truncate_utf8_boundaries() {
+        let mixed = "前缀🚀<local-command-stdout>中文提示 <system-reminder> 标记</local-command-stdout>后缀✨\n继续说明";
+        assert_eq!(strip_system_context(mixed), "前缀🚀后缀✨\n继续说明");
+
+        let unclosed_utf8 = "保留中文🎯<system-reminder>未闭合";
+        assert_eq!(strip_system_context(unclosed_utf8), "保留中文🎯");
+
+        let long_body = format!("{}{}", "路径/".repeat(27), "正文🎉".repeat(80));
+        let wrapped = format!(
+            "<local-command-stdout>提示 <system-reminder> 标记</local-command-stdout>\n{long_body}"
+        );
+        let stripped = strip_system_context(&wrapped);
+        assert_eq!(stripped, long_body);
+        let preview = truncate(&stripped, 200);
+        assert_eq!(preview.chars().count(), 200);
+        assert!(stripped.starts_with(&preview));
     }
 
     #[test]

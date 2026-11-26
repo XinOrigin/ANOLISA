@@ -2,12 +2,15 @@
 
 use crate::{filesystem as paths, require, Result};
 use std::{
-    ffi::CStr,
+    ffi::{CStr, OsStr},
     fs::{self, File, Metadata, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{fchown, MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{fchown, MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
     },
     path::{Component, Path, PathBuf},
 };
@@ -53,12 +56,19 @@ pub(super) fn deployment_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(read_snapshot(path, true)?.bytes)
 }
 
+fn file_name(path: &Path) -> Result<&OsStr> {
+    let bytes = path.as_os_str().as_bytes();
+    require(
+        !bytes.ends_with(b"/") && !bytes.ends_with(b"/."),
+        "configuration path must not have a trailing directory component",
+    )?;
+    path.file_name()
+        .ok_or_else(|| crate::Error::Invalid("configuration path has no file name".into()))
+}
+
 fn read_snapshot(path: &Path, deployment: bool) -> Result<Snapshot> {
     let parent = pin_parent(path)?;
-    let anchored = descriptor_path(&parent).join(
-        path.file_name()
-            .ok_or_else(|| crate::Error::Invalid("configuration path has no file name".into()))?,
-    );
+    let anchored = descriptor_path(&parent).join(file_name(path)?);
     let mut file = open(&anchored, false)?;
     if deployment {
         check_deployment_filesystem(&parent)?;
@@ -239,10 +249,7 @@ fn publish_using(
     write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
 ) -> Result<Option<Snapshot>> {
     let parent = descriptor_path(&original.parent);
-    let anchored = parent.join(
-        path.file_name()
-            .ok_or_else(|| crate::Error::Invalid("configuration path has no file name".into()))?,
-    );
+    let anchored = parent.join(file_name(path)?);
     let path = anchored.as_path();
     let changed = bytes.is_some();
     let mut held = open(path, changed)?;
@@ -495,5 +502,56 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"another writer");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn trailing_directory_components_are_rejected_without_touching_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(root.path().canonicalize().unwrap()).unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("aw.yaml");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = read(&path).unwrap();
+        for suffix in ["/", "///", "/.", "//.", "/./", "/./."] {
+            let spelled = PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(File::open(&spelled).is_err(), "{spelled:?}");
+            assert!(read(&spelled).is_err(), "read accepted {spelled:?}");
+            assert!(
+                deployment_bytes(&spelled).is_err(),
+                "deployment_bytes accepted {spelled:?}"
+            );
+            assert!(
+                publish(&spelled, &original, None).is_err(),
+                "noop publish accepted {spelled:?}"
+            );
+            assert!(
+                publish(&spelled, &original, Some(b"mutated")).is_err(),
+                "mutating publish accepted {spelled:?}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+            assert_eq!(fs::metadata(&path).unwrap().ino(), original.identity.inode);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+        for spelled in [
+            PathBuf::from(format!("{}//aw.yaml", directory.path().display())),
+            PathBuf::from(format!("{}/./aw.yaml", directory.path().display())),
+        ] {
+            assert!(File::open(&spelled).is_ok(), "{spelled:?}");
+            assert_eq!(deployment_bytes(&spelled).unwrap(), b"original");
+            assert!(publish(&spelled, &original, None).unwrap().is_none());
+        }
+        for name in [".aw.yaml", "aw.", "..yaml", "..."] {
+            let dotted = directory.path().join(name);
+            fs::write(&dotted, b"original").unwrap();
+            fs::set_permissions(&dotted, fs::Permissions::from_mode(0o600)).unwrap();
+            let snapshot = read(&dotted).unwrap();
+            assert_eq!(deployment_bytes(&dotted).unwrap(), b"original");
+            assert!(publish(&dotted, &snapshot, Some(b"updated"))
+                .unwrap()
+                .is_some());
+            assert_eq!(fs::read(&dotted).unwrap(), b"updated");
+            fs::remove_file(&dotted).unwrap();
+        }
     }
 }

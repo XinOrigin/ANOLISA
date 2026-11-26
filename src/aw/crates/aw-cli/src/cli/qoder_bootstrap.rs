@@ -289,6 +289,51 @@ fn record_binding(record: &Value) -> Result<HookBinding> {
     Ok(binding)
 }
 
+fn confirm_owner_exited(pid: u32, ticks: &str) -> Result<()> {
+    match aw_service::ProcessIdentity::read(pid) {
+        Ok(process) if process.metadata()["start_ticks"] == ticks => {
+            Err("Qoder startup still has a live owner; exit it before removal".into())
+        }
+        Ok(_) => Ok(()),
+        Err(aw_service::Error::Rejected(code)) if code == "process_exited" => Ok(()),
+        Err(_) => match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let fields: Vec<_> = stat
+                    .rsplit_once(") ")
+                    .ok_or("Qoder owner exit is not yet confirmed")?
+                    .1
+                    .split_whitespace()
+                    .collect();
+                if matches!(fields.first(), Some(&"Z" | &"X")) {
+                    Ok(())
+                } else if let Some(&start) = fields.get(19) {
+                    if start == ticks {
+                        Err("Qoder startup still has a live owner; exit it before removal".into())
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Err("Qoder owner exit is not yet confirmed".into())
+                }
+            }
+            Err(error)
+                if (error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH))
+                    && Path::new("/proc/self").exists() =>
+            {
+                Ok(())
+            }
+            Err(_)
+                if !Path::new(&format!("/proc/{pid}")).exists()
+                    && Path::new("/proc/self").exists() =>
+            {
+                Ok(())
+            }
+            Err(_) => Err("Qoder owner exit is not yet confirmed".into()),
+        },
+    }
+}
+
 pub(super) fn recover(directory: &Path) -> Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -313,15 +358,7 @@ pub(super) fn recover(directory: &Path) -> Result<()> {
         {
             return Err("invalid Qoder locator process identity".into());
         }
-        match aw_service::ProcessIdentity::read(pid) {
-            Ok(process) if process.metadata()["start_ticks"] == ticks => {
-                return Err("Qoder startup still has a live owner; exit it before removal".into())
-            }
-            Err(_) if Path::new(&format!("/proc/{pid}")).exists() => {
-                return Err("Qoder owner exit is not yet confirmed".into())
-            }
-            _ => {}
-        }
+        confirm_owner_exited(pid, ticks)?;
         let record = match private_json(&path) {
             Ok(record) => record,
             Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
@@ -371,7 +408,30 @@ pub(super) fn recover(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+        thread,
+    };
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn write_private_locator(path: &Path, contents: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(contents).unwrap();
+    }
 
     #[test]
     fn interrupted_publication_reclaims_only_private_claims_of_exited_owners() {
@@ -386,13 +446,7 @@ mod tests {
                 owner.id(),
                 identity["start_ticks"].as_str().unwrap()
             ));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .unwrap();
-            file.write_all(contents.as_bytes()).unwrap();
+            write_private_locator(&path, contents.as_bytes());
             assert!(recover(directory.path()).is_err());
             assert!(path.exists());
             owner.kill().unwrap();
@@ -403,5 +457,118 @@ mod tests {
             assert!(!path.exists());
             assert_eq!(fs::read_to_string(unknown).unwrap(), "keep");
         }
+    }
+
+    #[test]
+    fn zombie_owner_locator_is_reclaimed_before_parent_reaps_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner = ChildGuard(
+            Command::new("/bin/sh")
+                .args(["-c", "read _ || true"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = owner.0.id();
+        let identity = aw_service::ProcessIdentity::read(pid).unwrap().metadata();
+        let ticks = identity["start_ticks"].as_str().unwrap();
+        let path = directory.path().join(format!("owner-{pid}-{ticks}.json"));
+        let record = json!({
+            "process": identity,
+            "binding": directory.path().join("missing-binding.json"),
+        });
+        write_private_locator(&path, record.to_string().as_bytes());
+        assert!(recover(directory.path()).is_err());
+
+        drop(owner.0.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if stat.rsplit_once(") ").unwrap().1.starts_with("Z ") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not reach zombie state"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(aw_service::ProcessIdentity::read(pid).is_err());
+
+        let result = recover(directory.path());
+        owner.0.wait().unwrap();
+        result.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn recycled_foreign_owner_pid_reclaims_stale_locator_without_releasing_live_owner() {
+        let script = concat!(
+            "import ctypes, os, signal, sys\n",
+            "signal.alarm(30)\n",
+            "print('ready', flush=True)\n",
+            "assert sys.stdin.readline() == 'drop\\n'\n",
+            "if os.geteuid() == 0:\n",
+            "    os.setuid(65534)\n",
+            "else:\n",
+            "    assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0\n",
+            "print('dropped', flush=True)\n",
+            "sys.stdin.readline()\n",
+        );
+        let mut child = ChildGuard(
+            Command::new("python3")
+                .args(["-I", "-c", script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stdout = BufReader::new(child.0.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+
+        let pid = child.0.id();
+        let identity = aw_service::ProcessIdentity::read(pid).unwrap().metadata();
+        let actual_ticks = identity["start_ticks"].as_str().unwrap();
+        child
+            .0
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"drop\n")
+            .unwrap();
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, "dropped\n");
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(aw_service::ProcessIdentity::read(pid).is_err());
+
+        let stale_dir = tempfile::tempdir().unwrap();
+        let stale_ticks = if actual_ticks == "1" { "2" } else { "1" };
+        let stale_path = stale_dir
+            .path()
+            .join(format!("owner-{pid}-{stale_ticks}.json"));
+        let stale_record = json!({
+            "process": { "pid": pid, "start_ticks": stale_ticks },
+            "binding": stale_dir.path().join("missing-binding.json"),
+        });
+        write_private_locator(&stale_path, stale_record.to_string().as_bytes());
+        recover(stale_dir.path()).unwrap();
+        assert!(!stale_path.exists());
+
+        let live_dir = tempfile::tempdir().unwrap();
+        let live_path = live_dir
+            .path()
+            .join(format!("owner-{pid}-{actual_ticks}.json"));
+        let live_record = json!({
+            "process": identity,
+            "binding": live_dir.path().join("missing-binding.json"),
+        });
+        write_private_locator(&live_path, live_record.to_string().as_bytes());
+        let err = recover(live_dir.path()).unwrap_err();
+        assert!(err.to_string().contains("live owner"), "{err}");
+        assert!(live_path.exists());
     }
 }

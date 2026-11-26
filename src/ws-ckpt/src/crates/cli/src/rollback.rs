@@ -103,6 +103,7 @@ async fn ordinary_json(
                     Mode::Execute,
                     ErrorCode::WorkspaceNotFound
                     | ErrorCode::SnapshotNotFound
+                    | ErrorCode::InvalidPath
                     | ErrorCode::CwdOccupied
                     | ErrorCode::CwdScanFailed
                     | ErrorCode::DiskSpaceInsufficient,
@@ -214,6 +215,22 @@ async fn guarded_json(path: String, snapshot: Option<String>, mode: Mode) -> Res
                 {
                     json!({"status": "succeeded", "evidence": evidence})
                 }
+                Ok(Response::GuardedRollbackV2Uncertain { evidence })
+                    if confirmation.matches(&evidence, uid)
+                        && evidence.registered_path == path
+                        && evidence.target_snapshot_id == snapshot
+                        && matches!(
+                            evidence.outcome,
+                            GuardedRollbackOutcomeV2::Started
+                                | GuardedRollbackOutcomeV2::Unknown { .. }
+                        ) =>
+                {
+                    let message = match &evidence.outcome {
+                        GuardedRollbackOutcomeV2::Unknown { reason } => reason,
+                        _ => "daemon could not confirm the rollback outcome",
+                    };
+                    failure("unknown", "UncertainOutcome", message)
+                }
                 response => guarded_reply(response, mode),
             }
         }
@@ -248,13 +265,6 @@ fn guarded_reply(response: std::result::Result<Response, IpcFailure>, mode: Mode
                 "error"
             };
             failure(status, &format!("{code:?}"), &message)
-        }
-        Ok(Response::GuardedRollbackV2Uncertain { evidence }) if matches!(mode, Mode::Execute) => {
-            let message = match &evidence.outcome {
-                GuardedRollbackOutcomeV2::Unknown { reason } => reason,
-                _ => "daemon could not confirm the rollback outcome",
-            };
-            failure("unknown", "UncertainOutcome", message)
         }
         Ok(Response::Error { code, message }) => {
             let status = if matches!(mode, Mode::Execute) {
@@ -330,5 +340,243 @@ impl Confirmation {
             && evidence.operation_id == self.operation_id
             && evidence.operation_digest == self.operation_digest
             && evidence.caller_uid == uid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+    use ws_ckpt_common::{
+        decode_payload, encode_frame, ErrorCode, GuardedRollbackEvidenceV2,
+        GuardedRollbackOutcomeV2, Request, Response, WorkspaceGenerationTokenV2,
+        GUARDED_CHECKPOINT_PROTOCOL_VERSION_V2,
+    };
+
+    use super::{effective_uid, run_json, Mode};
+
+    static NEXT_SOCKET_ID: AtomicUsize = AtomicUsize::new(0);
+    const CHILD_CASE_ENV: &str = "WS_CKPT_ROLLBACK_UNIT_CHILD_CASE";
+
+    struct TestSocketDir(PathBuf);
+
+    impl TestSocketDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ws-ckpt-rollback-unit-{}-{}",
+                std::process::id(),
+                NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestSocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn spawn_mock_peer(
+        responses: Vec<Response>,
+    ) -> (
+        TestSocketDir,
+        PathBuf,
+        std::thread::JoinHandle<Vec<Request>>,
+    ) {
+        let dir = TestSocketDir::new();
+        let socket = dir.0.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "mock daemon timed out waiting for CLI"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept failed: {e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut len = [0u8; 4];
+                stream.read_exact(&mut len).unwrap();
+                let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
+                stream.read_exact(&mut payload).unwrap();
+                requests.push(decode_payload(&payload).unwrap());
+                stream.write_all(&encode_frame(&response).unwrap()).unwrap();
+            }
+            requests
+        });
+        (dir, socket, handle)
+    }
+
+    fn sample_evidence(uid: u32, outcome: GuardedRollbackOutcomeV2) -> GuardedRollbackEvidenceV2 {
+        GuardedRollbackEvidenceV2 {
+            ws_id: "ws-abc123".to_string(),
+            registered_path: "/workspace".to_string(),
+            expected_generation: WorkspaceGenerationTokenV2::from_bytes([7; 32]),
+            target_snapshot_id: "s1".to_string(),
+            expected_diff_digest: [8; 32],
+            operation_id: "op-123".to_string(),
+            operation_digest: [9; 32],
+            caller_uid: uid,
+            outcome,
+        }
+    }
+
+    fn sample_confirmation() -> Value {
+        json!({
+            "ws_id": "ws-abc123",
+            "generation": ([7_u8; 32]),
+            "diff_digest": ([8_u8; 32]),
+            "operation_id": "op-123",
+            "operation_digest": ([9_u8; 32]),
+        })
+    }
+
+    #[tokio::test]
+    async fn ordinary_execute_classifies_invalid_path_as_known_no_effect() {
+        let (_dir, socket, peer) = spawn_mock_peer(vec![Response::Error {
+            code: ErrorCode::InvalidPath,
+            message: "snapshot reference '__live__' resolved to a rejected id".to_string(),
+        }]);
+        std::env::set_var("WS_CKPT_SOCKET", &socket);
+        let output = run_json(
+            "ws-abc123".to_string(),
+            Some("__live__".to_string()),
+            None,
+            false,
+            Mode::Execute,
+        )
+        .await;
+        let requests = peer.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(output["schema"], "ws-ckpt.rollback.v1");
+        assert_eq!(output["code"], "InvalidPath");
+        assert_eq!(output["status"], "known_no_effect");
+    }
+
+    #[tokio::test]
+    async fn guarded_execute_validates_uncertain_evidence_binding() {
+        if let Ok(case) = std::env::var(CHILD_CASE_ENV) {
+            assert_eq!(case, "run");
+            let output = run_json(
+                "/workspace".to_string(),
+                Some("s1".to_string()),
+                None,
+                true,
+                Mode::Execute,
+            )
+            .await;
+            println!("CHILD_JSON:{}", serde_json::to_string(&output).unwrap());
+            return;
+        }
+
+        let uid = effective_uid().unwrap();
+        let identity = || Response::WorkspaceIdentityV2Ok {
+            protocol_version: GUARDED_CHECKPOINT_PROTOCOL_VERSION_V2,
+            ws_id: "ws-abc123".to_string(),
+            registered_path: "/workspace".to_string(),
+            generation: WorkspaceGenerationTokenV2::from_bytes([7; 32]),
+        };
+
+        let mut wrong_op = sample_evidence(
+            uid,
+            GuardedRollbackOutcomeV2::Unknown {
+                reason: "unverified peer diagnostic".to_string(),
+            },
+        );
+        wrong_op.operation_id = "op-other".to_string();
+
+        let mut wrong_path = sample_evidence(
+            uid,
+            GuardedRollbackOutcomeV2::Unknown {
+                reason: "wrong path diagnostic".to_string(),
+            },
+        );
+        wrong_path.registered_path = "/other-workspace".to_string();
+
+        let contradictory_outcome = sample_evidence(
+            uid,
+            GuardedRollbackOutcomeV2::Succeeded {
+                resulting_generation: WorkspaceGenerationTokenV2::from_bytes([10; 32]),
+            },
+        );
+
+        for invalid_uncertain in [wrong_op, wrong_path, contradictory_outcome] {
+            let (_dir, socket, peer) = spawn_mock_peer(vec![
+                identity(),
+                Response::GuardedRollbackV2Uncertain {
+                    evidence: invalid_uncertain,
+                },
+            ]);
+            let output = run_child_with_stdin(&socket, &sample_confirmation());
+            peer.join().unwrap();
+            assert_eq!(output["status"], "unknown");
+            assert_eq!(output["code"], "UnexpectedResponse");
+        }
+
+        let valid_uncertain = sample_evidence(
+            uid,
+            GuardedRollbackOutcomeV2::Unknown {
+                reason: "durable index save failed after switch".to_string(),
+            },
+        );
+        let (_dir, socket, peer) = spawn_mock_peer(vec![
+            identity(),
+            Response::GuardedRollbackV2Uncertain {
+                evidence: valid_uncertain,
+            },
+        ]);
+        let output = run_child_with_stdin(&socket, &sample_confirmation());
+        peer.join().unwrap();
+        assert_eq!(output["status"], "unknown");
+        assert_eq!(output["code"], "UncertainOutcome");
+        assert_eq!(output["message"], "durable index save failed after switch");
+    }
+
+    fn run_child_with_stdin(socket: &std::path::Path, confirmation: &Value) -> Value {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rollback::tests::guarded_execute_validates_uncertain_evidence_binding",
+                "--nocapture",
+            ])
+            .env(CHILD_CASE_ENV, "run")
+            .env("WS_CKPT_SOCKET", socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        serde_json::to_writer(child.stdin.take().unwrap(), confirmation).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "child test failed: {output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let line = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("CHILD_JSON:"))
+            .expect("missing CHILD_JSON line from child test");
+        serde_json::from_str(line).unwrap()
     }
 }

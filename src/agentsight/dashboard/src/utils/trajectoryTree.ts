@@ -32,19 +32,25 @@ export interface TrajNode {
 const AGENT_NAME_PREFIX = 'agentsight-opt:';
 
 function stepsOf(doc: AtifDocument): AtifStep[] {
-  return Array.isArray(doc.steps) ? doc.steps : [];
+  return Array.isArray(doc.steps)
+    ? doc.steps.filter((s): s is AtifStep => s != null && typeof s === 'object')
+    : [];
 }
 
 function subagentsOf(doc: AtifDocument): AtifDocument[] {
-  return Array.isArray(doc.subagent_trajectories) ? doc.subagent_trajectories : [];
+  return Array.isArray(doc.subagent_trajectories)
+    ? doc.subagent_trajectories.filter((sub): sub is AtifDocument => sub != null && typeof sub === 'object')
+    : [];
 }
 
 function observationResultsOf(step: AtifStep) {
-  return Array.isArray(step.observation?.results) ? step.observation.results : [];
+  const results = step.observation?.results;
+  return Array.isArray(results) ? results.filter(Boolean) : [];
 }
 
 function subagentRefsOf(result: { subagent_trajectory_ref?: SubagentTrajectoryRef[] }) {
-  return Array.isArray(result.subagent_trajectory_ref) ? result.subagent_trajectory_ref : [];
+  const refs = result.subagent_trajectory_ref;
+  return Array.isArray(refs) ? refs.filter(Boolean) : [];
 }
 
 function displayLabel(doc: AtifDocument): string {
@@ -80,40 +86,90 @@ function collectRefs(doc: AtifDocument): SubagentTrajectoryRef[] {
   return refs;
 }
 
-function buildNode(doc: AtifDocument, path: string[], depth: number): TrajNode {
-  const embedded = subagentsOf(doc);
-  const children: TrajNode[] = embedded.map((sub, i) => {
-    const key = subagentKey(sub, i);
-    return buildNode(sub, [...path, key], depth + 1);
+interface EmbeddedIdIndex {
+  trajectoryIds: Set<string>;
+  sessionOrTrajectoryIds: Set<string>;
+}
+
+function collectEmbeddedIds(
+  doc: AtifDocument,
+  visited = new Set<AtifDocument>(),
+  index: EmbeddedIdIndex = { trajectoryIds: new Set(), sessionOrTrajectoryIds: new Set() },
+): EmbeddedIdIndex {
+  if (visited.has(doc)) return index;
+  visited.add(doc);
+  if (doc.trajectory_id) {
+    index.trajectoryIds.add(doc.trajectory_id);
+    index.sessionOrTrajectoryIds.add(doc.trajectory_id);
+  }
+  if (doc.session_id) {
+    index.sessionOrTrajectoryIds.add(doc.session_id);
+  }
+  for (const sub of subagentsOf(doc)) {
+    collectEmbeddedIds(sub, visited, index);
+  }
+  return index;
+}
+
+function claimSegment(candidates: string[], usedSegments: Set<string>): string {
+  for (const candidate of candidates) {
+    if (candidate && !usedSegments.has(candidate)) {
+      usedSegments.add(candidate);
+      return candidate;
+    }
+  }
+  const base = candidates.find(Boolean) || '#0';
+  let suffix = 1;
+  while (usedSegments.has(`${base}#${suffix}`)) {
+    suffix += 1;
+  }
+  const unique = `${base}#${suffix}`;
+  usedSegments.add(unique);
+  return unique;
+}
+
+function buildNode(
+  doc: AtifDocument,
+  path: string[],
+  depth: number,
+  embeddedIndex: EmbeddedIdIndex,
+  ancestors: Set<AtifDocument>,
+): TrajNode {
+  const nextAncestors = new Set(ancestors);
+  nextAncestors.add(doc);
+
+  const usedSegments = new Set<string>();
+  const children: TrajNode[] = [];
+  subagentsOf(doc).forEach((sub, i) => {
+    if (nextAncestors.has(sub)) return;
+    const segment = claimSegment([subagentKey(sub, i)], usedSegments);
+    children.push(buildNode(sub, [...path, segment], depth + 1, embeddedIndex, nextAncestors));
   });
 
-  // Refs that name a session but have no embedded document become external
-  // nodes: reachable, but explicitly marked as living outside this page.
-  const embeddedIds = new Set<string>();
-  embedded.forEach((sub, i) => {
-    embeddedIds.add(subagentKey(sub, i));
-    if (sub.trajectory_id) embeddedIds.add(sub.trajectory_id);
-    if (sub.session_id) embeddedIds.add(sub.session_id);
-  });
-  const usedSegments = new Set(children.map(c => c.path[c.path.length - 1]));
+  // Refs that name a session with no matching embedded document anywhere in the
+  // tree become external nodes: reachable, but explicitly marked as living outside this page.
   const externalBySession = new Map<string, TrajNode>();
   for (const ref of collectRefs(doc)) {
     // Match `subagentKey` and `findNodeByRef`: an empty trajectory_id counts as absent.
-    const refId = ref.trajectory_id || ref.session_id;
-    if (!refId || embeddedIds.has(refId)) continue;
+    const explicitTrajId = ref.trajectory_id || '';
+    const refId = explicitTrajId || ref.session_id;
+    if (!refId) continue;
+    const isEmbedded = explicitTrajId
+      ? embeddedIndex.trajectoryIds.has(explicitTrajId)
+      : embeddedIndex.sessionOrTrajectoryIds.has(refId);
+    if (isEmbedded) continue;
     if (!ref.session_id) continue;
     const existing = externalBySession.get(ref.session_id);
     if (existing) {
-      if (ref.trajectory_id) {
+      if (explicitTrajId) {
         existing.externalTrajectoryIds ??= [];
-        if (!existing.externalTrajectoryIds.includes(ref.trajectory_id)) {
-          existing.externalTrajectoryIds.push(ref.trajectory_id);
+        if (!existing.externalTrajectoryIds.includes(explicitTrajId)) {
+          existing.externalTrajectoryIds.push(explicitTrajId);
         }
       }
       continue;
     }
-    const segment = usedSegments.has(ref.session_id) ? refId : ref.session_id;
-    usedSegments.add(segment);
+    const segment = claimSegment([ref.session_id, refId], usedSegments);
     const nodePath = [...path, segment];
     const extNode: TrajNode = {
       path: nodePath,
@@ -127,7 +183,7 @@ function buildNode(doc: AtifDocument, path: string[], depth: number): TrajNode {
       stepCount: 0,
       promptTokens: 0,
       externalSessionId: ref.session_id,
-      ...(ref.trajectory_id ? { externalTrajectoryIds: [ref.trajectory_id] } : {}),
+      ...(explicitTrajId ? { externalTrajectoryIds: [explicitTrajId] } : {}),
       children: [],
     };
     externalBySession.set(ref.session_id, extNode);
@@ -154,7 +210,8 @@ function shortLabel(id: string): string {
 /** Build the tree rooted at `doc`. Returns null when there are no subagents. */
 export function buildTrajectoryTree(doc: AtifDocument | null): TrajNode | null {
   if (!doc) return null;
-  const root = buildNode(doc, [], 0);
+  const embeddedIndex = collectEmbeddedIds(doc);
+  const root = buildNode(doc, [], 0, embeddedIndex, new Set());
   return root.children.length > 0 ? root : null;
 }
 
@@ -184,7 +241,7 @@ export function findNodeByPath(root: TrajNode, path: string[]): TrajNode {
   let node = root;
   for (const segment of path) {
     const next = node.children.find(c => c.path[c.path.length - 1] === segment);
-    if (!next) return node;
+    if (!next) return root;
     node = next;
   }
   return node;
@@ -192,23 +249,24 @@ export function findNodeByPath(root: TrajNode, path: string[]): TrajNode {
 
 /**
  * Resolve the node a step's `subagent_trajectory_ref` points at, searching the
- * whole tree so a ref inside a nested trajectory still resolves.
+ * whole tree in breadth-first child order so shallower and earlier trajectories
+ * win while nested trajectories still resolve.
  */
 export function findNodeByRef(root: TrajNode, ref: SubagentTrajectoryRef): TrajNode | null {
-  const wanted = ref.trajectory_id || ref.session_id;
+  const explicitTrajId = ref.trajectory_id || '';
+  const wanted = explicitTrajId || ref.session_id;
   if (!wanted) return null;
 
-  const stack: TrajNode[] = [root];
-  while (stack.length > 0) {
-    const node = stack.pop()!;
-    const last = node.path[node.path.length - 1];
+  const queue: TrajNode[] = [root];
+  for (let i = 0; i < queue.length; i++) {
+    const node = queue[i];
     // Session ids are run-scoped; an explicit trajectory id identifies the document
     // (or the external node created for that referenced trajectory).
-    const ids = ref.trajectory_id
+    const ids = explicitTrajId
       ? [node.doc?.trajectory_id, ...(node.externalTrajectoryIds ?? [])]
-      : [last, node.doc?.session_id, node.externalSessionId];
+      : [node.doc?.session_id, node.doc?.trajectory_id, node.externalSessionId];
     if (ids.includes(wanted)) return node;
-    stack.push(...node.children);
+    queue.push(...node.children);
   }
   return null;
 }

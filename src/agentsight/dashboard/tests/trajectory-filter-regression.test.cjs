@@ -300,3 +300,108 @@ test('pure matcher includes optional content, literal punctuation and frozen dat
   assert.equal(roundMatchesText([{ step_id: 1, source: 'agent', reasoning_content: 42 }], '42'), false);
   assert.equal(JSON.stringify(steps), before);
 });
+
+const { NODE_H, buildTrajectoryTree, decodeNodePath, encodeNodePath, findNodeByPath, findNodeByRef, layoutTree } =
+  require(process.env.AGENTSIGHT_TRAJECTORY_TREE_BUILD);
+const makeTreeDoc = (extra = {}) => ({
+  schema_version: 'ATIF-v1.7', session_id: 'root-session', steps: [{ step_id: 1, source: 'agent', message: 'ok' }], ...extra,
+});
+const stepWithRefs = (refs, step_id = 1) => ({
+  step_id, source: 'agent', message: 'dispatch', observation: { results: [{ subagent_trajectory_ref: refs }] },
+});
+
+test('trajectoryTree: cyclic subagent_trajectories and ancestor/self refs terminate without external stubs', () => {
+  const selfCycle = makeTreeDoc({ trajectory_id: 'self-traj', session_id: 'self-session' });
+  selfCycle.subagent_trajectories = [selfCycle];
+  assert.equal(buildTrajectoryTree(selfCycle), null);
+  const root = makeTreeDoc({ trajectory_id: 'root-traj', session_id: 'root-session' });
+  const child = makeTreeDoc({ trajectory_id: 'child-traj', session_id: 'child-session', steps: [stepWithRefs([
+    { session_id: 'root-session' }, { trajectory_id: 'root-traj', session_id: 'root-session' }, { session_id: 'child-session' },
+  ])] });
+  root.subagent_trajectories = [child];
+  child.subagent_trajectories = [root];
+  const tree = buildTrajectoryTree(root);
+  assert.ok(tree);
+  assert.equal(tree.children.length, 1);
+  assert.equal(tree.children[0].doc.trajectory_id, 'child-traj');
+  assert.deepEqual(tree.children[0].children, []);
+  assert.equal(findNodeByRef(tree, { session_id: 'root-session' }).doc.trajectory_id, 'root-traj');
+  const sharedLeaf = makeTreeDoc({ trajectory_id: 'shared-leaf', session_id: 'leaf-session' });
+  const diamond = buildTrajectoryTree(makeTreeDoc({ trajectory_id: 'diamond-root', session_id: 'diamond-session', subagent_trajectories: [
+    makeTreeDoc({ trajectory_id: 'branch-a', session_id: 'sess-a', subagent_trajectories: [sharedLeaf] }),
+    makeTreeDoc({ trajectory_id: 'branch-b', session_id: 'sess-b', subagent_trajectories: [sharedLeaf] }),
+  ] }));
+  assert.equal(diamond.children[0].children.length, 1);
+  assert.equal(diamond.children[1].children.length, 1);
+});
+
+test('trajectoryTree: refs to nested or sibling embedded subagents resolve without duplicate external stubs', () => {
+  const grandchild = makeTreeDoc({ trajectory_id: 'gc-traj', session_id: 'gc-session' });
+  const childA = makeTreeDoc({ trajectory_id: 'child-a', session_id: 'sess-a', subagent_trajectories: [grandchild] });
+  const childB = makeTreeDoc({ trajectory_id: 'child-b', session_id: 'sess-b', steps: [stepWithRefs([{ session_id: 'sess-a' }])] });
+  const tree = buildTrajectoryTree(makeTreeDoc({
+    trajectory_id: 'root-traj', session_id: 'root-session', subagent_trajectories: [childA, childB],
+    steps: [stepWithRefs([{ trajectory_id: 'gc-traj', session_id: 'gc-session' }, { trajectory_id: '', session_id: 'gc-session' }])],
+  }));
+  assert.ok(tree);
+  assert.equal(tree.children.length, 2);
+  assert.equal(tree.children[1].children.length, 0);
+  for (const ref of [{ trajectory_id: 'gc-traj', session_id: 'gc-session' }, { trajectory_id: '', session_id: 'gc-session' }]) {
+    const resolved = findNodeByRef(tree, ref);
+    assert.equal(resolved?.externalSessionId, undefined);
+    assert.equal(resolved?.doc.trajectory_id, 'gc-traj');
+  }
+  assert.equal(findNodeByRef(tree, { session_id: 'sess-a' }).doc.trajectory_id, 'child-a');
+});
+
+test('trajectoryTree: synthetic fallback keys and cross-field session ids preserve unembedded external refs', () => {
+  const tree = buildTrajectoryTree(makeTreeDoc({
+    trajectory_id: 'root-traj', session_id: 'root-session',
+    steps: [stepWithRefs([{ trajectory_id: '', session_id: '#0' }, { trajectory_id: 'shared-token', session_id: 'external-run' }])],
+    subagent_trajectories: [
+      makeTreeDoc({ trajectory_id: '', session_id: '', steps: [] }),
+      makeTreeDoc({ trajectory_id: 'embedded-traj', session_id: 'shared-token' }),
+    ],
+  }));
+  assert.ok(tree);
+  assert.equal(findNodeByRef(tree, { trajectory_id: '', session_id: '#0' })?.externalSessionId, '#0');
+  assert.equal(findNodeByRef(tree, { trajectory_id: 'shared-token', session_id: 'external-run' })?.externalSessionId, 'external-run');
+});
+
+test('trajectoryTree: colliding sibling segments keep unique layout keys, aligned edges, and URL round-trip', () => {
+  const tree = buildTrajectoryTree(makeTreeDoc({
+    trajectory_id: 'root-traj', session_id: 'root-session',
+    steps: [stepWithRefs([{ trajectory_id: 's2', session_id: 's1' }, { trajectory_id: '', session_id: 's2' }])],
+    subagent_trajectories: [
+      makeTreeDoc({ trajectory_id: undefined, session_id: 'shared-run', agent: { name: 'worker-a', version: '1' } }),
+      makeTreeDoc({ trajectory_id: undefined, session_id: 'shared-run', agent: { name: 'worker-b', version: '1' } }),
+      makeTreeDoc({ trajectory_id: 's1', session_id: 'embedded-s1' }),
+    ],
+  }));
+  assert.ok(tree);
+  assert.equal(tree.children.length, 5);
+  const layout = layoutTree(tree);
+  const nodeKeys = layout.nodes.map((positioned) => positioned.node.key);
+  assert.equal(new Set(nodeKeys).size, nodeKeys.length);
+  const centerByKey = new Map(layout.nodes.map((positioned) => [positioned.node.key, positioned.y + NODE_H / 2]));
+  for (const edge of layout.edges) assert.equal(edge.y2, centerByKey.get(edge.toKey));
+  for (const positioned of layout.nodes) {
+    assert.equal(findNodeByPath(tree, decodeNodePath(encodeNodePath(positioned.node.path))), positioned.node);
+  }
+});
+
+test('trajectoryTree: findNodeByRef resolves breadth-first in tree order and findNodeByPath falls back to root', () => {
+  const tree = buildTrajectoryTree(makeTreeDoc({
+    trajectory_id: 'parent', session_id: 'parent-run', subagent_trajectories: [
+      makeTreeDoc({ trajectory_id: 'first-child', session_id: 'shared-sub',
+        subagent_trajectories: [makeTreeDoc({ trajectory_id: 'deep-child', session_id: 'later-target' })] }),
+      makeTreeDoc({ trajectory_id: 'second-child', session_id: 'shared-sub' }),
+      makeTreeDoc({ trajectory_id: 'third-child', session_id: 'later-target' }),
+    ],
+  }));
+  assert.ok(tree);
+  assert.equal(findNodeByRef(tree, { session_id: 'shared-sub' }).doc.trajectory_id, 'first-child');
+  assert.equal(findNodeByRef(tree, { session_id: 'later-target' }).doc.trajectory_id, 'third-child');
+  assert.equal(findNodeByRef(tree, { trajectory_id: 'deep-child', session_id: 'later-target' }).doc.trajectory_id, 'deep-child');
+  assert.equal(findNodeByPath(tree, ['first-child', 'missing-grandchild']), tree);
+});

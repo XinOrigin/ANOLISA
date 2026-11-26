@@ -203,8 +203,59 @@ fn default_search_path() -> Option<std::ffi::OsString> {
 fn capture_env_vars() -> HashMap<String, String> {
     ENV_VAR_WHITELIST
         .iter()
-        .filter_map(|&key| std::env::var(key).ok().map(|val| (key.to_string(), val)))
+        .filter_map(|&key| {
+            let val = std::env::var_os(key)?;
+            let encoded = match val.into_string() {
+                Ok(utf8) => utf8,
+                Err(raw) => encode_raw_os_str(&raw),
+            };
+            Some((key.to_string(), encoded))
+        })
         .collect()
+}
+
+// Keep valid UTF-8 values verbatim while prefixing escaped raw OS payloads
+// with `\0raw:` (impossible in NUL-terminated OS env vars) so raw bytes never
+// collide with literal UTF-8 escapes in `TransformPipeline::identity`.
+fn encode_raw_os_str(raw: &std::ffi::OsStr) -> String {
+    #[cfg(unix)]
+    {
+        use std::fmt::Write;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut out = String::from("\0raw:");
+        for &byte in raw.as_bytes() {
+            match byte {
+                b'\\' => out.push_str("\\\\"),
+                0x20..=0x7e => out.push(char::from(byte)),
+                _ => {
+                    let _ = write!(out, "\\x{byte:02x}");
+                }
+            }
+        }
+        out
+    }
+    #[cfg(windows)]
+    {
+        use std::fmt::Write;
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut out = String::from("\0raw:");
+        for unit in raw.encode_wide() {
+            match unit {
+                0x005c => out.push_str("\\\\"),
+                0x0020..=0x007e => out.push(char::from(unit as u8)),
+                _ => {
+                    let _ = write!(out, "\\u{unit:04x}");
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("\0raw:{}", raw.to_string_lossy())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,5 +304,108 @@ mod tests {
             profile.has_command("sh"),
             "sh should always be available on Unix"
         );
+    }
+
+    #[cfg(unix)]
+    fn run_raw_env_child(bin_dir: &std::path::Path, case: &str, vars: &[(&str, &[u8])]) -> String {
+        use std::ffi::OsStr;
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+        let uv = bin_dir.join("uv");
+        if !uv.exists() {
+            std::fs::write(&uv, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut path_bytes = bin_dir.as_os_str().as_bytes().to_vec();
+        path_bytes.extend_from_slice(b":/missing-\xff");
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.env_clear()
+            .env("SKILLFS_RAW_ENV_CASE", case)
+            .env("PATH", OsStr::from_bytes(&path_bytes));
+        for (k, v) in vars {
+            cmd.env(k, OsStr::from_bytes(v));
+        }
+        let out = cmd.args(["--exact", case, "--nocapture"]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_captures_raw_byte_whitelisted_env_vars() {
+        const CASE: &str = "env::tests::test_detect_captures_raw_byte_whitelisted_env_vars";
+        if std::env::var("SKILLFS_RAW_ENV_CASE").as_deref() != Ok(CASE) {
+            let tmp = tempfile::tempdir().unwrap();
+            let extra: &[(&str, &[u8])] = &[
+                ("VIRTUAL_ENV", b"/tmp/venv-\xff"),
+                ("HOME", b"/home/user-\x80"),
+                ("UV_CACHE_DIR", b"/tmp/uv-cache-\xfe"),
+                ("UNLISTED_RAW_ENV", b"ignored-\xff"),
+            ];
+            assert!(run_raw_env_child(tmp.path(), CASE, extra).contains("raw-env-captured"));
+            return;
+        }
+        let profile = EnvironmentProfile::detect();
+        assert!(profile.has_command("uv"));
+        for key in ["PATH", "VIRTUAL_ENV", "HOME", "UV_CACHE_DIR"] {
+            assert!(profile.has_env(key), "{key} should be captured");
+        }
+        assert!(!profile.has_env("UNLISTED_RAW_ENV"));
+        let pipeline = crate::transform::TransformPipeline::directive_only(profile);
+        let doc = "<!-- @if has_env(\"VIRTUAL_ENV\") -->\nactive\n<!-- @else -->\ninactive\n<!-- @endif -->\n";
+        assert_eq!(pipeline.run(doc), "active\n");
+        println!("raw-env-captured");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_raw_byte_pip_user_preserves_pip_install() {
+        const CASE: &str = "env::tests::test_detect_raw_byte_pip_user_preserves_pip_install";
+        if std::env::var("SKILLFS_RAW_ENV_CASE").as_deref() != Ok(CASE) {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = run_raw_env_child(tmp.path(), CASE, &[("PIP_USER", b"\xff")]);
+            assert!(out.contains("raw-pip-user-preserved"));
+            return;
+        }
+        let profile = EnvironmentProfile::detect();
+        assert!(profile.has_command("uv") && profile.has_env("PIP_USER"));
+        let pipeline = crate::transform::TransformPipeline::directive_only(profile);
+        assert_eq!(
+            pipeline.run("pip install requests\n"),
+            "pip install requests\n"
+        );
+        println!("raw-pip-user-preserved");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_distinguishes_raw_byte_env_identities() {
+        const CASE: &str = "env::tests::test_detect_distinguishes_raw_byte_env_identities";
+        if std::env::var("SKILLFS_RAW_ENV_CASE").as_deref() != Ok(CASE) {
+            let tmp = tempfile::tempdir().unwrap();
+            let variants: [&[(&str, &[u8])]; 5] = [
+                &[],
+                &[("VIRTUAL_ENV", b"/venv-\x80")],
+                &[("VIRTUAL_ENV", b"/venv-\xff")],
+                &[("VIRTUAL_ENV", b"/venv-\\xff")],
+                &[("VIRTUAL_ENV", b"/venv-\\x80\xff")],
+            ];
+            let mut digests = HashSet::new();
+            for variant in variants {
+                let stdout = run_raw_env_child(tmp.path(), CASE, variant);
+                let hex = stdout.lines().find_map(|l| l.strip_prefix("identity="));
+                assert!(digests.insert(hex.unwrap().to_string()));
+            }
+            return;
+        }
+        let id = crate::transform::TransformPipeline::directive_only(EnvironmentProfile::detect())
+            .identity();
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        println!("identity={hex}");
     }
 }
